@@ -1,0 +1,9 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "discovery": "./src/darkfactory/stages/discovery.py:discovery_subgraph",
+    "build": "./src/darkfactory/stages/build.py:build_subgraph",
+    "verify": "./src/darkfactory/stages/verify.py:verify_subgraph"
+  },
+  "env": ".env"
+}

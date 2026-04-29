@@ -1,0 +1,56 @@
+FROM eclipse-temurin:21-jdk-jammy
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    UV_NO_CACHE=1 \
+    UV_LINK_MODE=copy \
+    VIRTUAL_ENV=/opt/darkfactory/.venv \
+    PATH="/opt/darkfactory/.venv/bin:/usr/local/bin:${PATH}" \
+    PYTHONPATH="/opt/darkfactory/src" \
+    DISABLE_AUTOUPDATER=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git ripgrep curl ca-certificates maven gh unzip \
+      software-properties-common gpg \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && install -d -m 0755 /etc/apt/keyrings \
+    && curl -fsSL https://downloads.claude.ai/keys/claude-code.asc \
+      -o /etc/apt/keyrings/claude-code.asc \
+    && echo "deb [signed-by=/etc/apt/keyrings/claude-code.asc] https://downloads.claude.ai/claude-code/apt/latest latest main" \
+      > /etc/apt/sources.list.d/claude-code.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+      python3.13 python3.13-venv claude-code \
+    && ln -sf /usr/bin/python3.13 /usr/local/bin/python3 \
+    && ln -sf /usr/bin/claude /usr/local/bin/claude \
+    && curl -fsSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py \
+    && python3.13 /tmp/get-pip.py \
+    && python3.13 -m pip install --no-cache-dir uv \
+    && rm -f /tmp/get-pip.py \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG GRADLE_VERSION=8.10
+RUN curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -o /tmp/gradle.zip \
+    && unzip -q /tmp/gradle.zip -d /opt \
+    && ln -s "/opt/gradle-${GRADLE_VERSION}/bin/gradle" /usr/local/bin/gradle \
+    && rm /tmp/gradle.zip
+
+RUN useradd -m -u 1000 -s /bin/bash agent \
+    && mkdir -p /opt/darkfactory /workspace \
+    && chown -R agent:agent /opt/darkfactory /workspace
+
+USER agent
+WORKDIR /opt/darkfactory
+
+COPY --chown=agent:agent pyproject.toml uv.lock README.md ./
+COPY --chown=agent:agent src/ ./src/
+RUN uv sync --frozen --no-dev
+
+WORKDIR /workspace
+
+RUN gradle --version >/dev/null 2>&1 || true \
+    && claude --version >/dev/null \
+    && python3 -c "import claude_agent_sdk, temporalio"
+
+CMD ["uv", "run", "--project", "/opt/darkfactory", "python", "-m", "darkfactory.runtime.worker_main"]

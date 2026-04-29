@@ -1,0 +1,298 @@
+name: darkfactory
+
+networks:
+  darkfactory-net:
+    name: darkfactory-net
+    driver: bridge
+
+volumes:
+  postgres-data:
+  clickhouse-data:
+  clickhouse-logs:
+  redis-data:
+  otel-config:
+  minio-data:
+
+services:
+  temporal:
+    image: temporalio/temporal:latest
+    container_name: darkfactory-temporal
+    command:
+      - server
+      - start-dev
+      - --ip=0.0.0.0
+      - --ui-port=8233
+    ports:
+      - "7233:7233"
+      - "8233:8233"
+    networks:
+      - darkfactory-net
+    healthcheck:
+      test: ["CMD-SHELL", "temporal operator cluster health --address temporal:7233 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  langfuse-otel-bootstrap:
+    image: alpine:3.20
+    container_name: darkfactory-langfuse-otel-bootstrap
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        if [ -n "$${LANGFUSE_PUBLIC_KEY:-}" ] && [ -n "$${LANGFUSE_SECRET_KEY:-}" ]; then
+          BASIC=$$(printf '%s:%s' "$$LANGFUSE_PUBLIC_KEY" "$$LANGFUSE_SECRET_KEY" | base64 | tr -d '\n')
+          echo "rendered Langfuse OTLP Basic auth header"
+        else
+          BASIC=""
+          echo "warn: LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY unset; Langfuse OTLP exporter will fail to authenticate. Sign up at http://localhost:3000 and add the keys to .env." 1>&2
+        fi
+        sed "s|__LANGFUSE_OTLP_BASIC__|$$BASIC|g" /input/otel-collector-config.yaml > /output/otel-collector-config.yaml
+        echo "wrote /output/otel-collector-config.yaml"
+    environment:
+      LANGFUSE_PUBLIC_KEY: pk-lf-local
+      LANGFUSE_SECRET_KEY: sk-lf-local
+    volumes:
+      - ./otel-collector-config.yaml:/input/otel-collector-config.yaml:ro
+      - otel-config:/output
+    networks:
+      - darkfactory-net
+    restart: "no"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: darkfactory-otel-collector
+    command: ["--config=/etc/otelcol/otel-collector-config.yaml"]
+    volumes:
+      - otel-config:/etc/otelcol:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    networks:
+      - darkfactory-net
+    depends_on:
+      langfuse-otel-bootstrap:
+        condition: service_completed_successfully
+      langfuse-web:
+        condition: service_started
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: darkfactory-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - darkfactory-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: darkfactory-clickhouse
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - clickhouse-logs:/var/log/clickhouse-server
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    networks:
+      - darkfactory-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    container_name: darkfactory-redis
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "redis"]
+    volumes:
+      - redis-data:/data
+    networks:
+      - darkfactory-net
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a redis ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  minio:
+    image: minio/minio:latest
+    container_name: darkfactory-minio
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: miniosecret
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - darkfactory-net
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  minio-bootstrap:
+    image: minio/mc:latest
+    container_name: darkfactory-minio-bootstrap
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        mc alias set local http://minio:9000 minio miniosecret
+        mc mb --ignore-existing local/${LANGFUSE_S3_EVENT_UPLOAD_BUCKET:-darkfactory-local-events}
+        mc mb --ignore-existing local/${LANGFUSE_S3_MEDIA_UPLOAD_BUCKET:-darkfactory-local-media}
+        echo "minio buckets ready"
+    networks:
+      - darkfactory-net
+    restart: "no"
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    container_name: darkfactory-langfuse-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_AUTH: redis
+      SALT: ${LANGFUSE_SALT:-darkfactory-demo-salt-change-me}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_ENABLED: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ${LANGFUSE_S3_EVENT_UPLOAD_BUCKET:-darkfactory-local-events}
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_ENABLED: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: ${LANGFUSE_S3_MEDIA_UPLOAD_BUCKET:-darkfactory-local-media}
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+    networks:
+      - darkfactory-net
+
+  langfuse-web:
+    image: langfuse/langfuse:3
+    container_name: darkfactory-langfuse-web
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-bootstrap:
+        condition: service_completed_successfully
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_AUTH: redis
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-darkfactory-demo-nextauth-change-me}
+      SALT: ${LANGFUSE_SALT:-darkfactory-demo-salt-change-me}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_ENABLED: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ${LANGFUSE_S3_EVENT_UPLOAD_BUCKET:-darkfactory-local-events}
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_ENABLED: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: ${LANGFUSE_S3_MEDIA_UPLOAD_BUCKET:-darkfactory-local-media}
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_INIT_ORG_ID: local
+      LANGFUSE_INIT_ORG_NAME: Local Org
+      LANGFUSE_INIT_PROJECT_ID: darkfactory
+      LANGFUSE_INIT_PROJECT_NAME: Dark Factory
+      LANGFUSE_INIT_USER_EMAIL: admin@local.dev
+      LANGFUSE_INIT_USER_PASSWORD: password
+      LANGFUSE_INIT_USER_NAME: Admin
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: pk-lf-local
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: sk-lf-local
+    networks:
+      - darkfactory-net
+
+  darkfactory-orchestrator:
+    image: darkfactory-orchestrator:dev
+    build:
+      context: .
+      dockerfile: Dockerfile.orchestrator
+    container_name: darkfactory-orchestrator
+    depends_on:
+      temporal:
+        condition: service_started
+      otel-collector:
+        condition: service_started
+      langfuse-web:
+        condition: service_started
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      LANGFUSE_HOST: http://langfuse-web:3000
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./src:/app/src:ro
+    working_dir: /app
+    networks:
+      - darkfactory-net

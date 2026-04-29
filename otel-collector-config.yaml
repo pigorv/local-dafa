@@ -1,0 +1,29 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  otlp_http/langfuse:
+    traces_endpoint: http://langfuse-web:3000/api/public/otel/v1/traces
+    headers:
+      Authorization: "Basic __LANGFUSE_OTLP_BASIC__"
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    traces:
+      receivers:
+        - otlp
+      processors:
+        - batch
+      exporters:
+        - otlp_http/langfuse
+        - debug
