@@ -95,7 +95,7 @@ def test_code_quality_client_options_are_hermetic_and_no_tool() -> None:
     assert opts.thinking is not None
     assert opts.thinking["type"] == "disabled"
     assert "PreToolUse" in opts.hooks
-    assert "PostToolUse" in opts.hooks
+    assert "PostToolUse" not in opts.hooks  # reasoning-only role: no post-tool hooks
     assert "UserPromptSubmit" in opts.hooks
 
 

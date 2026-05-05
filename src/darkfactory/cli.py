@@ -7,10 +7,12 @@ import uuid
 from pathlib import Path
 from typing import Sequence
 
+from opentelemetry import trace
 from temporalio.client import Client
 from temporalio.contrib.opentelemetry import TracingInterceptor
 from temporalio.contrib.pydantic import pydantic_data_converter
 
+from darkfactory.bootstrap import init_observability
 from darkfactory.runtime.workflow import DarkFactoryWorkflow
 from darkfactory.state import RunRequest
 
@@ -46,8 +48,14 @@ async def _connect_client() -> Client:
 
 
 async def run_command(args: argparse.Namespace) -> int:
+    # Init observability so the CLI process has a TracerProvider; the
+    # TracingInterceptor on the client then has an active span context to
+    # inject into the workflow start headers, and the supervisor's
+    # RunWorkflow span becomes a child of this CLI span.
+    init_observability("darkfactory-cli")
+    tracer = trace.get_tracer("darkfactory.cli")
+
     if args.hello_worker:
-        client = await _connect_client()
         workflow_id = args.workflow_id or f"darkfactory-hello-worker-{uuid.uuid4().hex}"
         repo = args.repo.resolve()
         request = RunRequest(
@@ -56,12 +64,18 @@ async def run_command(args: argparse.Namespace) -> int:
             user_request="hello from darkfactory worker",
             model_profile=None,
         )
-        result = await client.execute_workflow(
-            DarkFactoryWorkflow.run,
-            request,
-            id=workflow_id,
-            task_queue=SUPERVISOR_TASK_QUEUE,
-        )
+        with tracer.start_as_current_span("darkfactory.cli.run") as span:
+            span.set_attribute("langfuse.session.id", workflow_id)
+            span.set_attribute("session.id", workflow_id)
+            span.set_attribute("workflow.id", workflow_id)
+            client = await _connect_client()
+            result = await client.execute_workflow(
+                DarkFactoryWorkflow.run,
+                request,
+                id=workflow_id,
+                task_queue=SUPERVISOR_TASK_QUEUE,
+            )
+        _flush_traces()
         print(f"workflow_id={workflow_id}")
         print(result)
         return 0
@@ -69,7 +83,6 @@ async def run_command(args: argparse.Namespace) -> int:
     if not args.prompt:
         raise SystemExit("darkfactory run requires a prompt unless --hello-worker is set")
 
-    client = await _connect_client()
     workflow_id = args.workflow_id or f"darkfactory-{uuid.uuid4().hex}"
     repo = args.repo.resolve()
     request = RunRequest(
@@ -78,20 +91,35 @@ async def run_command(args: argparse.Namespace) -> int:
         user_request=args.prompt,
         model_profile=os.environ.get("LLM_MODEL_PROFILE"),
     )
-    handle = await client.start_workflow(
-        DarkFactoryWorkflow.run,
-        request,
-        id=workflow_id,
-        task_queue=SUPERVISOR_TASK_QUEUE,
-    )
-    print(f"workflow_id={workflow_id}")
+    with tracer.start_as_current_span("darkfactory.cli.run") as span:
+        span.set_attribute("langfuse.session.id", workflow_id)
+        span.set_attribute("session.id", workflow_id)
+        span.set_attribute("workflow.id", workflow_id)
+        client = await _connect_client()
+        handle = await client.start_workflow(
+            DarkFactoryWorkflow.run,
+            request,
+            id=workflow_id,
+            task_queue=SUPERVISOR_TASK_QUEUE,
+        )
+        print(f"workflow_id={workflow_id}")
 
-    if not args.wait:
-        return 0
+        if not args.wait:
+            _flush_traces()
+            return 0
 
-    result = await handle.result()
+        result = await handle.result()
+    _flush_traces()
     print(result)
     return 0
+
+
+def _flush_traces() -> None:
+    """Flush BatchSpanProcessor before the CLI exits so spans aren't lost."""
+    provider = trace.get_tracer_provider()
+    flush = getattr(provider, "force_flush", None)
+    if callable(flush):
+        flush()
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -312,7 +312,6 @@ dependencies = [
     { name = "grep-ast" },
     { name = "langgraph" },
     { name = "langgraph-checkpoint-sqlite" },
-    { name = "openinference-instrumentation-anthropic" },
     { name = "openinference-instrumentation-langchain" },
     { name = "opentelemetry-api" },
     { name = "opentelemetry-exporter-otlp-proto-grpc" },
@@ -336,7 +335,6 @@ requires-dist = [
     { name = "grep-ast" },
     { name = "langgraph", specifier = ">=1.0.0" },
     { name = "langgraph-checkpoint-sqlite" },
-    { name = "openinference-instrumentation-anthropic" },
     { name = "openinference-instrumentation-langchain" },
     { name = "opentelemetry-api" },
     { name = "opentelemetry-exporter-otlp-proto-grpc" },
@@ -991,24 +989,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/18/d4/390c47304f172161e7d1ccdf6e4d02bc3f5612741a6768d652eb264b2edc/openinference_instrumentation-0.1.47.tar.gz", hash = "sha256:4f68930d974c04bdf765b31262fd8ec35c3b6b1b24dbbadbbdec2c685024b06b", size = 23931, upload-time = "2026-04-22T00:39:25.472Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1a/83/31420c5f503fec0f6b3cc66d9a93a10b656ce77bbe16421cdb4aad5b12fe/openinference_instrumentation-0.1.47-py3-none-any.whl", hash = "sha256:8496b29de79d0ceb7a7e5a523920da73351f192800fddd43aebc23c58d5586b9", size = 30112, upload-time = "2026-04-22T00:39:24.561Z" },
-]
-
-[[package]]
-name = "openinference-instrumentation-anthropic"
-version = "1.0.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "openinference-instrumentation" },
-    { name = "openinference-semantic-conventions" },
-    { name = "opentelemetry-api" },
-    { name = "opentelemetry-instrumentation" },
-    { name = "opentelemetry-semantic-conventions" },
-    { name = "typing-extensions" },
-    { name = "wrapt" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/cc/b5/88f3f45af83279083332dc50010a36c88020fb5a13b511708b95ad1e1446/openinference_instrumentation_anthropic-1.0.1.tar.gz", hash = "sha256:d27263588ea0c94f2525e4df27f26f23c9fcc8f7a2e2eac8d837fb7a4cb8d0b0", size = 15610, upload-time = "2026-04-22T00:39:26.426Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/1b/aa/80b28c9baeefe5f35cfc9db0ab2dfa632e3b457408dd19b9cbc005228ac3/openinference_instrumentation_anthropic-1.0.1-py3-none-any.whl", hash = "sha256:ab2e0d706aa38fb48f9ea3b1faa839d68b926040382f257fd452a07e2e268d5b", size = 18856, upload-time = "2026-04-22T00:39:25.569Z" },
 ]
 
 [[package]]

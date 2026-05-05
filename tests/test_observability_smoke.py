@@ -3,25 +3,24 @@
 Runs `DarkFactoryWorkflow` end-to-end against Temporal's time-skipping
 test environment with `TracingInterceptor` wired on the client and both
 workers, captures every emitted OTel span via an `InMemorySpanExporter`,
-and asserts the trace shape from ARCHITECTURE §5.7:
+and asserts the Python-side trace shape from ARCHITECTURE §5.7:
 
   * one workflow root span scoped to the run (TracingInterceptor names it
     `RunWorkflow:DarkFactoryWorkflow` on the worker side; ARCHITECTURE's
     "DarkFactoryWorkflow.run" phrasing is descriptive, not the literal
     span name)
   * one `RunActivity:<stage>` span per stage activity that executed
-  * for any stage that opens an SDK client, at least one `gen_ai.*`
-    generation span — `stub_build_stage` simulates the AnthropicInstrumentor
-    output so the assertion holds without an Anthropic API call
-  * for any tool call inside a generation, a `tool.<name>` span — the stub
-    drives the real `make_otel_emit` pre/post pair to produce one
+
+The native Claude Code spans (`claude_code.interaction`, `claude_code.llm_request`,
+`claude_code.tool*`) are emitted by the bundled `claude` CLI subprocess and
+cannot be exercised without a real subprocess + OTel collector. They are
+verified end-to-end by running a real workflow and inspecting Langfuse.
 
 No network, no Anthropic API, no Docker.
 """
 from __future__ import annotations
 
 import asyncio
-from typing import Any
 
 from opentelemetry import trace
 from opentelemetry.sdk.resources import Resource
@@ -38,7 +37,6 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
-from darkfactory.hooks.otel_emit import make_otel_emit
 from darkfactory.runtime.workflow import DarkFactoryWorkflow
 from darkfactory.state import GateDecision, RunRequest
 
@@ -90,57 +88,8 @@ async def stub_discovery_stage(state: dict) -> dict:
     return {"stories": [], "spec": [], "review_decision": None}
 
 
-def _hook_event(tool_name: str, **extra: Any) -> dict[str, Any]:
-    base = {
-        "session_id": "smoke",
-        "transcript_path": "/tmp/transcript",
-        "cwd": "/workspace",
-        "agent_id": "agent-smoke",
-        "agent_type": "backend",
-        "tool_name": tool_name,
-    }
-    base.update(extra)
-    return base
-
-
 @activity.defn(name="build_stage")
 async def stub_build_stage(state: dict) -> dict:
-    """Simulate one Anthropic generation that issues one tool call.
-
-    The `gen_ai.system="anthropic"` attribute is what
-    `openinference.instrumentation.anthropic.AnthropicInstrumentor` would
-    set on a real LLM-call span. The tool span comes from driving the real
-    `otel_emit` hook pair, so we exercise production code rather than
-    fake-emitting another span manually.
-    """
-    tracer = trace.get_tracer("test_observability_smoke")
-    pre, post = make_otel_emit("backend")
-    with tracer.start_as_current_span("anthropic.chat.completions") as gen:
-        gen.set_attribute("gen_ai.system", "anthropic")
-        gen.set_attribute("gen_ai.request.model", "claude-sonnet-4-5-20250929")
-        gen.set_attribute("gen_ai.usage.input_tokens", 100)
-        gen.set_attribute("gen_ai.usage.output_tokens", 20)
-        await pre(
-            _hook_event(
-                "sandbox_bash",
-                hook_event_name="PreToolUse",
-                tool_input={"argv": ["mvn", "compile"]},
-                tool_use_id="tu-smoke",
-            ),
-            "tu-smoke",
-            {"signal": None},
-        )
-        await post(
-            _hook_event(
-                "sandbox_bash",
-                hook_event_name="PostToolUse",
-                tool_input={},
-                tool_response={"returncode": 0, "stdout": "BUILD SUCCESS"},
-                tool_use_id="tu-smoke",
-            ),
-            "tu-smoke",
-            {"signal": None},
-        )
     return {"build_order": [], "current_slice": "", "patches": []}
 
 
@@ -266,18 +215,3 @@ async def _run_smoke() -> None:
     assert not missing, (
         f"missing activity spans for stages {missing}; saw {sorted(activity_stage_names)}"
     )
-
-    gen_ai_spans = [
-        s for s in spans
-        if any(k.startswith("gen_ai.") for k in dict(s.attributes or {}).keys())
-    ]
-    assert gen_ai_spans, (
-        "expected at least one gen_ai.* generation span (simulating an SDK call); "
-        f"saw {span_names}"
-    )
-
-    tool_spans = [s for s in spans if s.name.startswith("tool.")]
-    assert tool_spans, f"expected at least one tool.<name> span; saw {span_names}"
-    assert any(
-        s.name == "tool.sandbox_bash" for s in tool_spans
-    ), f"expected tool.sandbox_bash span; saw tool spans {[s.name for s in tool_spans]}"

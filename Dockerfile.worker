@@ -37,8 +37,8 @@ RUN curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSIO
     && rm /tmp/gradle.zip
 
 RUN useradd -m -u 1000 -s /bin/bash agent \
-    && mkdir -p /opt/darkfactory /workspace \
-    && chown -R agent:agent /opt/darkfactory /workspace
+    && mkdir -p /opt/darkfactory /workspace /var/log/claude-bodies \
+    && chown -R agent:agent /opt/darkfactory /workspace /var/log/claude-bodies
 
 USER agent
 WORKDIR /opt/darkfactory

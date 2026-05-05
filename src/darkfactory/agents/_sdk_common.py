@@ -16,7 +16,6 @@ parsing the assistant's final message — workers commit code through `Edit` /
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import re
 from pathlib import Path
@@ -28,7 +27,6 @@ from claude_agent_sdk import (
     ResultMessage,
     TextBlock,
 )
-from opentelemetry import trace
 from pydantic import BaseModel, Field, ValidationError
 
 T = TypeVar("T", bound=BaseModel)
@@ -48,7 +46,6 @@ class WorkerOutput(BaseModel):
     summary: str = ""
 
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
-_GENERATION_TRACER = "darkfactory.sdk.generation"
 
 
 class ParseError(Exception):
@@ -77,191 +74,6 @@ def repo_summary(repo_context: dict | None) -> str:
 
 
 _FENCED_JSON_RE = re.compile(r"```(?:json)?\s*\n(.*?)\n\s*```", re.DOTALL)
-
-
-@dataclass(frozen=True)
-class _GenerationObservation:
-    model: str | None
-    usage: dict[str, Any] | None
-    message_id: str | None
-    session_id: str | None
-    stop_reason: str | None
-
-
-def _int_usage(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    return None
-
-
-def _normalise_usage_key(key: str) -> str:
-    aliases = {
-        "inputTokens": "input_tokens",
-        "outputTokens": "output_tokens",
-        "cacheReadInputTokens": "cache_read_input_tokens",
-        "cacheCreationInputTokens": "cache_creation_input_tokens",
-    }
-    return aliases.get(key, key)
-
-
-def _usage_details(usage: dict[str, Any] | None) -> dict[str, int]:
-    if not usage:
-        return {}
-
-    details: dict[str, int] = {}
-    for raw_key, value in usage.items():
-        key = _normalise_usage_key(raw_key)
-        numeric = _int_usage(value)
-        if numeric is None:
-            continue
-        if key == "costUSD":
-            continue
-        if key.endswith("_tokens"):
-            details[key[: -len("_tokens")]] = numeric
-        else:
-            details[key] = numeric
-
-    if "total" not in details:
-        total = sum(value for key, value in details.items() if key != "total")
-        if total:
-            details["total"] = total
-    return details
-
-
-def _usage_token(usage: dict[str, Any] | None, key: str) -> int | None:
-    if not usage:
-        return None
-    value = usage.get(key)
-    if value is None:
-        camel_aliases = {
-            "input_tokens": "inputTokens",
-            "output_tokens": "outputTokens",
-        }
-        value = usage.get(camel_aliases.get(key, key))
-    return _int_usage(value)
-
-
-def _usage_cost(usage: dict[str, Any] | None) -> float | None:
-    if not usage:
-        return None
-    value = usage.get("costUSD")
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
-    return None
-
-
-def _model_usage_observations(final: ResultMessage) -> list[_GenerationObservation]:
-    if not final.model_usage:
-        return []
-
-    observations: list[_GenerationObservation] = []
-    for model, usage in final.model_usage.items():
-        if not isinstance(usage, dict):
-            continue
-        observations.append(
-            _GenerationObservation(
-                model=str(model),
-                usage=usage,
-                message_id=final.uuid,
-                session_id=final.session_id,
-                stop_reason=final.stop_reason,
-            )
-        )
-    return observations
-
-
-def _emit_generation_span(
-    observation: _GenerationObservation,
-    *,
-    cost_usd: float | None,
-    index: int,
-) -> None:
-    usage_details = _usage_details(observation.usage)
-    if not (observation.model or usage_details or cost_usd is not None):
-        return
-
-    tracer = trace.get_tracer(_GENERATION_TRACER)
-    with tracer.start_as_current_span("gen_ai.claude_code") as span:
-        span.set_attribute("langfuse.observation.type", "generation")
-        span.set_attribute("gen_ai.system", "anthropic")
-        span.set_attribute("gen_ai.operation.name", "chat")
-        span.set_attribute("darkfactory.generation.index", index)
-        if observation.model:
-            span.set_attribute("gen_ai.request.model", observation.model)
-            span.set_attribute("gen_ai.response.model", observation.model)
-            span.set_attribute("langfuse.observation.model.name", observation.model)
-        if observation.message_id:
-            span.set_attribute("gen_ai.response.id", observation.message_id)
-        if observation.session_id:
-            span.set_attribute(
-                "langfuse.observation.metadata.claude_session_id",
-                observation.session_id,
-            )
-        if observation.stop_reason:
-            span.set_attribute("gen_ai.response.finish_reasons", observation.stop_reason)
-
-        input_tokens = _usage_token(observation.usage, "input_tokens")
-        output_tokens = _usage_token(observation.usage, "output_tokens")
-        if input_tokens is not None:
-            span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
-        if output_tokens is not None:
-            span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
-        if usage_details:
-            span.set_attribute(
-                "langfuse.observation.usage_details",
-                json.dumps(usage_details, sort_keys=True),
-            )
-        if cost_usd is not None:
-            span.set_attribute("gen_ai.usage.cost", cost_usd)
-            span.set_attribute(
-                "langfuse.observation.cost_details",
-                json.dumps({"total": cost_usd}, sort_keys=True),
-            )
-
-
-def _emit_generation_spans(
-    observations: list[_GenerationObservation],
-    final: ResultMessage | None,
-) -> None:
-    if final is None:
-        for index, observation in enumerate(observations):
-            _emit_generation_span(observation, cost_usd=None, index=index)
-        return
-
-    final_observations = observations or _model_usage_observations(final)
-    if not final_observations and (final.usage or final.total_cost_usd is not None):
-        final_observations = [
-            _GenerationObservation(
-                model=None,
-                usage=final.usage,
-                message_id=final.uuid,
-                session_id=final.session_id,
-                stop_reason=final.stop_reason,
-            )
-        ]
-
-    last_index = len(final_observations) - 1
-    for index, observation in enumerate(final_observations):
-        usage = observation.usage
-        if usage is None and index == last_index:
-            usage = final.usage
-        enriched = _GenerationObservation(
-            model=observation.model,
-            usage=usage,
-            message_id=observation.message_id or final.uuid,
-            session_id=observation.session_id or final.session_id,
-            stop_reason=observation.stop_reason or final.stop_reason,
-        )
-        cost = (
-            final.total_cost_usd
-            if index == last_index and final.total_cost_usd is not None
-            else _usage_cost(enriched.usage)
-        )
-        _emit_generation_span(enriched, cost_usd=cost, index=index)
 
 
 def _extract_json(text: str) -> str | None:
@@ -306,24 +118,13 @@ async def _drain(client: ClaudeSDKClient) -> tuple[str, ResultMessage | None]:
     """Iterate `receive_response()` to exhaustion; return (last assistant text, ResultMessage)."""
     last_text_chunks: list[str] = []
     final: ResultMessage | None = None
-    observations: list[_GenerationObservation] = []
     async for msg in client.receive_response():
         if isinstance(msg, AssistantMessage):
             last_text_chunks = [
                 block.text for block in msg.content if isinstance(block, TextBlock)
             ]
-            observations.append(
-                _GenerationObservation(
-                    model=msg.model,
-                    usage=msg.usage,
-                    message_id=msg.message_id or msg.uuid,
-                    session_id=msg.session_id,
-                    stop_reason=msg.stop_reason,
-                )
-            )
         elif isinstance(msg, ResultMessage):
             final = msg
-    _emit_generation_spans(observations, final)
     return "".join(last_text_chunks), final
 
 

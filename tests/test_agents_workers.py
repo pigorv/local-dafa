@@ -156,15 +156,15 @@ def test_worker_client_options_are_hermetic_and_sdk_native(
 def test_each_worker_has_loop_breaker_and_call_cap_on_pretool() -> None:
     client = make_backend_client(_state_slice())
     pre_hooks = list(client.options.hooks["PreToolUse"][0].hooks)
-    # loop_breaker + call_cap (M2-5) + otel_pre (M3-2).
-    assert len(pre_hooks) == 3
+    # loop_breaker + call_cap (M2-5).
+    assert len(pre_hooks) == 2
 
 
 def test_each_worker_has_diff_capture_and_injection_guard_on_posttool() -> None:
     client = make_database_client(_state_slice())
     post_hooks = list(client.options.hooks["PostToolUse"][0].hooks)
-    # diff_capture (M2-7) + prompt_injection_guard (M2-8) + otel_post (M3-2).
-    assert len(post_hooks) == 3
+    # diff_capture (M2-7) + prompt_injection_guard (M2-8).
+    assert len(post_hooks) == 2
 
 
 def test_each_worker_has_goal_pin_on_user_prompt_submit() -> None:

@@ -16,7 +16,6 @@ from darkfactory.agents._sdk_common import (
 from darkfactory.hooks.call_cap import make_call_cap
 from darkfactory.hooks.goal_pin import make_goal_pin
 from darkfactory.hooks.loop_breaker import make_loop_breaker
-from darkfactory.hooks.otel_emit import make_otel_emit
 from darkfactory.llm_factory import build_options
 
 
@@ -47,17 +46,13 @@ def _user_message(state_slice: dict) -> str:
 
 def make_po_client(state_slice: dict) -> ClaudeSDKClient:
     user_request = state_slice.get("user_request", "") or ""
-    otel_pre, otel_post = make_otel_emit("po")
     options = build_options(
         "po",
         system_prompt=load_prompt("po"),
         allowed_tools=[],
         hooks={
             "PreToolUse": [
-                HookMatcher(hooks=[make_loop_breaker(), make_call_cap(), otel_pre]),
-            ],
-            "PostToolUse": [
-                HookMatcher(hooks=[otel_post]),
+                HookMatcher(hooks=[make_loop_breaker(), make_call_cap()]),
             ],
             "UserPromptSubmit": [
                 HookMatcher(hooks=[make_goal_pin(user_request)]),

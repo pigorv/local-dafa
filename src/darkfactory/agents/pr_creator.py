@@ -18,7 +18,6 @@ from darkfactory.hooks.call_cap import make_call_cap
 from darkfactory.hooks.goal_pin import make_goal_pin
 from darkfactory.hooks.heartbeat import make_heartbeat
 from darkfactory.hooks.loop_breaker import make_loop_breaker
-from darkfactory.hooks.otel_emit import make_otel_emit
 from darkfactory.hooks.permission_gate import make_permission_gate
 from darkfactory.hooks.prompt_injection_guard import make_prompt_injection_guard
 from darkfactory.llm_factory import build_options
@@ -85,17 +84,16 @@ def make_pr_creator_client(state_slice: dict) -> ClaudeSDKClient:
     task_id = _wf_id(state_slice)
     gate_approved = bool(state_slice.get("gate_approved", False))
 
-    otel_pre, otel_post = make_otel_emit(ROLE)
     options = build_options(
         ROLE,
         system_prompt=load_prompt(ROLE),
         allowed_tools=ALLOWED_TOOLS,
         hooks={
             "PreToolUse": [
-                HookMatcher(hooks=[make_loop_breaker(), make_call_cap(), otel_pre]),
+                HookMatcher(hooks=[make_loop_breaker(), make_call_cap()]),
             ],
             "PostToolUse": [
-                HookMatcher(hooks=[make_prompt_injection_guard(), otel_post]),
+                HookMatcher(hooks=[make_prompt_injection_guard()]),
             ],
             "UserPromptSubmit": [
                 HookMatcher(hooks=[make_goal_pin(user_request)]),

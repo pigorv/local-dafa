@@ -23,7 +23,6 @@ from darkfactory.hooks.diff_capture import make_diff_capture
 from darkfactory.hooks.goal_pin import make_goal_pin
 from darkfactory.hooks.heartbeat import make_heartbeat
 from darkfactory.hooks.loop_breaker import make_loop_breaker
-from darkfactory.hooks.otel_emit import make_otel_emit
 from darkfactory.hooks.permission_gate import make_permission_gate
 from darkfactory.hooks.prompt_injection_guard import make_prompt_injection_guard
 from darkfactory.llm_factory import build_options
@@ -58,21 +57,19 @@ def make_database_client(
     task_id = state_slice.get("task_id", "") or ""
     slice_id = state_slice.get("current_slice", "") or ""
 
-    otel_pre, otel_post = make_otel_emit(ROLE)
     options = build_options(
         ROLE,
         system_prompt=load_prompt(ROLE),
         allowed_tools=ALLOWED_TOOLS,
         hooks={
             "PreToolUse": [
-                HookMatcher(hooks=[make_loop_breaker(), make_call_cap(), otel_pre]),
+                HookMatcher(hooks=[make_loop_breaker(), make_call_cap()]),
             ],
             "PostToolUse": [
                 HookMatcher(
                     hooks=[
                         make_diff_capture(ROLE, slice_id, task_id, patches_sink),
                         make_prompt_injection_guard(),
-                        otel_post,
                     ]
                 ),
             ],

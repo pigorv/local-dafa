@@ -134,9 +134,8 @@ def test_po_client_options_are_hermetic_and_no_tool() -> None:
     assert "PreToolUse" in opts.hooks
     assert "UserPromptSubmit" in opts.hooks
     pre_hooks = _hook_callbacks(opts.hooks["PreToolUse"][0])
-    assert len(pre_hooks) == 3  # loop_breaker + call_cap + otel_pre (M3-2)
-    post_hooks = _hook_callbacks(opts.hooks["PostToolUse"][0])
-    assert len(post_hooks) == 1  # otel_post (M3-2)
+    assert len(pre_hooks) == 2  # loop_breaker + call_cap
+    assert "PostToolUse" not in opts.hooks  # no PostToolUse hooks for reasoning-only roles
 
 
 def test_architect_client_options_are_hermetic_and_no_tool() -> None:

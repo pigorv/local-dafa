@@ -3,17 +3,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-import json
 
 import pytest
 from claude_agent_sdk.types import AssistantMessage, ResultMessage, TextBlock
-from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
-    InMemorySpanExporter,
-)
-from opentelemetry.trace import ProxyTracerProvider
 from pydantic import BaseModel
 
 from darkfactory.agents._sdk_common import ParseError, run_to_completion
@@ -22,32 +14,6 @@ from darkfactory.agents._sdk_common import ParseError, run_to_completion
 class Greeting(BaseModel):
     hello: str
     n: int
-
-
-_exporter = InMemorySpanExporter()
-_processor_attached = False
-
-
-def _ensure_in_memory_exporter() -> None:
-    global _processor_attached
-    if _processor_attached:
-        return
-
-    provider = trace.get_tracer_provider()
-    if isinstance(provider, ProxyTracerProvider):
-        new_provider = TracerProvider()
-        new_provider.add_span_processor(SimpleSpanProcessor(_exporter))
-        trace.set_tracer_provider(new_provider)
-    elif isinstance(provider, TracerProvider):
-        provider.add_span_processor(SimpleSpanProcessor(_exporter))
-    _processor_attached = True
-
-
-@pytest.fixture(autouse=True)
-def _clean_spans() -> None:
-    _ensure_in_memory_exporter()
-    _exporter.clear()
-    yield
 
 
 def _assistant(
@@ -173,41 +139,3 @@ def test_run_to_completion_without_schema_returns_text_and_result() -> None:
     assert isinstance(out, dict)
     assert out["text"] == "free-form answer"
     assert isinstance(out["result"], ResultMessage)
-
-
-def test_run_to_completion_emits_langfuse_generation_usage_and_cost_span() -> None:
-    client = FakeClient(
-        [
-            [
-                _assistant(
-                    "free-form answer",
-                    usage={"input_tokens": 11, "output_tokens": 7},
-                    model="claude-test-model",
-                ),
-                _result(total_cost_usd=0.0012),
-            ]
-        ]
-    )
-
-    out = asyncio.run(run_to_completion(client))  # type: ignore[arg-type]
-
-    assert isinstance(out, dict)
-    spans = [
-        span for span in _exporter.get_finished_spans() if span.name == "gen_ai.claude_code"
-    ]
-    assert len(spans) == 1
-    attrs = dict(spans[0].attributes)
-    assert attrs["langfuse.observation.type"] == "generation"
-    assert attrs["langfuse.observation.model.name"] == "claude-test-model"
-    assert attrs["gen_ai.request.model"] == "claude-test-model"
-    assert attrs["gen_ai.usage.input_tokens"] == 11
-    assert attrs["gen_ai.usage.output_tokens"] == 7
-    assert attrs["gen_ai.usage.cost"] == 0.0012
-    assert json.loads(attrs["langfuse.observation.usage_details"]) == {
-        "input": 11,
-        "output": 7,
-        "total": 18,
-    }
-    assert json.loads(attrs["langfuse.observation.cost_details"]) == {
-        "total": 0.0012
-    }
