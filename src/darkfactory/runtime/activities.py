@@ -164,6 +164,8 @@ async def setup_worker_activity(wf_id: str, repo_url: str) -> str:
     except NotFound:
         pass
 
+    otlp_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", DEFAULT_OTLP_ENDPOINT)
+    environment = os.environ.get("DARKFACTORY_ENVIRONMENT", "local")
     container = client.containers.run(
         image=WORKER_IMAGE,
         name=name,
@@ -172,10 +174,33 @@ async def setup_worker_activity(wf_id: str, repo_url: str) -> str:
         environment={
             "TEMPORAL_ADDRESS": _worker_temporal_address(),
             "TEMPORAL_TASK_QUEUE": f"agent-tq-{wf_id}",
+            "DARKFACTORY_WF_ID": wf_id,
+            "DARKFACTORY_ENVIRONMENT": environment,
             "CLAUDE_CODE_OAUTH_TOKEN": os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", ""),
             "GITHUB_TOKEN": os.environ.get("GITHUB_TOKEN", ""),
-            "OTEL_EXPORTER_OTLP_ENDPOINT": os.environ.get(
-                "OTEL_EXPORTER_OTLP_ENDPOINT", DEFAULT_OTLP_ENDPOINT
+            # Native Claude Code telemetry — see https://code.claude.com/docs/en/monitoring-usage.
+            # Each role activity opens its own ClaudeSDKClient (one CLI subprocess per
+            # activity), so traces propagate from the Temporal activity span via
+            # TRACEPARENT injected in llm_factory.build_options().
+            "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+            "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
+            "OTEL_TRACES_EXPORTER": "otlp",
+            "OTEL_LOGS_EXPORTER": "otlp",
+            "OTEL_METRICS_EXPORTER": "none",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "grpc",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": otlp_endpoint,
+            "OTEL_TRACES_EXPORT_INTERVAL": "1000",
+            "OTEL_LOGS_EXPORT_INTERVAL": "1000",
+            # Local-only content gates: prompts, tool args, tool I/O, and full API bodies
+            # are captured. Strip these on any non-local deployment.
+            "OTEL_LOG_USER_PROMPTS": "1",
+            "OTEL_LOG_TOOL_DETAILS": "1",
+            "OTEL_LOG_TOOL_CONTENT": "1",
+            "OTEL_LOG_RAW_API_BODIES": "file:/var/log/claude-bodies",
+            "OTEL_RESOURCE_ATTRIBUTES": (
+                f"darkfactory.workflow_id={wf_id},"
+                f"darkfactory.environment={environment},"
+                "service.namespace=darkfactory"
             ),
         },
         volumes={repo_url: {"bind": "/workspace", "mode": "rw"}},

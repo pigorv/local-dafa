@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 
+from opentelemetry import trace
 from temporalio.client import Client
 from temporalio.contrib.opentelemetry import TracingInterceptor
 from temporalio.contrib.pydantic import pydantic_data_converter
@@ -23,14 +24,15 @@ SUPERVISOR_TASK_QUEUE = "supervisor-tq"
 async def main() -> None:
     init_observability("darkfactory-orchestrator")
     address = os.environ.get("TEMPORAL_ADDRESS", DEFAULT_TEMPORAL_ADDRESS)
-    # `always_create_workflow_spans=True` is required when the workflow is
-    # started by a process that has no OTel TracerProvider configured (the
-    # `darkfactory` CLI, Temporal schedules, the Temporal UI, etc.). Without
-    # it, the workflow inbound interceptor sees no inbound parent context
-    # and silently skips the `RunWorkflow:<type>` root span — every
-    # `workflow.execute_activity` then becomes its own trace root and
-    # Langfuse shows N disconnected traces per run instead of one.
-    tracing_interceptor = TracingInterceptor(always_create_workflow_spans=True)
+    # Default `always_create_workflow_spans=False`: the contrib interceptor
+    # also creates workflow / activity spans during workflow REPLAY when this
+    # is True, which produces N copies of every span (~6× the loop body in
+    # observed traces). The `darkfactory` CLI initialises OTel via
+    # `init_observability("darkfactory-cli")` and starts a parent span before
+    # `start_workflow`, so RunWorkflow always inherits a real parent context;
+    # the original justification ("workflow started without a tracer") no
+    # longer applies. Schedules / Temporal UI starts are not used.
+    tracing_interceptor = TracingInterceptor()
     client = await Client.connect(
         address,
         data_converter=pydantic_data_converter,
@@ -43,7 +45,16 @@ async def main() -> None:
         activities=[setup_worker_activity, teardown_worker_activity],
         interceptors=[tracing_interceptor],
     )
-    await worker.run()
+    try:
+        await worker.run()
+    finally:
+        provider = trace.get_tracer_provider()
+        flush = getattr(provider, "force_flush", None)
+        if callable(flush):
+            flush()
+        shutdown = getattr(provider, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
 
 
 if __name__ == "__main__":

@@ -9,6 +9,77 @@ receivers:
 processors:
   batch: {}
 
+  # Coalesce OTel trace_id across one workflow run so Langfuse renders it as
+  # a single trace. Langfuse OTLP indexes observations by OTel trace_id and
+  # ignores the `langfuse.trace.id` span attribute for grouping (verified —
+  # two spans in distinct OTel traces stamped with identical `langfuse.trace.id`
+  # still landed as two separate Langfuse traces).
+  #
+  # We derive a deterministic 32-char hex from whichever workflow id source
+  # the span carries, then `set(trace_id.string, ...)`. The fallback chain:
+  #   1. attributes["temporalWorkflowID"] — set by temporalio's TracingInterceptor
+  #      on every workflow / activity span on the Python side.
+  #   2. attributes["langfuse.session.id"] — stamped by SessionStampingSpanProcessor
+  #      and by the cli.run / activity bodies.
+  #   3. resource.attributes["darkfactory.workflow_id"] — set by the worker
+  #      container's OTEL_RESOURCE_ATTRIBUTES, picked up by the bundled
+  #      `claude` CLI subprocess for its native `claude_code.*` spans.
+  # Span IDs and parent_span_ids are untouched, so existing parent-child
+  # links resolve correctly within the now-unified trace; cross-process
+  # orphans land as siblings under the same trace rather than separate traces.
+  transform/coalesce_trace_id:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - set(attributes["darkfactory._wf_src"], attributes["temporalWorkflowID"]) where attributes["temporalWorkflowID"] != nil
+          - set(attributes["darkfactory._wf_src"], attributes["langfuse.session.id"]) where attributes["darkfactory._wf_src"] == nil and attributes["langfuse.session.id"] != nil
+          - set(attributes["darkfactory._wf_src"], resource.attributes["darkfactory.workflow_id"]) where attributes["darkfactory._wf_src"] == nil and resource.attributes["darkfactory.workflow_id"] != nil
+          - set(trace_id.string, Substring(SHA256(attributes["darkfactory._wf_src"]), 0, 32)) where attributes["darkfactory._wf_src"] != nil
+          # Stamp langfuse.trace.name on EVERY span in the unified trace.
+          # Langfuse OTLP last-write-wins on trace name; without this, late-
+          # arriving CLI spans (claude_code.*) overwrite the trace name with
+          # their own. Hardcoded to the only workflow type in dark-factory.
+          - set(attributes["langfuse.trace.name"], "DarkFactoryWorkflow") where attributes["darkfactory._wf_src"] != nil and attributes["langfuse.trace.name"] == nil
+          - delete_key(attributes, "darkfactory._wf_src")
+
+          # Re-parent orphan top-level claude_code.* spans onto the Python
+          # span that spawned the SDK subprocess. The CLI emits `tool` and
+          # most `llm_request` spans as roots (TRACEPARENT only adopts the
+          # first span — claude_code.interaction). `llm_factory.build_options`
+          # passes `darkfactory.cli_parent_span_id` as a resource attribute
+          # (the active span_id at SDK invocation, i.e. the LangGraph node or
+          # the activity span). We only rewrite the THREE top-level names —
+          # `claude_code.tool.execution` / `.blocked_on_user` keep their real
+          # in-trace parent (claude_code.tool).
+          - set(parent_span_id.string, resource.attributes["darkfactory.cli_parent_span_id"]) where IsMatch(name, "^claude_code\\.(tool|llm_request|interaction)$") and resource.attributes["darkfactory.cli_parent_span_id"] != nil
+
+  # Map native Claude Code span attributes onto the Langfuse schema.
+  # The worker container sets `darkfactory.workflow_id` as a resource attribute
+  # via OTEL_RESOURCE_ATTRIBUTES; we lift it to `langfuse.session.id` so every
+  # span emitted by the bundled `claude` CLI subprocess groups under the same
+  # Langfuse session as the Python-side Temporal/LangGraph spans.
+  transform/langfuse:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - set(attributes["langfuse.session.id"], resource.attributes["darkfactory.workflow_id"]) where resource.attributes["darkfactory.workflow_id"] != nil
+          - set(attributes["session.id"], resource.attributes["darkfactory.workflow_id"]) where resource.attributes["darkfactory.workflow_id"] != nil
+          - set(attributes["langfuse.environment"], resource.attributes["darkfactory.environment"]) where resource.attributes["darkfactory.environment"] != nil
+          - set(attributes["deployment.environment"], resource.attributes["darkfactory.environment"]) where resource.attributes["darkfactory.environment"] != nil
+          # claude_code.llm_request -> Langfuse generation observation.
+          # Cost is not on the span (it lives on the api_request log event); Langfuse
+          # rolls cost up from model + token counts using its own price table.
+          - set(attributes["langfuse.observation.type"], "generation") where name == "claude_code.llm_request"
+          - set(attributes["langfuse.observation.model.name"], attributes["model"]) where name == "claude_code.llm_request" and attributes["model"] != nil
+          - set(attributes["gen_ai.usage.input_tokens"], attributes["input_tokens"]) where name == "claude_code.llm_request" and attributes["input_tokens"] != nil
+          - set(attributes["gen_ai.usage.output_tokens"], attributes["output_tokens"]) where name == "claude_code.llm_request" and attributes["output_tokens"] != nil
+          - set(attributes["gen_ai.usage.cache_read_input_tokens"], attributes["cache_read_tokens"]) where name == "claude_code.llm_request" and attributes["cache_read_tokens"] != nil
+          - set(attributes["gen_ai.usage.cache_creation_input_tokens"], attributes["cache_creation_tokens"]) where name == "claude_code.llm_request" and attributes["cache_creation_tokens"] != nil
+          # claude_code.tool* -> Langfuse tool observation.
+          - set(attributes["langfuse.observation.type"], "tool") where IsMatch(name, "^claude_code\\.tool")
+
 exporters:
   otlp_http/langfuse:
     traces_endpoint: http://langfuse-web:3000/api/public/otel/v1/traces
@@ -23,7 +94,21 @@ service:
       receivers:
         - otlp
       processors:
+        - transform/coalesce_trace_id
+        - transform/langfuse
         - batch
       exporters:
         - otlp_http/langfuse
+        - debug
+    # Native Claude Code events (claude_code.api_request, .tool_result,
+    # .api_retries_exhausted, .mcp_server_connection, ...) ride OTLP logs.
+    # Langfuse OTLP ingest does not currently consume these, so route them to
+    # the debug exporter; wire a real backend (Loki, Langfuse logs ingest) when
+    # we add one.
+    logs:
+      receivers:
+        - otlp
+      processors:
+        - batch
+      exporters:
         - debug

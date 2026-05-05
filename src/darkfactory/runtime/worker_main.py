@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 
+from opentelemetry import trace
 from temporalio.client import Client
 from temporalio.contrib.opentelemetry import TracingInterceptor
 from temporalio.contrib.pydantic import pydantic_data_converter
@@ -30,11 +31,7 @@ async def main() -> None:
         os.environ.setdefault("DARKFACTORY_WF_ID", task_queue[len(AGENT_TASK_QUEUE_PREFIX):])
     init_observability("darkfactory-worker")
     address = os.environ.get("TEMPORAL_ADDRESS", DEFAULT_TEMPORAL_ADDRESS)
-    # See comment in `orchestrator_main.py`. The agent worker doesn't host a
-    # workflow definition, but we mirror the flag for symmetry — and so any
-    # local-only workflow that ever runs on this worker (none today) inherits
-    # the same behaviour.
-    tracing_interceptor = TracingInterceptor(always_create_workflow_spans=True)
+    tracing_interceptor = TracingInterceptor()
     client = await Client.connect(
         address,
         data_converter=pydantic_data_converter,
@@ -46,7 +43,18 @@ async def main() -> None:
         activities=[ping_activity, *STAGE_ACTIVITIES],
         interceptors=[tracing_interceptor],
     )
-    await worker.run()
+    try:
+        await worker.run()
+    finally:
+        # Flush any spans buffered in BatchSpanProcessor before container teardown
+        # by teardown_worker_activity, otherwise late activity spans may be lost.
+        provider = trace.get_tracer_provider()
+        flush = getattr(provider, "force_flush", None)
+        if callable(flush):
+            flush()
+        shutdown = getattr(provider, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
 
 
 if __name__ == "__main__":

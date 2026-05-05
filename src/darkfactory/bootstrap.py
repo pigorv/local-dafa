@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Optional
 
 import darkfactory
-from openinference.instrumentation.anthropic import AnthropicInstrumentor
 from openinference.instrumentation.langchain import LangChainInstrumentor
 from opentelemetry import trace
 from opentelemetry.context import Context
@@ -15,7 +15,11 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter
 from opentelemetry.trace import ProxyTracerProvider
 
 
-DEFAULT_OTLP_ENDPOINT = "http://otel-collector:4317"
+# Default to localhost:4317 because the CLI typically runs on the host where
+# docker-compose's port mapping (0.0.0.0:4317->4317) makes the collector
+# reachable. The orchestrator and worker containers override this with the
+# Docker DNS name `otel-collector:4317` via docker-compose.yml.
+DEFAULT_OTLP_ENDPOINT = "http://localhost:4317"
 
 _WF_ID_ENV = "DARKFACTORY_WF_ID"
 _ENVIRONMENT_ENV = "DARKFACTORY_ENVIRONMENT"
@@ -38,8 +42,19 @@ class SessionStampingSpanProcessor(SpanProcessor):
       2. Parent span's langfuse.session.id — already-stamped ancestor.
       3. Parent span's temporalWorkflowID — added by
          temporalio.contrib.opentelemetry.TracingInterceptor on RunActivity
-         spans, lets child spans (LangGraph, gen_ai.claude_code, tool.*)
-         inherit the workflow id even in the multi-workflow orchestrator.
+         spans, lets Python-side child spans (LangGraph, etc.) inherit the
+         workflow id even in the multi-workflow orchestrator.
+
+    Cross-trace coalescing into a single Langfuse trace is handled by the
+    otel-collector's `transform/coalesce_trace_id` processor, which derives
+    a deterministic OTel `trace_id` from `temporalWorkflowID` /
+    `langfuse.session.id` / `resource.attributes["darkfactory.workflow_id"]`
+    via `Substring(SHA256(...), 0, 32)`. We do not stamp the unified id from
+    Python because the orchestrator hosts spans whose parent is cross-process
+    (the cli.run span via TraceContextPropagator) — at on_start the parent
+    is a NonRecordingSpan with no readable attributes — and Temporal's
+    interceptor sets `temporalWorkflowID` only after on_start. The collector
+    sees the final attribute state, so it's the right place to do the rewrite.
     """
 
     def __init__(self, default_wf_id: Optional[str], environment: Optional[str]) -> None:
@@ -90,9 +105,23 @@ def init_observability(
     neither and get the default OTLP gRPC exporter wrapped in a
     `BatchSpanProcessor`. Tests typically pass a `SimpleSpanProcessor` wrapping
     an `InMemorySpanExporter` to assert span attributes deterministically.
+
+    Set `OTEL_SDK_DISABLED=true` to skip OTel setup entirely (standard OTel
+    escape hatch — useful when the collector is unreachable, e.g. running
+    the CLI without `docker compose up`).
     """
+    if os.environ.get("OTEL_SDK_DISABLED", "").lower() in ("1", "true", "yes"):
+        return
     if not isinstance(trace.get_tracer_provider(), ProxyTracerProvider):
         return
+
+    # Suppress per-retry WARNING spam from BatchSpanProcessor's exporter when the
+    # collector is briefly unreachable; the final ERROR-level "Failed to export"
+    # still surfaces. Set DARKFACTORY_OTEL_VERBOSE=1 to keep retry logs.
+    if not os.environ.get("DARKFACTORY_OTEL_VERBOSE"):
+        logging.getLogger("opentelemetry.exporter.otlp.proto.grpc.exporter").setLevel(
+            logging.ERROR
+        )
 
     provider = TracerProvider(
         resource=Resource.create(
@@ -118,5 +147,12 @@ def init_observability(
         provider.add_span_processor(BatchSpanProcessor(active_exporter))
     trace.set_tracer_provider(provider)
 
-    AnthropicInstrumentor().instrument()
+    # Claude Agent SDK telemetry rides the bundled `claude` CLI's native
+    # exporters (CLAUDE_CODE_ENABLE_TELEMETRY=1 + OTEL_TRACES_EXPORTER=otlp set
+    # on the worker container). The Python SDK never goes through the public
+    # `anthropic` client, so AnthropicInstrumentor is intentionally not wired.
+    # The SDK itself injects W3C TRACEPARENT into the CLI subprocess env from
+    # the active OTel span (claude_agent_sdk's subprocess transport, not us),
+    # so the CLI's `claude_code.interaction` span and its children adopt the
+    # activity trace_id without anything extra on our side.
     LangChainInstrumentor().instrument()
