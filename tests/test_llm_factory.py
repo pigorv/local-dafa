@@ -46,3 +46,24 @@ def test_build_options_unknown_role_raises() -> None:
 def test_build_options_default_cwd_is_workspace() -> None:
     opts = build_options("po", **_BASE_KWARGS)
     assert opts.cwd == "/workspace"
+
+
+@pytest.mark.parametrize("role", sorted(_ROLE_DEFAULTS))
+def test_build_options_disables_interactive_permission_ui(role: str) -> None:
+    """In non-interactive worker containers the CLI's permission UI hangs
+    (`claude_code.tool.blocked_on_user`). `bypassPermissions` skips that
+    UI; `can_use_tool` (the per-role permission gate) is still consulted.
+    """
+    opts = build_options(role, **_BASE_KWARGS)
+    assert opts.permission_mode == "bypassPermissions"
+
+
+@pytest.mark.parametrize("role", sorted(_ROLE_DEFAULTS))
+def test_build_options_disallows_builtin_bash_and_toolsearch(role: str) -> None:
+    """Built-in `Bash` and `ToolSearch` are never allowed: the worker prompts
+    route every shell call through `mcp__darkfactory__sandbox_bash`, and our
+    MCP tools are registered eagerly so deferred-tool discovery isn't needed.
+    """
+    opts = build_options(role, **_BASE_KWARGS)
+    assert "Bash" in opts.disallowed_tools
+    assert "ToolSearch" in opts.disallowed_tools

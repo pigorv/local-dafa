@@ -51,6 +51,16 @@ _ROLE_DEFAULTS: dict[str, _RoleDefaults] = {
 
 _THINKING_BUDGET_TOKENS = 4096
 
+# Built-in CLI tools we never want a role to invoke. The Claude Code CLI's
+# permission UI runs *before* `can_use_tool` for tools not in `allowed_tools`,
+# and in non-interactive worker containers that UI hangs (telemetry shows up
+# as `claude_code.tool.blocked_on_user`). Listing the tool here causes the
+# SDK to reject the call without the UI roundtrip. `Bash` is the standard
+# escape hatch the model otherwise reaches for; `ToolSearch` is the deferred-
+# tool discovery mechanism we don't use (all our MCP tools are exposed
+# eagerly via `mcp_servers=`).
+_DISALLOWED_BUILTIN_TOOLS: tuple[str, ...] = ("Bash", "ToolSearch")
+
 CanUseTool = Callable[
     [str, dict[str, Any], ToolPermissionContext],
     Awaitable[PermissionResultAllow | PermissionResultDeny],
@@ -149,6 +159,7 @@ def build_options(
         model=model,
         system_prompt=system_prompt,
         allowed_tools=allowed_tools,
+        disallowed_tools=list(_DISALLOWED_BUILTIN_TOOLS),
         mcp_servers=mcp_servers or {},
         can_use_tool=can_use_tool,
         hooks=hooks,
@@ -156,6 +167,7 @@ def build_options(
         setting_sources=[],
         thinking=thinking_cfg,
         env=sdk_env,
+        permission_mode="bypassPermissions",
     )
     options.temperature = temperature
     return options

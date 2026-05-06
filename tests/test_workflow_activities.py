@@ -17,7 +17,7 @@ import pytest
 
 from darkfactory.agents.architect import SpecSliceModel
 from darkfactory.agents.spec_adjustment import SpecAdjustmentOutput
-from darkfactory.state import CodeQualitySummary
+from darkfactory.state import CodeQualitySummary, RunRequest, init_state, merge
 from darkfactory.runtime import activities as activities_mod
 from darkfactory.runtime.activities import (
     STAGE_ACTIVITIES,
@@ -31,6 +31,7 @@ from darkfactory.runtime.activities import (
     setup_worker_activity,
     spec_adjustment_stage,
     teardown_worker_activity,
+    triage_stage,
     verify_stage,
 )
 
@@ -42,6 +43,7 @@ def _activity_definition(fn: Any):
 def test_each_stage_activity_has_temporal_definition():
     expected_names = {
         "hydrate_stage",
+        "triage_stage",
         "discovery_stage",
         "build_stage",
         "verify_stage",
@@ -83,6 +85,91 @@ def test_stage_activities_register_on_a_worker():
         assert defn.name
 
 
+class _FakeContainer:
+    def __init__(self):
+        self.exec_calls: list[dict[str, Any]] = []
+
+    def exec_run(self, cmd, **kwargs):
+        self.exec_calls.append({"cmd": cmd, **kwargs})
+        return types.SimpleNamespace(exit_code=0, output=b"")
+
+
+class _FakeContainersAPI:
+    def __init__(self, container: _FakeContainer):
+        self._container = container
+        self.run_kwargs: dict[str, Any] | None = None
+
+    def get(self, _name):
+        from docker.errors import NotFound
+        raise NotFound("not found")
+
+    def run(self, **kwargs):
+        self.run_kwargs = kwargs
+        return self._container
+
+
+class _FakeDockerClient:
+    def __init__(self, container: _FakeContainer):
+        self.containers = _FakeContainersAPI(container)
+
+
+def _patch_docker_for_setup(monkeypatch) -> tuple[_FakeContainer, _FakeContainersAPI]:
+    container = _FakeContainer()
+    fake_client = _FakeDockerClient(container)
+    monkeypatch.setattr(
+        activities_mod.docker, "from_env", lambda: fake_client
+    )
+    return container, fake_client.containers
+
+
+def test_setup_worker_activity_bind_mounts_local_path(monkeypatch):
+    container, containers_api = _patch_docker_for_setup(monkeypatch)
+
+    name = asyncio.run(setup_worker_activity("wf-local", "/host/path/to/repo"))
+
+    assert name.endswith("wf-local")
+    assert containers_api.run_kwargs is not None
+    assert containers_api.run_kwargs["volumes"] == {
+        "/host/path/to/repo": {"bind": "/workspace", "mode": "rw"}
+    }
+    # Only the branch checkout should fire — no clone for local-path runs.
+    cmds = [call["cmd"] for call in container.exec_calls]
+    assert all(cmd[0] == "git" for cmd in cmds)
+    assert not any(cmd[0] == "gh" for cmd in cmds)
+
+
+def test_setup_worker_activity_clones_when_repo_url_given(monkeypatch):
+    container, containers_api = _patch_docker_for_setup(monkeypatch)
+    url = "https://github.com/pigorv/dark-factory-target-test.git"
+
+    name = asyncio.run(setup_worker_activity("wf-issue", url))
+
+    assert name.endswith("wf-issue")
+    assert containers_api.run_kwargs is not None
+    # No bind mount: the URL would be an invalid volume spec.
+    assert containers_api.run_kwargs["volumes"] == {}
+
+    cmds = [call["cmd"] for call in container.exec_calls]
+    assert cmds[0] == ["gh", "repo", "clone", url, "/workspace"]
+    assert any(cmd[0] == "git" and "checkout" in cmd for cmd in cmds[1:])
+
+
+def test_setup_worker_activity_raises_when_clone_fails(monkeypatch):
+    container, _ = _patch_docker_for_setup(monkeypatch)
+
+    def failing_exec(cmd, **kwargs):
+        if cmd[:2] == ["gh", "repo"]:
+            return types.SimpleNamespace(exit_code=128, output=b"auth required")
+        return types.SimpleNamespace(exit_code=0, output=b"")
+
+    container.exec_run = failing_exec  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="gh repo clone failed"):
+        asyncio.run(
+            setup_worker_activity("wf-bad", "https://github.com/foo/bar.git")
+        )
+
+
 def test_hydrate_stage_returns_repo_context(tmp_path):
     """`hydrate_stage` reads `repo_path` from state and returns a `repo_context` dict."""
     (tmp_path / "AGENTS.md").write_text("demo repo")
@@ -90,6 +177,37 @@ def test_hydrate_stage_returns_repo_context(tmp_path):
     assert "repo_context" in out
     assert out["repo_context"]["agents_md"] == "demo repo"
     assert "repo_map" in out["repo_context"]
+
+
+def test_hydrate_stage_manual_run_state_skips_issue_context(monkeypatch, tmp_path):
+    """Manual `darkfactory run "<prompt>"` state does not trigger issue hydration."""
+    (tmp_path / "AGENTS.md").write_text("manual repo")
+
+    def fail_issue_collection(*_args, **_kwargs):
+        raise AssertionError("issue collection should not run for manual runs")
+
+    monkeypatch.setattr(
+        "darkfactory.stages.hydrator._collect_issue_context",
+        fail_issue_collection,
+    )
+
+    state = init_state(
+        RunRequest(
+            repo_url=str(tmp_path),
+            repo_path=str(tmp_path),
+            user_request="keep the manual flow working",
+            model_profile=None,
+        )
+    )
+
+    assert "issue" not in state
+    out = asyncio.run(hydrate_stage(state))
+    merged = merge(state, out)
+
+    assert merged["user_request"] == "keep the manual flow working"
+    assert merged["repo_context"]["agents_md"] == "manual repo"
+    assert "issue" not in merged
+    assert "issue_comments" not in merged
 
 
 def _install_fake_module(monkeypatch, name: str, **attrs) -> types.ModuleType:
@@ -135,6 +253,40 @@ def test_discovery_stage_invokes_subgraph(monkeypatch):
     assert out["stories"] == [{"id": "US-1", "title": "x"}]
     assert out["spec"] == [{"story_id": "US-1"}]
     assert out["review_decision"]["approved"] is True
+
+
+def test_triage_stage_invokes_subgraph(monkeypatch):
+    """`triage_stage` lazy-imports `triage_subgraph` and returns its decision delta."""
+    recorded: dict[str, Any] = {}
+
+    class FakeSubgraph:
+        async def ainvoke(self, state):
+            recorded["state"] = state
+            return {
+                **state,
+                "ready_to_build": False,
+                "clarification_questions": ["Which API should this use?"],
+                "derived_user_request": "",
+                "confidence": "medium",
+                "rationale": "The issue names the symptom but not the API.",
+            }
+
+    _install_fake_module(
+        monkeypatch,
+        "darkfactory.stages.triage",
+        triage_subgraph=lambda: FakeSubgraph(),
+    )
+
+    state = {"issue": {"number": 7, "title": "Add export"}}
+    out = asyncio.run(triage_stage(state))
+    assert recorded["state"] is state
+    assert out == {
+        "ready_to_build": False,
+        "clarification_questions": ["Which API should this use?"],
+        "derived_user_request": "",
+        "confidence": "medium",
+        "rationale": "The issue names the symptom but not the API.",
+    }
 
 
 def test_build_stage_invokes_subgraph_with_runctx(monkeypatch):
@@ -266,6 +418,95 @@ def test_spec_adjustment_stage_rejects_partial_patch_code():
     bad = SpecAdjustmentOutput(decision="patch_code", target_worker="backend")
     with pytest.raises(ValueError, match="missing required fields"):
         activities_mod._spec_adjustment_delta(bad)
+
+
+def test_spec_adjustment_stage_applies_patch_code_diff_to_workspace(monkeypatch):
+    """`patch_code` must `git apply` the diff so the next verify sees it on disk.
+
+    Without this step the diff sits in `state['patches']` as dead data and
+    the workspace stays unchanged — the failure mode that left
+    `df-issue-pigorv-dark-factory-target-test-1` looping until exhaustion.
+    """
+    diff_text = "--- /dev/null\n+++ b/pom.xml\n@@ -0,0 +1 @@\n+<project/>\n"
+    out_model = SpecAdjustmentOutput(
+        decision="patch_code",
+        rationale="missing build file",
+        target_worker="backend",
+        slice_id="US-1",
+        path="pom.xml",
+        diff=diff_text,
+    )
+
+    async def fake_run_spec_adjustment(state):
+        return out_model
+
+    _install_fake_module(
+        monkeypatch,
+        "darkfactory.agents.spec_adjustment",
+        run_spec_adjustment=fake_run_spec_adjustment,
+    )
+
+    calls: list[dict] = []
+
+    class FakeSandbox:
+        def exec(self, argv, timeout=120, stdin=None):
+            calls.append({"argv": list(argv), "stdin": stdin})
+            return {"returncode": 0, "stdout": "", "stderr": "", "timed_out": False}
+
+    monkeypatch.setattr(activities_mod, "_ensure_repo_sandbox", lambda state: FakeSandbox())
+
+    delta = asyncio.run(
+        spec_adjustment_stage(
+            {"task_id": "wf-x", "wf_id": "wf-x", "feature_branch": "agent/wf-x"}
+        )
+    )
+
+    apply_calls = [c for c in calls if c["argv"][:2] == ["git", "apply"]]
+    assert len(apply_calls) == 1, f"expected one git apply call, saw: {calls}"
+    assert apply_calls[0]["stdin"] == diff_text
+    assert delta["patches"][0]["path"] == "pom.xml"
+    assert delta["current_slice"] == "US-1"
+
+
+def test_spec_adjustment_stage_records_patch_even_when_apply_fails(monkeypatch):
+    """If `git apply` rejects the diff we still surface the Patch in state.
+
+    Verify will fail again next round — that's preferable to silently
+    discarding spec_adjustment's reasoning, since the recorded Patch lets a
+    human see what was attempted.
+    """
+    out_model = SpecAdjustmentOutput(
+        decision="patch_code",
+        rationale="malformed diff",
+        target_worker="backend",
+        slice_id="US-1",
+        path="pom.xml",
+        diff="garbage",
+    )
+
+    async def fake_run_spec_adjustment(state):
+        return out_model
+
+    _install_fake_module(
+        monkeypatch,
+        "darkfactory.agents.spec_adjustment",
+        run_spec_adjustment=fake_run_spec_adjustment,
+    )
+
+    class FailingSandbox:
+        def exec(self, argv, timeout=120, stdin=None):
+            return {"returncode": 1, "stdout": "", "stderr": "rejected", "timed_out": False}
+
+    monkeypatch.setattr(activities_mod, "_ensure_repo_sandbox", lambda state: FailingSandbox())
+
+    delta = asyncio.run(
+        spec_adjustment_stage(
+            {"task_id": "wf-x", "wf_id": "wf-x", "feature_branch": "agent/wf-x"}
+        )
+    )
+    # Delta is unchanged: Patch is still recorded, current_slice is set.
+    assert delta["patches"][0]["author_agent"] == "spec_adjustment"
+    assert delta["current_slice"] == "US-1"
 
 
 def test_code_quality_stage_flows_summary_into_review_decision(monkeypatch):

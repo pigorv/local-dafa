@@ -22,14 +22,21 @@ class RepoSandbox:
     def __init__(self, repo_path: str):
         self.repo_path = str(Path(repo_path).resolve())
 
-    def exec(self, argv: list[str], timeout: int = 120) -> dict[str, Any]:
+    def exec(
+        self,
+        argv: list[str],
+        timeout: int = 120,
+        stdin: str | bytes | None = None,
+    ) -> dict[str, Any]:
         if not argv:
             raise ValueError("argv must be non-empty")
+        input_bytes = stdin.encode("utf-8") if isinstance(stdin, str) else stdin
         try:
             completed = subprocess.run(
                 argv,
                 cwd=self.repo_path,
                 capture_output=True,
+                input=input_bytes,
                 timeout=timeout,
                 check=False,
             )

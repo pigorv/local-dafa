@@ -11,9 +11,17 @@ from temporalio.worker import Worker
 
 from darkfactory.bootstrap import init_observability
 from darkfactory.runtime.activities import (
+    detect_approval_signal_activity,
+    issue_workflow_capacity_activity,
+    list_ready_issues_activity,
+    quarantine_closed_issue_activity,
+    signal_issue_workflow_activity,
     setup_worker_activity,
+    start_or_update_issue_workflow_activity,
     teardown_worker_activity,
 )
+from darkfactory.runtime.issue_poll_workflow import IssuePollWorkflow
+from darkfactory.runtime.issue_workflow import DarkFactoryIssueWorkflow
 from darkfactory.runtime.workflow import DarkFactoryWorkflow
 
 
@@ -41,8 +49,17 @@ async def main() -> None:
     worker = Worker(
         client,
         task_queue=SUPERVISOR_TASK_QUEUE,
-        workflows=[DarkFactoryWorkflow],
-        activities=[setup_worker_activity, teardown_worker_activity],
+        workflows=[DarkFactoryWorkflow, DarkFactoryIssueWorkflow, IssuePollWorkflow],
+        activities=[
+            setup_worker_activity,
+            teardown_worker_activity,
+            list_ready_issues_activity,
+            issue_workflow_capacity_activity,
+            start_or_update_issue_workflow_activity,
+            detect_approval_signal_activity,
+            signal_issue_workflow_activity,
+            quarantine_closed_issue_activity,
+        ],
         interceptors=[tracing_interceptor],
     )
     try:

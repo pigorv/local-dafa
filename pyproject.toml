@@ -18,6 +18,7 @@ dependencies = [
     "opentelemetry-sdk",
     "opentelemetry-exporter-otlp-proto-grpc",
     "openinference-instrumentation-langchain",
+    "python-dotenv>=1.0.0",
 ]
 
 [project.scripts]

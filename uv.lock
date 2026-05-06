@@ -316,6 +316,7 @@ dependencies = [
     { name = "opentelemetry-api" },
     { name = "opentelemetry-exporter-otlp-proto-grpc" },
     { name = "opentelemetry-sdk" },
+    { name = "python-dotenv" },
     { name = "temporalio" },
     { name = "tree-sitter" },
 ]
@@ -339,6 +340,7 @@ requires-dist = [
     { name = "opentelemetry-api" },
     { name = "opentelemetry-exporter-otlp-proto-grpc" },
     { name = "opentelemetry-sdk" },
+    { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "temporalio" },
     { name = "tree-sitter" },
 ]

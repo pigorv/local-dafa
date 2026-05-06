@@ -3,7 +3,15 @@ from __future__ import annotations
 from langchain_core.messages import HumanMessage, AIMessage
 from langgraph.graph.message import add_messages
 
-from darkfactory.state import SpecSlice, merge_specs, overwrite
+from darkfactory.state import (
+    IssueRef,
+    IssueRunRequest,
+    SpecSlice,
+    init_state_from_issue,
+    merge,
+    merge_specs,
+    overwrite,
+)
 
 
 def _slice(story_id: str, approach: str = "x") -> SpecSlice:
@@ -65,3 +73,53 @@ class TestAddMessages:
         merged = add_messages(left, right)
         assert len(merged) == 1
         assert merged[0].content == "edited"
+
+
+class TestIssueState:
+    def test_init_state_from_issue_round_trips_issue_through_merge(self):
+        issue = IssueRef(
+            repo="octo-org/octo-repo",
+            number=42,
+            url="https://github.com/octo-org/octo-repo/issues/42",
+            title="Add issue-driven workflow",
+            body="Dark Factory should pick this up from an issue.",
+            labels=["df:ready", "enhancement"],
+        )
+        req = IssueRunRequest(
+            repo_url="https://github.com/octo-org/octo-repo.git",
+            repo_path="/workspace",
+            issue=issue,
+        )
+
+        initial = init_state_from_issue(req)
+        merged = merge({}, initial)
+
+        assert merged["issue"] == issue
+        assert merged["issue"].model_dump() == issue.model_dump()
+        assert merged["issue_comments"] == []
+        assert merged["phase_comment_ids"] == {}
+        assert merged["latest_spec_rev"] == 1
+        assert merged["approval_record"] is None
+        assert merged["last_seen_comment_id"] == 0
+
+    def test_issue_state_phase_fields_are_overwritten(self):
+        state = {
+            "phase_comment_ids": {"triage": 1},
+            "latest_spec_rev": 1,
+            "approval_record": None,
+            "last_seen_comment_id": 10,
+        }
+        merged = merge(
+            state,
+            {
+                "phase_comment_ids": {"design:1": 2},
+                "latest_spec_rev": 2,
+                "approval_record": {"author": "octocat", "spec_rev": 2},
+                "last_seen_comment_id": 99,
+            },
+        )
+
+        assert merged["phase_comment_ids"] == {"design:1": 2}
+        assert merged["latest_spec_rev"] == 2
+        assert merged["approval_record"]["author"] == "octocat"
+        assert merged["last_seen_comment_id"] == 99

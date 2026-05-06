@@ -34,9 +34,12 @@ EXPECTED_STAGE_ACTIVITIES = (
     "pr_creator_stage",
     "merge_branch",
 )
+ISSUE_STAGE_ACTIVITIES = ("triage_stage",)
+REGISTERED_STAGE_ACTIVITIES = EXPECTED_STAGE_ACTIVITIES + ISSUE_STAGE_ACTIVITIES
 
 STAGE_BACKINGS = {
     "hydrate_stage": ("darkfactory.stages.hydrator", ("hydrate", "hydrator_node")),
+    "triage_stage": ("darkfactory.stages.triage", ("triage_subgraph",)),
     "discovery_stage": ("darkfactory.stages.discovery", ("discovery_subgraph",)),
     "build_stage": ("darkfactory.stages.build", ("build_subgraph",)),
     "verify_stage": ("darkfactory.stages.verify", ("verify_subgraph",)),
@@ -164,8 +167,10 @@ def test_workflow_stage_activities_match_worker_registration_bundle() -> None:
         for name in _workflow_activity_names()
         if name not in SUPERVISOR_ACTIVITIES
     }
+    registered_manual_stages = _stage_activity_names() - set(ISSUE_STAGE_ACTIVITIES)
 
-    assert workflow_stages == _stage_activity_names()
+    assert workflow_stages == registered_manual_stages
+    assert set(ISSUE_STAGE_ACTIVITIES) <= _stage_activity_names()
 
 
 def test_worker_entrypoint_registers_stage_activity_bundle() -> None:
@@ -193,7 +198,7 @@ def test_temporal_entrypoints_wire_tracing_interceptors() -> None:
 
 
 def test_each_workflow_stage_has_backing_implementation() -> None:
-    for activity_name in EXPECTED_STAGE_ACTIVITIES:
+    for activity_name in REGISTERED_STAGE_ACTIVITIES:
         module_name, attribute_names = STAGE_BACKINGS[activity_name]
         module = importlib.import_module(module_name)
         assert any(hasattr(module, attr) for attr in attribute_names), (

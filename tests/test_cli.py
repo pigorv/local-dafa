@@ -8,12 +8,14 @@ mock the Temporal client so they run without a live Temporal server.
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from darkfactory.cli import build_parser, run_command
+from darkfactory.cli import build_parser, run_command, schedule_command
+from darkfactory.runtime import schedule_admin
 from darkfactory.runtime.workflow import DarkFactoryWorkflow
 from darkfactory.state import RunRequest, RunResult
 
@@ -122,3 +124,105 @@ def test_run_requires_prompt():
     args = _parse(["run"])
     with pytest.raises(SystemExit):
         asyncio.run(run_command(args))
+
+
+def test_schedule_install_invokes_schedule_admin(capsys):
+    args = _parse(
+        [
+            "schedule",
+            "install",
+            "--repo",
+            "acme/widgets",
+            "--label",
+            "df:ready",
+            "--interval",
+            "30s",
+        ]
+    )
+    client = MagicMock()
+    result = schedule_admin.ScheduleAdminResult(
+        schedule_id="df-watch-acme-widgets",
+        action="created",
+    )
+
+    with patch(
+        "darkfactory.cli._connect_client",
+        AsyncMock(return_value=client),
+    ), patch(
+        "darkfactory.cli.schedule_admin.install_watch_schedule",
+        AsyncMock(return_value=result),
+    ) as install:
+        rc = asyncio.run(schedule_command(args))
+
+    assert rc == 0
+    install.assert_awaited_once()
+    assert install.await_args.args[0] is client
+    assert install.await_args.kwargs["repo"] == "acme/widgets"
+    assert install.await_args.kwargs["label"] == "df:ready"
+    assert install.await_args.kwargs["interval"] == timedelta(seconds=30)
+
+    out = capsys.readouterr().out
+    assert "schedule_id=df-watch-acme-widgets" in out
+    assert "action=created" in out
+
+
+def test_schedule_install_falls_back_to_df_watch_repo_env(monkeypatch, capsys):
+    monkeypatch.setenv("DF_WATCH_REPO", "acme/widgets")
+    args = _parse(["schedule", "install"])
+    client = MagicMock()
+    result = schedule_admin.ScheduleAdminResult(
+        schedule_id="df-watch-acme-widgets",
+        action="created",
+    )
+
+    with patch(
+        "darkfactory.cli._connect_client",
+        AsyncMock(return_value=client),
+    ), patch(
+        "darkfactory.cli.schedule_admin.install_watch_schedule",
+        AsyncMock(return_value=result),
+    ) as install:
+        rc = asyncio.run(schedule_command(args))
+
+    assert rc == 0
+    assert install.await_args.kwargs["repo"] == "acme/widgets"
+
+
+def test_schedule_install_errors_when_repo_missing(monkeypatch):
+    monkeypatch.delenv("DF_WATCH_REPO", raising=False)
+    args = _parse(["schedule", "install"])
+    client = MagicMock()
+
+    with patch(
+        "darkfactory.cli._connect_client",
+        AsyncMock(return_value=client),
+    ), patch(
+        "darkfactory.cli.schedule_admin.install_watch_schedule",
+        AsyncMock(),
+    ) as install, pytest.raises(SystemExit):
+        asyncio.run(schedule_command(args))
+
+    install.assert_not_awaited()
+
+
+def test_schedule_pause_derives_schedule_id_from_repo():
+    args = _parse(["schedule", "pause", "--repo", "acme/widgets"])
+    client = MagicMock()
+    result = schedule_admin.ScheduleAdminResult(
+        schedule_id="df-watch-acme-widgets",
+        action="paused",
+    )
+
+    with patch(
+        "darkfactory.cli._connect_client",
+        AsyncMock(return_value=client),
+    ), patch(
+        "darkfactory.cli.schedule_admin.pause",
+        AsyncMock(return_value=result),
+    ) as pause:
+        rc = asyncio.run(schedule_command(args))
+
+    assert rc == 0
+    pause.assert_awaited_once()
+    assert pause.await_args.args[0] is client
+    assert pause.await_args.kwargs["schedule_id"] == "df-watch-acme-widgets"

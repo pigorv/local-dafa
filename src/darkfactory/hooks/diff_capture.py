@@ -116,7 +116,17 @@ def make_diff_capture(
 
         diff = diff_result.get("stdout") or ""
         if not diff.strip():
-            return {}
+            # `git diff -- <path>` shows nothing for untracked files (every
+            # `Write` of a new file lands here until the worker commits).
+            # Mark the file intent-to-add and re-diff so the new-file content
+            # appears as a unified add diff.
+            add_result = sandbox.exec(["git", "add", "-N", "--", path])
+            if add_result.get("returncode") == 0:
+                diff_result = sandbox.exec(["git", "diff", "--", path])
+                if diff_result.get("returncode") == 0:
+                    diff = diff_result.get("stdout") or ""
+            if not diff.strip():
+                return {}
 
         if not apply_unified_diff(diff):
             log.warning(

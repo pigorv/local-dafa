@@ -10,7 +10,14 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.worker import Worker
 
 from darkfactory.bootstrap import init_observability
-from darkfactory.runtime.activities import STAGE_ACTIVITIES, ping_activity
+from darkfactory.runtime.activities import (
+    STAGE_ACTIVITIES,
+    mark_issue_done_activity,
+    ping_activity,
+    post_issue_comment_activity,
+    swap_state_label_activity,
+    upsert_phase_comment_activity,
+)
 
 
 DEFAULT_TEMPORAL_ADDRESS = "localhost:7233"
@@ -40,7 +47,14 @@ async def main() -> None:
     worker = Worker(
         client,
         task_queue=task_queue,
-        activities=[ping_activity, *STAGE_ACTIVITIES],
+        activities=[
+            ping_activity,
+            upsert_phase_comment_activity,
+            swap_state_label_activity,
+            post_issue_comment_activity,
+            mark_issue_done_activity,
+            *STAGE_ACTIVITIES,
+        ],
         interceptors=[tracing_interceptor],
     )
     try:

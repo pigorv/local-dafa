@@ -26,6 +26,18 @@ diff --git a/foo.txt b/foo.txt
 """
 
 
+NEW_FILE_DIFF = """\
+diff --git a/pom.xml b/pom.xml
+new file mode 100644
+index 0000000..abc1234
+--- /dev/null
++++ b/pom.xml
+@@ -0,0 +1,2 @@
++<project>
++</project>
+"""
+
+
 class FakeSandbox:
     """Records exec calls and serves canned responses."""
 
@@ -172,7 +184,10 @@ def test_no_sandbox_registered_is_silent_noop(task_id: str) -> None:
 
 
 def test_empty_diff_drops_patch(task_id: str) -> None:
+    """Genuinely empty diff (file unchanged, git add -N also produces nothing)."""
     sandbox = FakeSandbox([
+        {"returncode": 0, "stdout": "", "stderr": "", "timed_out": False},
+        {"returncode": 0, "stdout": "", "stderr": "", "timed_out": False},
         {"returncode": 0, "stdout": "", "stderr": "", "timed_out": False},
     ])
     shell_mod.register_sandbox(task_id, sandbox)  # type: ignore[arg-type]
@@ -182,7 +197,68 @@ def test_empty_diff_drops_patch(task_id: str) -> None:
     )
     asyncio.run(hook(_post("Edit", {"file_path": "foo.txt"}), "tu", _ctx()))
     assert sink == []
-    assert sandbox.calls == [["git", "diff", "--", "foo.txt"]]
+    # The hook tries `git diff`, then `git add -N` (intent-to-add), then re-diffs.
+    assert sandbox.calls == [
+        ["git", "diff", "--", "foo.txt"],
+        ["git", "add", "-N", "--", "foo.txt"],
+        ["git", "diff", "--", "foo.txt"],
+    ]
+
+
+def test_captures_new_file_via_intent_to_add(task_id: str) -> None:
+    """`Write` of an untracked file: first `git diff` is empty, intent-to-add
+    rescues the new-file diff so the patch is captured.
+
+    This exercises the green-field-repo path that previously dropped every
+    new file (the worker's `Write` of pom.xml etc. emitted no patch because
+    the file was untracked at PostToolUse time, before any commit).
+    """
+    sandbox = FakeSandbox([
+        # 1st `git diff` — empty (file untracked)
+        {"returncode": 0, "stdout": "", "stderr": "", "timed_out": False},
+        # `git add -N`
+        {"returncode": 0, "stdout": "", "stderr": "", "timed_out": False},
+        # 2nd `git diff` — full add diff
+        {"returncode": 0, "stdout": NEW_FILE_DIFF, "stderr": "", "timed_out": False},
+        # `git rev-parse HEAD`
+        {"returncode": 0, "stdout": "abc1234\n", "stderr": "", "timed_out": False},
+    ])
+    shell_mod.register_sandbox(task_id, sandbox)  # type: ignore[arg-type]
+
+    sink: list[Patch] = []
+    hook = make_diff_capture(
+        role="backend", slice_id="slice-1", task_id=task_id, sink=sink,
+    )
+    asyncio.run(hook(_post("Write", {"file_path": "pom.xml"}), "tu", _ctx()))
+
+    assert len(sink) == 1
+    assert sink[0]["path"] == "pom.xml"
+    assert sink[0]["diff"] == NEW_FILE_DIFF
+    assert sink[0]["author_agent"] == "backend"
+    assert sink[0]["sha"] == "abc1234"
+    assert sandbox.calls == [
+        ["git", "diff", "--", "pom.xml"],
+        ["git", "add", "-N", "--", "pom.xml"],
+        ["git", "diff", "--", "pom.xml"],
+        ["git", "rev-parse", "HEAD"],
+    ]
+
+
+def test_skips_intent_to_add_when_first_diff_succeeds(task_id: str) -> None:
+    """For tracked files with real changes, only ONE `git diff` should run."""
+    sandbox = FakeSandbox([
+        {"returncode": 0, "stdout": VALID_DIFF, "stderr": "", "timed_out": False},
+        {"returncode": 0, "stdout": "abc1234\n", "stderr": "", "timed_out": False},
+    ])
+    shell_mod.register_sandbox(task_id, sandbox)  # type: ignore[arg-type]
+    sink: list[Patch] = []
+    hook = make_diff_capture(
+        role="backend", slice_id="slice-1", task_id=task_id, sink=sink,
+    )
+    asyncio.run(hook(_post("Edit", {"file_path": "foo.txt"}), "tu", _ctx()))
+    assert len(sink) == 1
+    # No intent-to-add fallback fired because the first diff was non-empty.
+    assert ["git", "add", "-N", "--", "foo.txt"] not in sandbox.calls
 
 
 def test_git_diff_error_drops_patch(task_id: str) -> None:

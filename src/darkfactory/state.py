@@ -27,6 +27,35 @@ class RunContext(BaseModel):
 
 # ---------- Temporal I/O ----------
 
+class IssueRef(BaseModel):
+    repo: str
+    number: int
+    url: str
+    title: str
+    body: str
+    labels: list[str]
+
+
+class IssueComment(BaseModel):
+    id: int
+    author: str
+    body: str
+    created_at: str
+
+
+class IssueRunRequest(BaseModel):
+    repo_url: str
+    repo_path: str = "/workspace"
+    issue: IssueRef
+    model_profile: str | None = None
+
+
+class IssuePollRequest(BaseModel):
+    repo: str
+    label: str = "df:ready"
+    limit: int = 100
+
+
 class RunRequest(BaseModel):
     repo_url: str
     repo_path: str
@@ -34,7 +63,15 @@ class RunRequest(BaseModel):
     model_profile: str | None = None
 
 class RunResult(BaseModel):
-    status: Literal["merged", "rejected", "exhausted_retries", "failed"]
+    status: Literal[
+        "merged",
+        "rejected",
+        "canceled",
+        "exhausted_retries",
+        "needs_human",
+        "abandoned",
+        "failed",
+    ]
     state: dict
     reason: str | None = None
 
@@ -42,6 +79,14 @@ class GateDecision(BaseModel):
     approved: bool
     reason: str
     edits: dict | None = None
+
+
+class ApprovalRecord(BaseModel):
+    author: str
+    approved_at: str
+    spec_rev: int
+    comment_id: int = 0
+    text: str = ""
 
 # ---------- Domain records ----------
 
@@ -116,6 +161,8 @@ def overwrite(_: object, new: object) -> object:
 class PipelineState(TypedDict, total=False):
     messages: Annotated[list[AnyMessage], add_messages]   # conversational backbone
     user_request: str                                      # original prompt
+    issue: Annotated[IssueRef, overwrite]
+    issue_comments: Annotated[list[IssueComment], add]
     repo_context: Annotated[dict, overwrite]               # from Hydrator
     stories: Annotated[list[UserStory], add]
     spec: Annotated[list[SpecSlice], merge_specs]
@@ -129,6 +176,12 @@ class PipelineState(TypedDict, total=False):
     review_decision: Annotated[Optional[ReviewDecision | CodeQualitySummary], overwrite]
     pr_url: Annotated[Optional[str], overwrite]
     changelog_entry: Annotated[Optional[str], overwrite]
+    phase_comment_ids: Annotated[dict[str, int], overwrite]
+    latest_spec_rev: Annotated[int, overwrite]
+    approval_record: Annotated[Optional[ApprovalRecord], overwrite]
+    approved_spec_rev: Annotated[Optional[int], overwrite]
+    approved_spec_markdown: Annotated[Optional[str], overwrite]
+    last_seen_comment_id: Annotated[int, overwrite]
 
 
 # ---------- Workflow-level helpers ----------
@@ -175,4 +228,29 @@ def init_state(req: RunRequest) -> dict:
         "model_profile": req.model_profile or "claude",
         "verify_retries": 0,
         "gate_approved": False,
+        "phase_comment_ids": {},
+        "latest_spec_rev": 1,
+        "approval_record": None,
+        "approved_spec_rev": None,
+        "approved_spec_markdown": None,
+        "last_seen_comment_id": 0,
+    }
+
+
+def init_state_from_issue(req: IssueRunRequest) -> dict:
+    """Build the initial workflow-level state dict from an `IssueRunRequest`."""
+    return {
+        "issue": req.issue,
+        "issue_comments": [],
+        "repo_path": req.repo_path,
+        "repo_url": req.repo_url,
+        "model_profile": req.model_profile or "claude",
+        "verify_retries": 0,
+        "gate_approved": False,
+        "phase_comment_ids": {},
+        "latest_spec_rev": 1,
+        "approval_record": None,
+        "approved_spec_rev": None,
+        "approved_spec_markdown": None,
+        "last_seen_comment_id": 0,
     }
