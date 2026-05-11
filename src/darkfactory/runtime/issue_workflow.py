@@ -278,7 +278,6 @@ class DarkFactoryIssueWorkflow:
                 self._state,
                 task_queue=agent_tq,
                 start_to_close_timeout=timedelta(minutes=5),
-                heartbeat_timeout=timedelta(minutes=5),
                 retry_policy=RetryPolicy(
                     # Outer activity retry covers account-tier quota windows
                     # that exceed the Claude Agent SDK's per-call backoff.
@@ -567,6 +566,7 @@ class DarkFactoryIssueWorkflow:
                 self._state,
                 {
                     "planning_attempts": attempt_number,
+                    "planning_max_attempts": PLANNING_MAX_ATTEMPTS,
                     "planning_feedback": feedback,
                 },
             )

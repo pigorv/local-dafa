@@ -7,7 +7,12 @@ from langgraph.graph import END, START, StateGraph
 from darkfactory.agents.architect import run_architect
 from darkfactory.agents.plan_critic import run_plan_critic
 from darkfactory.agents.po import run_po
-from darkfactory.state import ImplementationBrief, PipelineState
+from darkfactory.state import (
+    ImplementationBrief,
+    PipelineState,
+    WorkPackage,
+    work_package_dict_from_model,
+)
 
 
 def _expected_behavior_from_stories(stories: Any) -> list[str]:
@@ -28,28 +33,32 @@ async def po_node(state: PipelineState) -> dict:
 async def architect_node(state: PipelineState) -> dict:
     result = await run_architect(state)
     stories = state.get("stories") or []
+    work_packages = [
+        WorkPackage.model_validate(wp) for wp in result.get("work_packages") or []
+    ]
     brief = ImplementationBrief(
         rev=int(state.get("latest_spec_rev") or 1),
         problem=str(state.get("user_request") or "").strip(),
         expected_behavior=_expected_behavior_from_stories(stories),
-        current_understanding=result.current_understanding,
-        proposed_design=result.proposed_design,
-        contract_changes=result.contract_changes,
+        current_understanding=result.get("current_understanding", ""),
+        proposed_design=result.get("proposed_design", ""),
+        contract_changes=result.get("contract_changes")
+        or {"api": [], "data": [], "events": []},
         compatibility_risks=[],
         open_assumptions=[],
-        test_strategy=result.test_strategy,
-        work_packages=list(result.work_packages),
+        test_strategy=result.get("test_strategy", ""),
+        work_packages=work_packages,
     )
     return {
-        "spec": [s.model_dump() for s in result.spec],
-        "work_packages": [wp.model_dump() for wp in result.work_packages],
+        "spec": [work_package_dict_from_model(wp) for wp in work_packages],
+        "work_packages": [wp.model_dump() for wp in work_packages],
         "implementation_brief": brief.model_dump(mode="json"),
     }
 
 
 async def plan_critic_node(state: PipelineState) -> dict:
     result = await run_plan_critic(state)
-    return {"review_decision": result.model_dump()}
+    return {"review_decision": result}
 
 
 def discovery_subgraph() -> Any:

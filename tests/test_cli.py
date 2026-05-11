@@ -243,10 +243,6 @@ def _write_minimal_manifest(
             "heartbeat": None,
             "retry_caps": {},
         },
-        "io_contract": {
-            "reads": [],
-            "writes": [],
-        },
     }
     manifest_path = manifests_dir / f"{role}.yaml"
     manifest_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")

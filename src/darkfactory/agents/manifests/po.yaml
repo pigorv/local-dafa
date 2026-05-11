@@ -20,8 +20,14 @@ llm:
   structured_output: schemas/po_output.json
 
 tools:
-  allowed: []
-  disallowed: []
+  allowed:
+    - Read
+    - Grep
+    - Glob
+  disallowed:
+    - Bash
+    - Edit
+    - Write
   argv_allowlist: []
   role_owned_argv_prefixes: []
   edit_path_allowlist: []
@@ -44,15 +50,3 @@ hooks:
 
 budgets:
   retry_caps: {}
-
-io_contract:
-  reads:
-    - user_request
-    - repo_context
-    - planning_feedback
-  writes:
-    - stories
-    - problem
-    - expected_behavior
-    - compatibility_risks
-    - open_assumptions

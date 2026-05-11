@@ -67,7 +67,6 @@ def _manifest_payload(prompt_path: Path, *, role: str = "hooked") -> dict[str, A
             },
         ],
         "budgets": {"timeout": None, "heartbeat": None, "retry_caps": {}},
-        "io_contract": {"reads": [], "writes": []},
     }
 
 

@@ -41,18 +41,3 @@ hooks:
 
 budgets:
   retry_caps: {}
-
-io_contract:
-  reads:
-    - user_request
-    - pr_url
-    - implementation_brief
-    - approved_spec_markdown
-    - patches
-    - verify_summary
-    - findings
-    - test_results
-    - audit_log
-    - attempt_log
-  writes:
-    - reviewer_summary

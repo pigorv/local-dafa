@@ -1,0 +1,38 @@
+{
+  "type": "object",
+  "title": "TriageOutput",
+  "description": "Triage decision: whether a GitHub issue is ready for Dark Factory to build, or which clarification questions to post back.",
+  "additionalProperties": false,
+  "required": [
+    "ready_to_build",
+    "clarification_questions",
+    "derived_user_request",
+    "confidence",
+    "rationale"
+  ],
+  "properties": {
+    "ready_to_build": {
+      "type": "boolean",
+      "description": "True when the issue and comments identify the requested behaviour, target surface, and expected result clearly enough for downstream discovery to create user stories without guessing. False when important behaviour, scope, data shape, user-visible outcome, or priority is still ambiguous. Must be false whenever clarification_questions is non-empty."
+    },
+    "clarification_questions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "maxItems": 3,
+      "description": "1-3 sharp clarification questions, each answerable by the issue author, whose answers would change what gets built. Empty when ready_to_build is true. Posted publicly on the GitHub issue, so keep them concise and avoid surfacing internal model uncertainty. Do not ask the author to choose internal class names, file paths, libraries, or implementation details — those are downstream decisions."
+    },
+    "derived_user_request": {
+      "type": "string",
+      "description": "Concise, implementation-ready restatement of the issue, including resolved constraints and acceptance details from comments. Required when ready_to_build is true; empty string otherwise."
+    },
+    "confidence": {
+      "type": "string",
+      "enum": ["low", "medium", "high"],
+      "description": "Self-assessed confidence in the readiness decision. Use 'low' when the inputs are mostly inferred, 'medium' when comments resolve the main ambiguities, and 'high' when the issue and comments specify behaviour, surface, and outcome explicitly."
+    },
+    "rationale": {
+      "type": "string",
+      "description": "One or two sentences justifying the decision. Posted to the workflow trace for human reviewers."
+    }
+  }
+}

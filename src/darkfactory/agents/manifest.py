@@ -49,11 +49,6 @@ class BudgetPolicy(_StrictModel):
     retry_caps: dict[str, int] = Field(default_factory=dict)
 
 
-class IOContract(_StrictModel):
-    reads: list[str]
-    writes: list[str]
-
-
 class RoleManifest(_StrictModel):
     identity: ManifestIdentity
     llm: LLMPolicy
@@ -61,4 +56,3 @@ class RoleManifest(_StrictModel):
     mcp: list[str]
     hooks: list[HookAttachment]
     budgets: BudgetPolicy
-    io_contract: IOContract

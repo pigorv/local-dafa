@@ -1,0 +1,70 @@
+{
+  "type": "object",
+  "title": "PlanCriticOutput",
+  "description": "Plan Critic decision: approve the brief or return targeted per-WorkPackage edits.",
+  "additionalProperties": false,
+  "required": ["approved", "reason", "edits", "notes"],
+  "properties": {
+    "approved": {
+      "type": "boolean",
+      "description": "True iff every check passes. When false, every issue named in `reason` must have a corresponding entry in `edits`."
+    },
+    "reason": {
+      "type": "string",
+      "description": "≤6 sentences. On approval, a one-line summary. On rejection, one bullet per failed check using the check name plus a one-line summary. Deferred concerns from the final-attempt allowance belong in `notes`, not here. Must not be empty when approved is false."
+    },
+    "notes": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Deferred concerns the reviewer should see on the brief gate. Populate only on approval-with-notes (final-attempt allowance) — list each soft blocker that did not warrant a hard rejection. Empty array otherwise."
+    },
+    "edits": {
+      "type": "object",
+      "description": "Empty object when approved is true. When approved is false, keys are WorkPackage ids (e.g. 'WP-1') and values are partial WorkPackage shapes containing only the fields that must change. Every WorkPackage mentioned in `reason` should appear as a key.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "story_id": {
+            "type": "string",
+            "description": "Replacement user-story id this WP serves (e.g. 'US-1'). Set only when the WP currently names the wrong story."
+          },
+          "intent": {
+            "type": "string",
+            "description": "Replacement intent — one behaviour-focused sentence."
+          },
+          "verification": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Replacement verification predicates. Must describe observable behaviour, never test harness names."
+          },
+          "repo_areas": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Replacement human-readable repo areas / flows."
+          },
+          "candidate_files": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Replacement repo-relative navigation hints."
+          },
+          "dependencies": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Replacement WP-id dependencies."
+          },
+          "estimated_scope": {
+            "type": "string",
+            "enum": ["small", "medium", "large"],
+            "description": "Replacement scope estimate."
+          },
+          "notes": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Replacement notes — risks, assumptions, compatibility concerns."
+          }
+        }
+      }
+    }
+  }
+}

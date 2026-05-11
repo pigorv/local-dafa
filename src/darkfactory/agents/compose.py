@@ -58,6 +58,19 @@ class ComposeState:
     patch_justification: str = ""
 
     @classmethod
+    def task_only(cls, task_id: str) -> "ComposeState":
+        """Minimal ``ComposeState`` for roles with no compose-time seams.
+
+        Use when the role consumes no patch sink, gate flag, ``user_request``
+        / ``spec_summary`` reminders, or slice intent. Triage is the
+        canonical example: zero tools, one query per run, so every seam
+        but ``task_id`` is dead. Going through ``from_mapping`` for such a
+        role would pull keys that are guaranteed not to matter and obscure
+        the actual contract.
+        """
+        return cls(task_id=str(task_id or ""))
+
+    @classmethod
     def from_mapping(
         cls,
         state: Mapping[str, Any],

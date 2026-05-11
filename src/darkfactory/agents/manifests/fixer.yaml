@@ -76,22 +76,3 @@ hooks:
 
 budgets:
   retry_caps: {}
-
-io_contract:
-  reads:
-    - user_request
-    - task_id
-    - wf_id
-    - current_slice
-    - implementation_brief
-    - spec
-    - test_results
-    - findings
-    - tester_findings
-    - review_decision
-    - verify_summary
-    - patches
-    - repo_context
-  writes:
-    - patches
-    - fixer_decision

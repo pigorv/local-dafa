@@ -57,7 +57,7 @@ The orchestrator never runs the SDK or shells the target repo. The CLI never run
 
 1. `setup_worker_activity` (supervisor task queue) — boot the worker container.
 2. `hydrate_stage` (agent task queue, hereafter "agent tq").
-3. **Planning loop** — up to `PLANNING_MAX_ATTEMPTS=3` calls of `discovery_stage` (PO → Architect → Plan Critic). On rejection, the critic's reason/edits are appended to `planning_feedback` and fed into the next pass. Cap exhaustion → `RunResult("needs_human", reason="planning_retry_cap")`.
+3. **Planning loop** — up to `PLANNING_MAX_ATTEMPTS=5` calls of `discovery_stage` (PO → Architect → Plan Critic). On rejection, the critic's reason/edits are appended to `planning_feedback` and fed into the next pass. Cap exhaustion → `RunResult("needs_human", reason="planning_retry_cap")`.
 4. **Brief gate** — `wait_condition` blocks on `_brief_gate` / `_brief_revise` updates. Approve, reject, or revise (resets `planning_attempts` to 0 and re-enters the planning loop).
 5. `build_stage` — Builder + Tester implement the brief.
 6. **Verify/Fixer loop** — `verify_stage` produces a `VerifySummary`. If not passed, `_fixer_budget_exhaustion()` checks per-WP and per-predicate `FIXER_MAX_ATTEMPTS=2` budgets; on overrun, return `needs_human`. Otherwise increment `fixer_attempts_by_wp` / `fixer_attempts_by_predicate`, run `fixer_stage`, check the fixer's own `decision` for `needs_brief_change` / `cannot_fix` escalations, then re-verify.
@@ -75,7 +75,7 @@ The first-class artifact moving through the pipeline is `ImplementationBrief` (p
 
 ### Agents and LLM configuration
 
-Each role under `src/darkfactory/agents/` (po, architect, spec_reviewer, builder, tester, verifier_semantic, fixer, reviewer, pr_creator, triage) calls `darkfactory.llm_factory.build_options(role, ...)` to get a `ClaudeAgentOptions` with per-role model + temperature + thinking config. Defaults live in `_ROLE_DEFAULTS` in `llm_factory.py` and can be overridden per-role with `LLM_<ROLE>_MODEL` / `LLM_<ROLE>_TEMPERATURE` / `LLM_<ROLE>_THINKING` env vars. Builder Supervisor (`agents/builder_supervisor.py`) is pure topo-sort, no LLM. `frontend.py` is a no-op stub for the Java-only target app.
+Each role under `src/darkfactory/agents/` (po, architect, plan_critic, builder, tester, verifier_semantic, fixer, reviewer, pr_creator, triage) calls `darkfactory.llm_factory.build_options(role, ...)` to get a `ClaudeAgentOptions` with per-role model + temperature + thinking config. Defaults come from each role's manifest under `agents/manifests/` and can be overridden per-role with `LLM_<ROLE>_MODEL` / `LLM_<ROLE>_TEMPERATURE` / `LLM_<ROLE>_THINKING` env vars. Builder Supervisor (`agents/builder_supervisor.py`) is pure topo-sort, no LLM. `frontend.py` is a no-op stub for the Java-only target app.
 
 `spec_adjustment.py` and the `spec_adjustment` role default are leftover from v1; the v2 replacement is `fixer.py` + `verifier_semantic.py`, and the activity is still exposed as `spec_adjustment_stage` for backwards compatibility. When touching planning/repair code, prefer the v2 names.
 

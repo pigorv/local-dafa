@@ -8,9 +8,7 @@ from darkfactory.state import (
     ImplementationBrief,
     VerificationPredicate,
     WorkPackage,
-    WorkPackageDict,
     work_package_dict_from_model,
-    work_package_from_dict,
 )
 
 
@@ -124,38 +122,6 @@ def test_contract_changes_requires_target_shape_fields(field):
         ContractChanges.model_validate(payload)
 
 
-def test_work_package_dict_maps_legacy_fields_to_v2_hints():
-    work_package_dict: WorkPackageDict = {
-        "story_id": "US-1",
-        "approach": "Add cursor parsing near the existing user lookup flow.",
-        "affected_files": ["src/users/api.py", "src/users/service.py"],
-        "new_files": ["src/users/cursor.py", "src/users/service.py"],
-        "test_files": ["tests/test_users_api.py"],
-        "risks": ["Existing offset clients may depend on metadata shape."],
-        "depends_on": ["US-0"],
-        "verification": "First page includes a next cursor.",
-    }
-
-    work_package = work_package_from_dict(work_package_dict)
-
-    assert work_package.id == "US-1"
-    assert work_package.story_id == "US-1"
-    assert work_package.title == "US-1"
-    assert work_package.intent == work_package_dict["approach"]
-    assert [predicate.root for predicate in work_package.verification] == [
-        "First page includes a next cursor."
-    ]
-    assert work_package.candidate_files == [
-        "src/users/api.py",
-        "src/users/service.py",
-        "src/users/cursor.py",
-    ]
-    assert work_package.dependencies == ["US-0"]
-    assert work_package.notes == [
-        "Risk: Existing offset clients may depend on metadata shape."
-    ]
-
-
 def test_work_package_model_maps_to_state_dict_shape():
     work_package = WorkPackage.model_validate(
         {
@@ -180,20 +146,3 @@ def test_work_package_model_maps_to_state_dict_shape():
     ]
 
 
-def test_work_package_dict_round_trip_preserves_ids_and_dependency_edges():
-    work_package_dict: WorkPackageDict = {
-        "story_id": "slice-users",
-        "approach": "Add cursor parsing near the existing user lookup flow.",
-        "affected_files": ["src/users/api.py"],
-        "new_files": ["src/users/cursor.py"],
-        "test_files": [],
-        "risks": [],
-        "depends_on": ["slice-db", "slice-model"],
-    }
-
-    round_tripped = work_package_dict_from_model(
-        work_package_from_dict(work_package_dict)
-    )
-
-    assert round_tripped["story_id"] == "slice-users"
-    assert round_tripped["depends_on"] == ["slice-db", "slice-model"]

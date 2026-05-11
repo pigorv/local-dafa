@@ -60,10 +60,6 @@ def _manifest_payload(
             "heartbeat": None,
             "retry_caps": {},
         },
-        "io_contract": {
-            "reads": [],
-            "writes": [],
-        },
     }
 
 

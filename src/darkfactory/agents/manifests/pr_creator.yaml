@@ -65,17 +65,3 @@ hooks:
 
 budgets:
   retry_caps: {}
-
-io_contract:
-  reads:
-    - user_request
-    - wf_id
-    - feature_branch
-    - spec
-    - approved_spec_markdown
-    - approved_spec_rev
-    - approval_record
-    - verify_summary
-    - gate_approved
-  writes:
-    - pr_url

@@ -15,6 +15,8 @@ llm:
   thinking:
     enabled: false
   prompt_path: prompts/triage.md
+  prompt_as_user_message: true
+  structured_output: schemas/triage_output.json
 
 tools:
   allowed: []
@@ -25,30 +27,7 @@ tools:
 
 mcp: []
 
-hooks:
-  - event: PreToolUse
-    name: loop_breaker
-    parameters: {}
-  - event: PreToolUse
-    name: call_cap
-    parameters: {}
-  - event: UserPromptSubmit
-    name: goal_pin
-    parameters: {}
+hooks: []
 
 budgets:
   retry_caps: {}
-
-io_contract:
-  reads:
-    - issue
-    - issue_title
-    - issue_body
-    - issue_comments
-    - repo_context
-  writes:
-    - ready_to_build
-    - clarification_questions
-    - derived_user_request
-    - confidence
-    - rationale

@@ -1,75 +1,138 @@
 """Plan Critic — SDK-driven discovery role.
 
-Reviews the spec produced by the Architect against the original stories
-and either approves it or returns targeted edits keyed by story id.
-No tools, no MCP servers; reasoning-only role with structured output.
+Reviews the work packages produced by the Architect against the original
+stories and either approves the brief or returns targeted edits keyed by
+WorkPackage id. No tools, no MCP servers; reasoning-only role with
+structured output.
+
+The output shape is defined by ``schemas/plan_critic_output.json`` and
+enforced by the SDK's ``output_format``. ``normalize_plan_critic_output``
+applies the cross-field invariants JSON Schema can't express:
+``approved=True`` forces ``edits={}`` (stray edits would mislead the next
+planning loop), and ``approved=False`` with an empty ``reason`` is
+backfilled from the edits keys (an empty rejection is not actionable
+downstream).
 """
 from __future__ import annotations
 
 import json
+from string import Template
+from typing import Any
 
-from pydantic import BaseModel, Field
-
-from darkfactory.agents._sdk_common import run_to_completion
+from darkfactory.agents._sdk_common import ParseError, _drain
 from darkfactory.agents.compose import ComposeState, compose
-from darkfactory.state import WorkPackage, work_package_from_dict
+from darkfactory.agents.registry import get_default_registry, resolve_prompt_path
+
+DEFAULT_PLANNING_MAX_ATTEMPTS = 5
 
 
-class ReviewDecisionModel(BaseModel):
-    """Plan Critic decision — approves the brief or returns targeted edits."""
-
-    approved: bool
-    reason: str = ""
-    edits: dict = Field(default_factory=dict)
-
-
-def _resolve_work_packages(state_slice: dict) -> list[dict]:
-    """Return v2 work packages as dicts.
-
-    Prefers `state["work_packages"]` (written by the v2 architect_node).
-    Falls back to converting legacy `state["spec"]` slices via
-    `work_package_from_dict` so older fixtures still feed the critic.
-    """
-    work_packages = state_slice.get("work_packages") or []
-    if work_packages:
-        return [
-            WorkPackage.model_validate(wp).model_dump()
-            for wp in work_packages
-        ]
-    spec = state_slice.get("spec") or []
-    return [work_package_from_dict(slice_).model_dump() for slice_ in spec]
-
-
-def _user_message(state_slice: dict) -> str:
-    stories = state_slice.get("stories", []) or []
-    work_packages = _resolve_work_packages(state_slice)
-    attempt = int(state_slice.get("planning_attempts") or 1)
-    prior_feedback = [
-        str(item) for item in (state_slice.get("planning_feedback") or []) if item
+def _planning_feedback_text(state_slice: dict) -> str:
+    feedback = [
+        str(item)
+        for item in state_slice.get("planning_feedback") or []
+        if item
     ]
-    prior_block = (
-        f"\n\nPrior plan-critic rejections in this run (attempt → feedback):\n"
-        + "\n".join(f"- attempt {i + 1}: {fb}" for i, fb in enumerate(prior_feedback))
-        if prior_feedback
-        else ""
+    if not feedback:
+        return "(none)"
+    return "\n".join(f"- {item}" for item in feedback)
+
+
+def _render_user_prompt(state_slice: dict) -> str:
+    manifest = get_default_registry().get("plan_critic")
+    template_text = resolve_prompt_path(manifest.llm.prompt_path).read_text(
+        encoding="utf-8"
     )
-    return (
-        f"Attempt: {attempt} (this is rejection #{len(prior_feedback) + 1} if you "
-        f"reject again).{prior_block}\n\n"
-        f"User stories (JSON):\n{json.dumps(stories, indent=2)}\n\n"
-        f"Work packages (JSON):\n{json.dumps(work_packages, indent=2)}\n\n"
-        "Review the work packages against the stories; approve or return targeted edits."
+    brief = state_slice.get("implementation_brief") or {}
+    if not isinstance(brief, dict):
+        brief = {}
+    contract_changes = brief.get("contract_changes") or {
+        "api": [],
+        "data": [],
+        "events": [],
+    }
+    attempt = int(state_slice.get("planning_attempts") or 1)
+    max_attempts = int(
+        state_slice.get("planning_max_attempts") or DEFAULT_PLANNING_MAX_ATTEMPTS
+    )
+    return Template(template_text).safe_substitute(
+        user_request=state_slice.get("user_request", "") or "",
+        current_understanding=str(brief.get("current_understanding") or ""),
+        contract_changes=json.dumps(contract_changes, indent=2),
+        stories=json.dumps(state_slice.get("stories") or [], indent=2),
+        work_packages=json.dumps(state_slice.get("work_packages") or [], indent=2),
+        attempt=str(attempt),
+        max_attempts=str(max_attempts),
+        planning_feedback=_planning_feedback_text(state_slice),
     )
 
 
-async def run_plan_critic(state_slice: dict) -> ReviewDecisionModel:
-    compose_state = ComposeState.from_mapping(state_slice)
+def _enforce_decision_invariants(data: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the cross-field invariants JSON Schema can't express.
+
+    - ``approved=True`` → drop any ``edits`` the model may have attached.
+      Downstream only forks on ``approved``; stray edits would mislead the
+      next planning loop.
+    - ``approved=False`` → ``notes`` is meaningless (concerns must escalate
+      to ``reason`` + ``edits`` on a rejection), so clear it.
+    - ``approved=False`` with an empty ``reason`` → derive a reason from
+      the ``edits`` keys when possible, otherwise mark the decision
+      explicitly unactionable so the workflow surfaces it instead of
+      forwarding "revise and try again." to the architect.
+    """
+    out = dict(data)
+    approved = bool(out.get("approved"))
+    reason = str(out.get("reason") or "").strip()
+    edits = dict(out.get("edits") or {})
+    notes = [str(n).strip() for n in (out.get("notes") or []) if str(n).strip()]
+
+    if approved:
+        edits = {}
+    else:
+        notes = []
+        if not reason:
+            if edits:
+                reason = f"Edits requested for: {', '.join(sorted(edits))}."
+            else:
+                reason = (
+                    "Plan Critic returned an empty rejection — "
+                    "no reason and no edits."
+                )
+
+    out["approved"] = approved
+    out["reason"] = reason
+    out["edits"] = edits
+    out["notes"] = notes
+    return out
+
+
+def normalize_plan_critic_output(raw: dict[str, Any]) -> dict[str, Any]:
+    """Public entry-point for the invariant transform.
+
+    Exposed so tests can exercise the normaliser without driving an SDK
+    client.
+    """
+    return _enforce_decision_invariants(raw)
+
+
+def _resolve_task_id(state_slice: dict) -> str:
+    return str(
+        state_slice.get("task_id")
+        or state_slice.get("wf_id")
+        or state_slice.get("workflow_id")
+        or ""
+    )
+
+
+async def run_plan_critic(state_slice: dict) -> dict[str, Any]:
+    compose_state = ComposeState.task_only(_resolve_task_id(state_slice))
+    rendered = _render_user_prompt(state_slice)
     async with compose(
         "plan_critic",
         compose_state,
         task_id=compose_state.task_id,
     ) as client:
-        await client.query(_user_message(state_slice))
-        result = await run_to_completion(client, expect=ReviewDecisionModel)
-        assert isinstance(result, ReviewDecisionModel)
-        return result
+        await client.query(rendered)
+        _text, structured, _result = await _drain(client)
+    if structured is None:
+        raise ParseError("Plan Critic emitted no structured output")
+    return normalize_plan_critic_output(structured)

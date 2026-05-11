@@ -21,6 +21,3 @@ budgets:
   timeout: null
   heartbeat: null
   retry_caps: {}
-io_contract:
-  reads: []
-  writes: []

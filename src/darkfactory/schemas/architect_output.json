@@ -1,0 +1,117 @@
+{
+  "type": "object",
+  "title": "ArchitectOutput",
+  "description": "Architect output: brief design fields plus a topo-sortable list of Work Packages.",
+  "additionalProperties": false,
+  "required": [
+    "current_understanding",
+    "proposed_design",
+    "contract_changes",
+    "test_strategy",
+    "work_packages"
+  ],
+  "properties": {
+    "current_understanding": {
+      "type": "string",
+      "description": "One-paragraph statement of what the repo appears to do today, grounded in repo_context."
+    },
+    "proposed_design": {
+      "type": "string",
+      "description": "Concrete technical approach for the change, no pseudocode. Reference repo areas, not file paths."
+    },
+    "contract_changes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api", "data", "events"],
+      "properties": {
+        "api": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Client-visible API changes, or empty."
+        },
+        "data": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Schema or storage changes, or empty."
+        },
+        "events": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Event or message changes, or empty."
+        }
+      }
+    },
+    "test_strategy": {
+      "type": "string",
+      "description": "What should be proven and at what level. Do not pin a test harness."
+    },
+    "work_packages": {
+      "type": "array",
+      "description": "Topo-sortable Work Packages. At least one per user story; split a story only when the behaviour or verification predicates are genuinely distinct.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "story_id",
+          "title",
+          "intent",
+          "verification",
+          "repo_areas",
+          "candidate_files",
+          "dependencies",
+          "estimated_scope",
+          "notes"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Stable Work Package id like 'WP-1', numeric suffix starting at 1."
+          },
+          "story_id": {
+            "type": "string",
+            "description": "Id of the user story this WP serves, e.g. 'US-1'. A WP names a single story_id."
+          },
+          "title": {
+            "type": "string",
+            "description": "Short verb phrase summarising the WP."
+          },
+          "intent": {
+            "type": "string",
+            "description": "One behaviour-focused statement of what should change."
+          },
+          "verification": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Observable predicates the Tester and Verifier can check. Describe what the system does, not how to test it. No test framework or harness names."
+          },
+          "repo_areas": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Human-readable areas or flows of the repo to investigate. Required for every WP and should be more useful than a blind file list."
+          },
+          "candidate_files": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Optional repo-relative navigation hints. Not an exhaustive, required, allowed, or forbidden file list. Leave empty when repo_context is not enough to name files confidently."
+          },
+          "dependencies": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "WP ids in this same output that should be understood first. Planning context only — does not schedule separate Builder invocations."
+          },
+          "estimated_scope": {
+            "type": "string",
+            "enum": ["small", "medium", "large"],
+            "description": "Rough Builder-pass scope."
+          },
+          "notes": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Short list of risks, assumptions, or compatibility concerns a reviewer should watch."
+          }
+        }
+      }
+    }
+  }
+}

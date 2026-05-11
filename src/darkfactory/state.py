@@ -155,64 +155,13 @@ class WorkPackageDict(TypedDict):
     notes: NotRequired[list[str]]
 
 
-def _string_list(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value] if value else []
-    return [str(item) for item in value if item is not None and str(item)]
-
-
-def _dedupe_ordered(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        out.append(value)
-    return out
-
-
-def work_package_from_dict(work_package: WorkPackageDict) -> WorkPackage:
-    """Normalize a state work-package dict into the v2 model."""
-
-    legacy_id = str(work_package["story_id"])
-    raw_dependencies = (
-        _string_list(work_package.get("dependencies"))
-        or _string_list(work_package.get("depends_on"))
-    )
-    risks = _string_list(work_package.get("risks"))
-    notes = _string_list(work_package.get("notes"))
-    candidate_files = _dedupe_ordered(
-        _string_list(work_package.get("affected_files"))
-        + _string_list(work_package.get("new_files"))
-        + _string_list(work_package.get("candidate_files"))
-    )
-
-    return WorkPackage(
-        id=str(work_package.get("id") or legacy_id),
-        story_id=legacy_id,
-        title=str(work_package.get("title") or legacy_id),
-        intent=str(work_package.get("intent") or work_package.get("approach") or ""),
-        verification=[
-            VerificationPredicate.model_validate(predicate)
-            for predicate in _string_list(work_package.get("verification"))
-        ],
-        repo_areas=_string_list(work_package.get("repo_areas")),
-        candidate_files=candidate_files,
-        dependencies=raw_dependencies,
-        estimated_scope=str(work_package.get("estimated_scope") or "unknown"),
-        notes=notes + [f"Risk: {risk}" for risk in risks],
-    )
-
-
 def work_package_dict_from_model(work_package: WorkPackage) -> WorkPackageDict:
     """Adapt a v2 WorkPackage model back to the durable state dict shape."""
 
-    wp = WorkPackage.model_validate(work_package)
-    # Split notes vs. risks on the legacy "Risk: " convention so a round-trip
-    # through this adapter and back through `work_package_from_dict` is stable.
+    wp = work_package
+    # Split notes vs. risks on the legacy "Risk: " convention so downstream
+    # `spec` consumers (tester, fixer, pr_creator, verifier_semantic) see a
+    # dedicated `risks` list rather than a notes prefix.
     risks: list[str] = []
     notes: list[str] = []
     for entry in wp.notes:
@@ -291,6 +240,7 @@ class ReviewDecision(TypedDict):
     approved: bool
     reason: str
     edits: dict                           # optional {field: new_value}
+    notes: list[str]                      # deferred concerns surfaced on the brief gate
 
 class ReviewerSummary(BaseModel):
     severity: Literal["low", "medium", "high"]
@@ -388,6 +338,11 @@ class PipelineState(TypedDict, total=False):
     issue: Annotated[IssueRef, overwrite]
     issue_comments: Annotated[list[IssueComment], merge_issue_comments]
     repo_context: Annotated[dict, overwrite]               # from Hydrator
+    ready_to_build: Annotated[bool, overwrite]             # from Triage
+    clarification_questions: Annotated[list[str], overwrite]
+    derived_user_request: Annotated[str, overwrite]
+    confidence: Annotated[Literal["low", "medium", "high"], overwrite]
+    rationale: Annotated[str, overwrite]
     stories: Annotated[list[UserStory], add]
     implementation_brief: Annotated[Optional[ImplementationBrief], overwrite]
     spec: Annotated[list[WorkPackageDict], merge_work_packages]

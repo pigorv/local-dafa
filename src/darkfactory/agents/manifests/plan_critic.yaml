@@ -3,10 +3,10 @@ identity:
   description: >-
     Reasoning-only critic that reviews the Architect's work packages
     against the original user stories and either approves the brief or
-    returns targeted edits keyed by story id.
+    returns targeted edits keyed by WorkPackage id.
   when_to_use: >-
     Inside the discovery subgraph after the Architect emits work
-    packages, before the brief gate. Up to PLANNING_MAX_ATTEMPTS=3
+    packages, before the brief gate. Up to PLANNING_MAX_ATTEMPTS=5
     rejection cycles re-feed planning_feedback into the Architect.
 
 llm:
@@ -15,6 +15,8 @@ llm:
   thinking:
     enabled: false
   prompt_path: prompts/plan_critic.md
+  prompt_as_user_message: true
+  structured_output: schemas/plan_critic_output.json
 
 tools:
   allowed: []
@@ -25,28 +27,7 @@ tools:
 
 mcp: []
 
-hooks:
-  - event: PreToolUse
-    name: loop_breaker
-    parameters: {}
-  - event: PreToolUse
-    name: call_cap
-    parameters: {}
-  - event: UserPromptSubmit
-    name: goal_pin
-    parameters: {}
+hooks: []
 
 budgets:
   retry_caps: {}
-
-io_contract:
-  reads:
-    - user_request
-    - stories
-    - work_packages
-    - spec
-    - planning_attempts
-    - planning_feedback
-  writes:
-    - planning_feedback
-    - planning_decision

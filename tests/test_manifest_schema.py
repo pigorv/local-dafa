@@ -33,10 +33,6 @@ def _manifest_payload() -> dict:
             "heartbeat": None,
             "retry_caps": {},
         },
-        "io_contract": {
-            "reads": [],
-            "writes": [],
-        },
     }
 
 
@@ -48,7 +44,6 @@ def test_role_manifest_accepts_minimal_valid_manifest() -> None:
     assert manifest.tools.allowed == []
     assert manifest.mcp == []
     assert manifest.hooks == []
-    assert manifest.io_contract.reads == []
 
 
 def test_role_manifest_preserves_hook_parameters_and_argv_prefixes() -> None:
@@ -85,7 +80,6 @@ def test_role_manifest_requires_missing_fields() -> None:
         ("llm", "unexpected"),
         ("tools", "unexpected"),
         ("budgets", "unexpected"),
-        ("io_contract", "unexpected"),
     ],
 )
 def test_role_manifest_rejects_unknown_extra_fields(

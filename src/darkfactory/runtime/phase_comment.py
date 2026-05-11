@@ -149,6 +149,11 @@ def render_spec_markdown(
                 lines.append(f"  - Depends on: {rendered_dependencies}")
 
     if review_decision:
+        notes = _decision_field(review_decision, "notes") or []
+        if isinstance(notes, list) and notes:
+            lines.extend(["", "### Deferred concerns (approved with notes)"])
+            for note in notes:
+                lines.append(f"- {note}")
         lines.extend(["", "### Spec Review", _compact_value(review_decision)])
 
     if len(lines) == 1:

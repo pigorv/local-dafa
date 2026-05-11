@@ -40,16 +40,3 @@ hooks:
 
 budgets:
   retry_caps: {}
-
-io_contract:
-  reads:
-    - implementation_brief
-    - spec
-    - coverage_entries
-    - test_results
-    - findings
-    - tester_findings
-    - test_files
-    - user_request
-  writes:
-    - predicate_coverage

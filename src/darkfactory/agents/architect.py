@@ -1,130 +1,59 @@
-"""Architect - SDK-driven discovery role.
+"""Architect — SDK-driven discovery role.
 
 Turns a list of user stories into a topo-sortable list of work packages.
 No tools, no MCP servers; reasoning-only role with structured output.
+
+The output shape is defined by ``schemas/architect_output.json`` and
+enforced by the SDK's ``output_format``; this module does not declare a
+Pydantic schema. The discovery subgraph (``stages/discovery.py``) is the
+single consumer and is responsible for shaping the brief and deriving the
+legacy ``spec`` channel.
 """
 from __future__ import annotations
 
 import json
+from string import Template
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator, model_validator
-
-from darkfactory.agents._sdk_common import (
-    repo_summary,
-    run_to_completion,
-)
+from darkfactory.agents._sdk_common import ParseError, _drain, repo_summary
 from darkfactory.agents.compose import ComposeState, compose
-from darkfactory.state import (
-    ContractChanges,
-    WorkPackage,
-    work_package_dict_from_model,
-    work_package_from_dict,
-)
+from darkfactory.agents.registry import get_default_registry, resolve_prompt_path
 
 
-class WorkPackagePlanModel(BaseModel):
-    story_id: str
-    approach: str
-    affected_files: list[str] = Field(default_factory=list)
-    new_files: list[str] = Field(default_factory=list)
-    test_files: list[str] = Field(default_factory=list)
-    risks: list[str] = Field(default_factory=list)
-    depends_on: list[str] = Field(default_factory=list)
-    # v2 fields carried alongside the legacy aliases so they survive
-    # the model_validator round-trip and reach downstream stages that
-    # still read state["spec"].
-    id: str = ""
-    title: str = ""
-    intent: str = ""
-    verification: list[str] = Field(default_factory=list)
-    repo_areas: list[str] = Field(default_factory=list)
-    candidate_files: list[str] = Field(default_factory=list)
-    dependencies: list[str] = Field(default_factory=list)
-    estimated_scope: str = ""
-    notes: list[str] = Field(default_factory=list)
-
-    @field_validator("verification", mode="before")
-    @classmethod
-    def _coerce_verification(cls, value: Any) -> list[str]:
-        if value is None:
-            return []
-        if isinstance(value, str):
-            return [line.strip() for line in value.splitlines() if line.strip()]
-        return list(value)
-
-
-def _empty_contract_changes() -> ContractChanges:
-    return ContractChanges(api=[], data=[], events=[])
-
-
-class ArchitectOutput(BaseModel):
-    """Architect output with v2 planning fields and legacy spec aliases."""
-
-    current_understanding: str = ""
-    proposed_design: str = ""
-    contract_changes: ContractChanges = Field(default_factory=_empty_contract_changes)
-    test_strategy: str = ""
-    work_packages: list[WorkPackage] = Field(default_factory=list)
-    spec: list[WorkPackagePlanModel] = Field(default_factory=list)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _sync_legacy_and_v2_fields(cls, data: Any) -> Any:
-        if not isinstance(data, dict):
-            return data
-
-        normalized = dict(data)
-        if "work_packages" not in normalized and "spec" in normalized:
-            normalized["work_packages"] = [
-                work_package_from_dict(
-                    WorkPackagePlanModel.model_validate(slice_).model_dump()
-                )
-                for slice_ in normalized.get("spec") or []
-            ]
-        if "spec" not in normalized and "work_packages" in normalized:
-            normalized["spec"] = [
-                work_package_dict_from_model(
-                    WorkPackage.model_validate(work_package)
-                )
-                for work_package in normalized.get("work_packages") or []
-            ]
-        return normalized
-
-
-def _planning_feedback_section(state_slice: dict) -> str:
+def _planning_feedback_text(state_slice: dict) -> str:
     feedback = [
         str(item)
         for item in state_slice.get("planning_feedback") or []
         if item
     ]
     if not feedback:
-        return ""
-    lines = "\n".join(f"- {item}" for item in feedback)
-    return f"\n\nPlanning feedback from prior attempt:\n{lines}"
+        return "(none)"
+    return "\n".join(f"- {item}" for item in feedback)
 
 
-def _user_message(state_slice: dict) -> str:
-    user_request = state_slice.get("user_request", "") or ""
-    stories = state_slice.get("stories", []) or []
-    ctx_blob = repo_summary(state_slice.get("repo_context"))
-    return (
-        f"User request:\n{user_request}\n\n"
-        f"Repo context:\n{ctx_blob}\n\n"
-        f"User stories (JSON):\n{json.dumps(stories, indent=2)}\n\n"
-        f"{_planning_feedback_section(state_slice)}\n\n"
-        "Produce ArchitectOutput with work_packages and dependencies."
+def _render_user_prompt(state_slice: dict) -> str:
+    manifest = get_default_registry().get("architect")
+    template_text = resolve_prompt_path(manifest.llm.prompt_path).read_text(
+        encoding="utf-8"
+    )
+    return Template(template_text).safe_substitute(
+        user_request=state_slice.get("user_request", "") or "",
+        repo_context=repo_summary(state_slice.get("repo_context")),
+        stories=json.dumps(state_slice.get("stories") or [], indent=2),
+        planning_feedback=_planning_feedback_text(state_slice),
     )
 
 
-async def run_architect(state_slice: dict) -> ArchitectOutput:
+async def run_architect(state_slice: dict) -> dict[str, Any]:
     compose_state = ComposeState.from_mapping(state_slice)
+    rendered = _render_user_prompt(state_slice)
     async with compose(
         "architect",
         compose_state,
         task_id=compose_state.task_id,
     ) as client:
-        await client.query(_user_message(state_slice))
-        result = await run_to_completion(client, expect=ArchitectOutput)
-        assert isinstance(result, ArchitectOutput)
-        return result
+        await client.query(rendered)
+        _text, structured, _result = await _drain(client)
+    if structured is None:
+        raise ParseError("Architect emitted no structured output")
+    return structured

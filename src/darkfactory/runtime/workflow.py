@@ -347,6 +347,7 @@ class DarkFactoryWorkflow:
                         self._state,
                         {
                             "planning_attempts": planning_attempt,
+                            "planning_max_attempts": PLANNING_MAX_ATTEMPTS,
                             "planning_feedback": planning_feedback,
                         },
                     )
