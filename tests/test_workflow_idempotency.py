@@ -16,7 +16,6 @@ from docker.errors import NotFound
 from temporalio import activity
 from temporalio.common import WorkflowIDReusePolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from darkfactory.runtime.activities import (
@@ -26,6 +25,7 @@ from darkfactory.runtime.activities import (
 )
 from darkfactory.runtime.workflow import DarkFactoryWorkflow
 from darkfactory.state import GateDecision, RunRequest
+from tests.temporal_testing import start_time_skipping_env
 
 
 def _build_fake_docker_client() -> tuple[MagicMock, dict[str, int]]:
@@ -72,8 +72,13 @@ def _build_fake_docker_client() -> tuple[MagicMock, dict[str, int]]:
         return container
 
     def fake_run(**kwargs):
+        # The orchestrator now spawns a throwaway alpine init container before
+        # each worker to pre-create the transcripts-volume subpath. Those calls
+        # have no `name=` and don't represent worker spawns.
+        name = kwargs.get("name")
+        if name is None:
+            return MagicMock()
         counters["spawn"] += 1
-        name = kwargs["name"]
         alive.add(name)
         return _container(name)
 
@@ -116,13 +121,13 @@ async def stub_verify_stage(state: dict) -> dict:
     }
 
 
-@activity.defn(name="spec_adjustment_stage")
-async def stub_spec_adjustment_stage(state: dict) -> dict:
+@activity.defn(name="fixer_stage")
+async def stub_fixer_stage(state: dict) -> dict:
     return {}
 
 
-@activity.defn(name="code_quality_stage")
-async def stub_code_quality_stage(state: dict) -> dict:
+@activity.defn(name="reviewer_stage")
+async def stub_reviewer_stage(state: dict) -> dict:
     return {}
 
 
@@ -141,8 +146,8 @@ _AGENT_STAGE_STUBS = (
     stub_discovery_stage,
     stub_build_stage,
     stub_verify_stage,
-    stub_spec_adjustment_stage,
-    stub_code_quality_stage,
+    stub_fixer_stage,
+    stub_reviewer_stage,
     stub_pr_creator_stage,
     stub_merge_branch,
 )
@@ -166,7 +171,7 @@ async def _run_idempotency_check() -> None:
         "darkfactory.runtime.activities.docker.from_env",
         return_value=fake_client,
     ):
-        async with await WorkflowEnvironment.start_time_skipping(
+        async with await start_time_skipping_env(
             data_converter=pydantic_data_converter
         ) as env:
             agent_tq = f"agent-tq-{wf_id}"
@@ -262,6 +267,10 @@ async def _run_and_approve(client, req: RunRequest, wf_id: str, **kwargs):
     )
     await handle.execute_update(
         DarkFactoryWorkflow.approve_gate,
-        GateDecision(approved=True, reason="test approves"),
+        GateDecision(approved=True, reason="test approves brief"),
+    )
+    await handle.execute_update(
+        DarkFactoryWorkflow.approve_gate,
+        GateDecision(approved=True, reason="test approves merge"),
     )
     return await handle.result()

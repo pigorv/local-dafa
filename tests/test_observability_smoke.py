@@ -34,11 +34,11 @@ from opentelemetry.trace import ProxyTracerProvider
 from temporalio import activity
 from temporalio.contrib.opentelemetry import TracingInterceptor
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from darkfactory.runtime.workflow import DarkFactoryWorkflow
 from darkfactory.state import GateDecision, RunRequest
+from tests.temporal_testing import start_time_skipping_env
 
 
 _exporter = InMemorySpanExporter()
@@ -102,13 +102,13 @@ async def stub_verify_stage(state: dict) -> dict:
     }
 
 
-@activity.defn(name="spec_adjustment_stage")
-async def stub_spec_adjustment_stage(state: dict) -> dict:
+@activity.defn(name="fixer_stage")
+async def stub_fixer_stage(state: dict) -> dict:
     return {}
 
 
-@activity.defn(name="code_quality_stage")
-async def stub_code_quality_stage(state: dict) -> dict:
+@activity.defn(name="reviewer_stage")
+async def stub_reviewer_stage(state: dict) -> dict:
     return {}
 
 
@@ -127,8 +127,8 @@ _STAGE_STUBS = (
     stub_discovery_stage,
     stub_build_stage,
     stub_verify_stage,
-    stub_spec_adjustment_stage,
-    stub_code_quality_stage,
+    stub_fixer_stage,
+    stub_reviewer_stage,
     stub_pr_creator_stage,
     stub_merge_branch,
 )
@@ -151,7 +151,7 @@ async def _run_smoke() -> None:
 
     interceptor = TracingInterceptor()
 
-    async with await WorkflowEnvironment.start_time_skipping(
+    async with await start_time_skipping_env(
         data_converter=pydantic_data_converter,
         interceptors=[interceptor],
     ) as env:
@@ -176,7 +176,11 @@ async def _run_smoke() -> None:
             )
             await handle.execute_update(
                 DarkFactoryWorkflow.approve_gate,
-                GateDecision(approved=True, reason="smoke approves"),
+                GateDecision(approved=True, reason="smoke approves brief"),
+            )
+            await handle.execute_update(
+                DarkFactoryWorkflow.approve_gate,
+                GateDecision(approved=True, reason="smoke approves merge"),
             )
             result = await handle.result()
 
@@ -202,7 +206,7 @@ async def _run_smoke() -> None:
         "discovery_stage",
         "build_stage",
         "verify_stage",
-        "code_quality_stage",
+        "reviewer_stage",
         "pr_creator_stage",
         "merge_branch",
     }

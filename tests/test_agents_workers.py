@@ -1,8 +1,8 @@
-"""Build-stage worker role tests after the SDK migration (M2-10).
+"""Build-stage worker role tests after the v2 Builder/Tester migration.
 
-Backend, Database, and Unit Test workers each expose
-``make_<role>_client(state_slice)`` and a sibling
-``async run_<role>(state_slice) -> WorkerOutput``. The tests below assert:
+Builder, Tester, and PR Creator agents are composed via
+``compose(role, ComposeState.from_mapping(...), task_id=...)``. The tests
+below assert:
 
 1. Option shape: hermetic ``setting_sources=[]``; the canonical worker
    ``allowed_tools`` list (no built-in ``Bash``); the in-process
@@ -13,8 +13,8 @@ Backend, Database, and Unit Test workers each expose
 3. The ``can_use_tool`` callback honours the allowlist (allow on ``mvn``,
    deny on out-of-list ``argv[0]``).
 4. ``run_<role>`` drives a fake SDK client and folds the diff_capture sink
-   into the returned ``WorkerOutput`` — confirming the
-   ``options.patches_sink`` round-trip.
+   into the returned output — confirming the ``options.patches_sink``
+   round-trip.
 
 No real Anthropic API calls and no real Docker. The lone integration touchpoint
 is the per-task sandbox registry in ``tools/shell.py`` which the
@@ -28,7 +28,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
-from claude_agent_sdk import HookMatcher
+from claude_agent_sdk import ClaudeSDKClient, HookMatcher
 from claude_agent_sdk.types import (
     AssistantMessage,
     PermissionResultAllow,
@@ -38,37 +38,47 @@ from claude_agent_sdk.types import (
     ToolPermissionContext,
 )
 
-from darkfactory.agents import backend as backend_mod
-from darkfactory.agents import database as database_mod
+from darkfactory.agents import builder as builder_mod
 from darkfactory.agents import pr_creator as pr_creator_mod
-from darkfactory.agents import unit_test as unit_test_mod
+from darkfactory.agents import tester as tester_mod
 from darkfactory.agents._sdk_common import WorkerOutput
-from darkfactory.agents.backend import (
-    BACKEND_ALLOWLIST,
-    make_backend_client,
-    run_backend,
-)
-from darkfactory.agents.database import (
-    DATABASE_ALLOWLIST,
-    make_database_client,
-    run_database,
-)
-from darkfactory.agents.pr_creator import (
-    PR_CREATOR_ALLOWLIST,
-    make_pr_creator_client,
-    run_pr_creator,
-)
-from darkfactory.agents.unit_test import (
-    UNIT_TEST_ALLOWLIST,
-    make_unit_test_client,
-    run_unit_test,
-)
+from darkfactory.agents.builder import run_builder
+from darkfactory.agents.compose import ComposeState, compose
+from darkfactory.agents.pr_creator import PR_CREATOR_ALLOWLIST, run_pr_creator
+from darkfactory.agents.registry import get_default_registry
+from darkfactory.agents.tester import TesterOutput, run_tester
+
+
+def _compose_client(
+    role: str,
+    state_slice: dict,
+    *,
+    patches_sink: list[Any] | None = None,
+) -> ClaudeSDKClient:
+    state = ComposeState.from_mapping(state_slice, patches_sink=patches_sink)
+    return compose(role, state, task_id=state.task_id)
+
+
+def _builder_client(
+    state_slice: dict, *, patches_sink: list[Any] | None = None
+) -> ClaudeSDKClient:
+    return _compose_client("builder", state_slice, patches_sink=patches_sink)
+
+
+def _tester_client(
+    state_slice: dict, *, patches_sink: list[Any] | None = None
+) -> ClaudeSDKClient:
+    return _compose_client("tester", state_slice, patches_sink=patches_sink)
+
+
+def _pr_creator_client(state_slice: dict) -> ClaudeSDKClient:
+    return _compose_client("pr_creator", state_slice)
 
 
 CANONICAL_ALLOWLIST: frozenset[str] = frozenset(
     {"mvn", "gradle", "./gradlew", "git", "cat", "ls"}
 )
-CANONICAL_TOOLS: list[str] = ["Read", "Write", "Edit", "Grep", "Glob", "sandbox_bash"]
+CANONICAL_TOOLS: list[str] = ["Read", "Write", "Edit", "Grep", "Glob", "Bash", "sandbox_bash"]
 PR_CREATOR_TOOLS: list[str] = ["Read", "Grep", "Glob", "sandbox_bash"]
 
 
@@ -114,15 +124,24 @@ def _pr_state_slice() -> dict:
 
 
 @pytest.mark.parametrize(
-    "factory, allowlist",
+    "factory, allowlist_source",
     [
-        (make_backend_client, BACKEND_ALLOWLIST),
-        (make_database_client, DATABASE_ALLOWLIST),
-        (make_unit_test_client, UNIT_TEST_ALLOWLIST),
+        (
+            _builder_client,
+            lambda: frozenset(
+                get_default_registry().get("builder").tools.argv_allowlist
+            ),
+        ),
+        (
+            _tester_client,
+            lambda: frozenset(
+                get_default_registry().get("tester").tools.argv_allowlist
+            ),
+        ),
     ],
 )
 def test_worker_client_options_are_hermetic_and_sdk_native(
-    factory: Any, allowlist: frozenset[str]
+    factory: Any, allowlist_source: Any
 ) -> None:
     client = factory(_state_slice())
     opts = client.options
@@ -131,7 +150,9 @@ def test_worker_client_options_are_hermetic_and_sdk_native(
     # Hermetic / SDK-native shape per ARCHITECTURE.md §15.4 + §5.5.
     assert opts.setting_sources == []
     assert opts.allowed_tools == CANONICAL_TOOLS
-    assert "Bash" not in opts.allowed_tools  # built-in Bash deliberately disabled
+    # Built-in ``Bash`` is intentionally enabled alongside ``sandbox_bash``
+    # so agents can introspect projects without the per-role argv allowlist.
+    assert "Bash" in opts.allowed_tools
     assert opts.cwd == "/workspace"
 
     # MCP server attached under the canonical "darkfactory" key.
@@ -149,46 +170,67 @@ def test_worker_client_options_are_hermetic_and_sdk_native(
         assert event in opts.hooks, event
         assert isinstance(opts.hooks[event][0], HookMatcher)
 
-    # The allowlist on the module must match the canonical six-binary set.
-    assert allowlist == CANONICAL_ALLOWLIST
+    # The role's argv allowlist must match the canonical six-binary set.
+    assert allowlist_source() == CANONICAL_ALLOWLIST
+
+
+def _flat_event_hooks(client: Any, event: str) -> list[Any]:
+    """Flatten every HookMatcher's callbacks for ``event``.
+
+    ``compose`` emits one HookMatcher per manifest attachment, while the
+    pre-Task-6.1 imperative path bundled them into a single matcher. Both
+    shapes fire the same hooks at runtime — these structural tests flatten
+    across matchers so the assertion is on hook identity, not packing.
+    """
+    out: list[Any] = []
+    for matcher in client.options.hooks.get(event) or []:
+        out.extend(list(matcher.hooks or []))
+    return out
 
 
 def test_each_worker_has_loop_breaker_and_call_cap_on_pretool() -> None:
-    client = make_backend_client(_state_slice())
-    pre_hooks = list(client.options.hooks["PreToolUse"][0].hooks)
-    # loop_breaker + call_cap (M2-5).
-    assert len(pre_hooks) == 2
+    client = _builder_client(_state_slice())
+    pre_hook_names = [hook.__name__ for hook in _flat_event_hooks(client, "PreToolUse")]
+    # path_guard + loop_breaker + call_cap + heartbeat.
+    assert "path_guard_hook" in pre_hook_names
+    assert "loop_breaker_hook" in pre_hook_names
+    assert "call_cap_hook" in pre_hook_names
+    assert "heartbeat_hook" in pre_hook_names
 
 
 def test_each_worker_has_diff_capture_and_injection_guard_on_posttool() -> None:
-    client = make_database_client(_state_slice())
-    post_hooks = list(client.options.hooks["PostToolUse"][0].hooks)
-    # diff_capture (M2-7) + prompt_injection_guard (M2-8).
-    assert len(post_hooks) == 2
+    client = _tester_client(_state_slice())
+    post_hook_names = [hook.__name__ for hook in _flat_event_hooks(client, "PostToolUse")]
+    # diff_capture (M2-7) + prompt_injection_guard (M2-8) + heartbeat.
+    assert "diff_capture_hook" in post_hook_names
+    assert "prompt_injection_guard_hook" in post_hook_names
+    assert "heartbeat_hook" in post_hook_names
 
 
 def test_each_worker_has_goal_pin_on_user_prompt_submit() -> None:
-    client = make_unit_test_client(_state_slice())
-    submit_hooks = list(client.options.hooks["UserPromptSubmit"][0].hooks)
-    assert len(submit_hooks) == 1
+    client = _tester_client(_state_slice())
+    submit_hook_names = [
+        hook.__name__ for hook in _flat_event_hooks(client, "UserPromptSubmit")
+    ]
+    assert "goal_pin_hook" in submit_hook_names
 
 
 def test_each_worker_has_heartbeat_on_stop() -> None:
-    client = make_backend_client(_state_slice())
-    stop_hooks = list(client.options.hooks["Stop"][0].hooks)
-    assert len(stop_hooks) == 1
+    client = _builder_client(_state_slice())
+    stop_hook_names = [hook.__name__ for hook in _flat_event_hooks(client, "Stop")]
+    assert "heartbeat_hook" in stop_hook_names
 
 
 def test_patches_sink_is_stashed_on_options() -> None:
     sink: list[dict] = []
-    client = make_backend_client(_state_slice(), patches_sink=sink)
+    client = _builder_client(_state_slice(), patches_sink=sink)
     # The same list object is exposed so `run_<role>` can fold it into the
     # WorkerOutput after the SDK loop ends.
     assert client.options.patches_sink is sink
 
 
-def test_pr_creator_client_options_are_post_gate_and_read_only() -> None:
-    client = make_pr_creator_client(_pr_state_slice())
+def test_pr_creator_client_options_are_pre_review_and_read_only() -> None:
+    client = _pr_creator_client(_pr_state_slice())
     opts = client.options
     assert opts is not None
 
@@ -215,7 +257,7 @@ def test_pr_creator_client_options_are_post_gate_and_read_only() -> None:
 
 @pytest.mark.parametrize(
     "factory",
-    [make_backend_client, make_database_client, make_unit_test_client],
+    [_builder_client, _tester_client],
 )
 def test_permission_gate_allows_mvn_compile(factory: Any) -> None:
     client = factory(_state_slice())
@@ -234,7 +276,7 @@ def test_permission_gate_allows_mvn_compile(factory: Any) -> None:
 
 @pytest.mark.parametrize(
     "factory",
-    [make_backend_client, make_database_client, make_unit_test_client],
+    [_builder_client, _tester_client],
 )
 def test_permission_gate_denies_off_allowlist_argv(factory: Any) -> None:
     client = factory(_state_slice())
@@ -254,10 +296,10 @@ def test_permission_gate_denies_off_allowlist_argv(factory: Any) -> None:
 
 @pytest.mark.parametrize(
     "factory",
-    [make_backend_client, make_database_client, make_unit_test_client],
+    [_builder_client, _tester_client],
 )
 def test_permission_gate_denies_merge_tools_pre_gate(factory: Any) -> None:
-    """Workers run before the HITL gate; ``gh_pr_merge`` must always deny."""
+    """Agents may never merge, even if a future caller passes a gate flag."""
     client = factory(_state_slice())
     gate = client.options.can_use_tool
 
@@ -266,11 +308,11 @@ def test_permission_gate_denies_merge_tools_pre_gate(factory: Any) -> None:
 
     result = asyncio.run(call())
     assert isinstance(result, PermissionResultDeny)
-    assert "merge gate not approved" in result.message
+    assert "agents cannot merge" in result.message
 
 
 def test_pr_creator_permission_gate_allows_gh_after_gate() -> None:
-    client = make_pr_creator_client(_pr_state_slice())
+    client = _pr_creator_client(_pr_state_slice())
     gate = client.options.can_use_tool
 
     async def call() -> Any:
@@ -285,7 +327,7 @@ def test_pr_creator_permission_gate_allows_gh_after_gate() -> None:
 
 
 def test_pr_creator_permission_gate_denies_off_allowlist_argv() -> None:
-    client = make_pr_creator_client(_pr_state_slice())
+    client = _pr_creator_client(_pr_state_slice())
     gate = client.options.can_use_tool
 
     async def call() -> Any:
@@ -301,8 +343,8 @@ def test_pr_creator_permission_gate_denies_off_allowlist_argv() -> None:
 
 
 def test_pr_creator_merge_tools_respect_gate() -> None:
-    denied_client = make_pr_creator_client({**_pr_state_slice(), "gate_approved": False})
-    allowed_client = make_pr_creator_client(_pr_state_slice())
+    denied_client = _pr_creator_client({**_pr_state_slice(), "gate_approved": False})
+    allowed_client = _pr_creator_client(_pr_state_slice())
 
     async def denied() -> Any:
         return await denied_client.options.can_use_tool(
@@ -407,64 +449,66 @@ class _FakePRClient:
         return _gen()
 
 
-def _patched_worker_factory(
-    seeded_patch: dict[str, Any],
-    summary: str,
-):
-    """Return a ``make_<role>_client`` replacement that wires a ``_FakeClient``.
-
-    The replacement honours the ``patches_sink`` keyword argument: it stuffs
-    one synthetic patch into the caller's sink at ``__aenter__`` time, then
-    drives one assistant message containing ``summary`` so
-    ``run_<role>`` returns ``WorkerOutput(patches=[seeded_patch], summary=summary)``.
-    """
-
-    def factory(_state_slice: dict, *, patches_sink: list[dict[str, Any]]) -> _FakeClient:
-        return _FakeClient(
-            responses=[[_assistant(summary), _result_msg()]],
-            seeded_sink=[seeded_patch],
-            patches_sink=patches_sink,
-        )
-
-    return factory
-
-
-@pytest.mark.parametrize(
-    "module, runner",
-    [
-        (backend_mod, run_backend),
-        (database_mod, run_database),
-        (unit_test_mod, run_unit_test),
-    ],
-)
-def test_run_worker_returns_worker_output_with_captured_patches(
-    monkeypatch: pytest.MonkeyPatch, module: Any, runner: Any
+def test_run_builder_returns_worker_output_with_captured_patches(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seeded_patch = {
         "path": "src/main/java/app/UserController.java",
         "diff": "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n",
-        "author_agent": module.ROLE,
+        "author_agent": builder_mod.ROLE,
         "slice_id": "US-1",
         "sha": "deadbeef",
     }
     summary = "Edited UserController to accept cursor parameter."
 
-    factory_name = next(
-        attr
-        for attr in (
-            "make_backend_client",
-            "make_database_client",
-            "make_unit_test_client",
+    def _compose(role: str, compose_state: Any, **_kwargs: Any) -> _FakeClient:
+        return _FakeClient(
+            responses=[[_assistant(summary), _result_msg()]],
+            seeded_sink=[seeded_patch],
+            patches_sink=compose_state.patches_sink,
         )
-        if hasattr(module, attr)
-    )
-    monkeypatch.setattr(module, factory_name, _patched_worker_factory(seeded_patch, summary))
 
-    out = asyncio.run(runner(_state_slice()))
+    monkeypatch.setattr(builder_mod, "compose", _compose)
+
+    out = asyncio.run(run_builder(_state_slice()))
 
     assert isinstance(out, WorkerOutput)
     assert out.patches == [seeded_patch]
     assert out.summary == summary
+
+
+def test_run_tester_returns_structured_output_with_captured_patches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seeded_patch = {
+        "path": "src/test/java/app/UserControllerTest.java",
+        "diff": "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n",
+        "author_agent": tester_mod.ROLE,
+        "slice_id": "US-1",
+        "sha": "feedface",
+    }
+    payload = (
+        '{"summary":"Added cursor pagination coverage",'
+        '"coverage":[{"wp_id":"US-1","predicate":"cursor returns next page",'
+        '"test_names":["UserControllerTest.cursor"]}],'
+        '"findings":[]}'
+    )
+
+    def _compose(role: str, compose_state: Any, **_kwargs: Any) -> _FakeClient:
+        return _FakeClient(
+            responses=[[_assistant(payload), _result_msg()]],
+            seeded_sink=[seeded_patch],
+            patches_sink=compose_state.patches_sink,
+        )
+
+    monkeypatch.setattr(tester_mod, "compose", _compose)
+
+    out = asyncio.run(run_tester(_state_slice()))
+
+    assert isinstance(out, TesterOutput)
+    assert out.patches == [seeded_patch]
+    assert out.coverage[0].wp_id == "US-1"
+    assert out.findings == []
 
 
 def test_run_pr_creator_returns_url_and_prompts_for_idempotent_check(
@@ -474,10 +518,10 @@ def test_run_pr_creator_returns_url_and_prompts_for_idempotent_check(
         [[_assistant("https://github.com/acme/demo/pull/42"), _result_msg()]]
     )
 
-    def factory(_state_slice: dict) -> _FakePRClient:
+    def _compose(*_args: Any, **_kwargs: Any) -> _FakePRClient:
         return fake
 
-    monkeypatch.setattr(pr_creator_mod, "make_pr_creator_client", factory)
+    monkeypatch.setattr(pr_creator_mod, "compose", _compose)
 
     out = asyncio.run(run_pr_creator(_pr_state_slice()))
 

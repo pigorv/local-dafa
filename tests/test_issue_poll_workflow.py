@@ -12,7 +12,6 @@ from temporalio.common import WorkflowIDReusePolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from darkfactory.runtime.activities import (
@@ -24,6 +23,7 @@ from darkfactory.runtime.activities import (
 from darkfactory.runtime.issue_workflow import DarkFactoryIssueWorkflow
 from darkfactory.runtime.issue_poll_workflow import IssuePollWorkflow
 from darkfactory.state import IssuePollRequest
+from tests.temporal_testing import start_time_skipping_env
 
 
 REPO = "octo-org/octo-repo"
@@ -263,7 +263,7 @@ async def _run_issue_poll_workflow_check() -> None:
         "darkfactory.runtime.activities._connect_temporal_client",
         new=fake_connect_temporal_client,
     ):
-        async with await WorkflowEnvironment.start_time_skipping(
+        async with await start_time_skipping_env(
             data_converter=pydantic_data_converter
         ) as env:
             async with Worker(
@@ -470,7 +470,7 @@ async def _run_issue_poll_approval_forwarding() -> None:
         "darkfactory.runtime.activities._connect_temporal_client",
         new=fake_connect_temporal_client,
     ):
-        async with await WorkflowEnvironment.start_time_skipping(
+        async with await start_time_skipping_env(
             data_converter=pydantic_data_converter
         ) as env:
             async with Worker(

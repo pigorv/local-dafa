@@ -1,0 +1,49 @@
+identity:
+  role: architect
+  description: >-
+    Reasoning-only planning role that turns user stories into a
+    topo-sortable list of work packages with verification predicates.
+  when_to_use: >-
+    Inside the discovery subgraph after PO emits user stories, before
+    the Plan Critic reviews the brief.
+
+llm:
+  model: claude-sonnet-4-5-20250929
+  temperature: 0.3
+  thinking:
+    enabled: false
+  prompt_path: prompts/architect.md
+
+tools:
+  allowed: []
+  disallowed: []
+  argv_allowlist: []
+  role_owned_argv_prefixes: []
+  edit_path_allowlist: []
+
+mcp: []
+
+hooks:
+  - event: PreToolUse
+    name: loop_breaker
+    parameters: {}
+  - event: PreToolUse
+    name: call_cap
+    parameters: {}
+  - event: UserPromptSubmit
+    name: goal_pin
+    parameters: {}
+
+budgets:
+  retry_caps: {}
+
+io_contract:
+  reads:
+    - user_request
+    - repo_context
+    - stories
+    - planning_feedback
+  writes:
+    - work_packages
+    - spec
+    - implementation_brief

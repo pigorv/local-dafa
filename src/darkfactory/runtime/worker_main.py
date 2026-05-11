@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+from pathlib import Path
 
 from opentelemetry import trace
 from temporalio.client import Client
@@ -9,6 +11,12 @@ from temporalio.contrib.opentelemetry import TracingInterceptor
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.worker import Worker
 
+from darkfactory.agents.registry import (
+    DEFAULT_MANIFESTS_DIR,
+    Registry,
+    load_registry,
+    set_default_registry,
+)
 from darkfactory.bootstrap import init_observability
 from darkfactory.runtime.activities import (
     STAGE_ACTIVITIES,
@@ -23,6 +31,7 @@ from darkfactory.runtime.activities import (
 DEFAULT_TEMPORAL_ADDRESS = "localhost:7233"
 TEMPORAL_TASK_QUEUE_ENV = "TEMPORAL_TASK_QUEUE"
 AGENT_TASK_QUEUE_PREFIX = "agent-tq-"
+log = logging.getLogger(__name__)
 
 
 def _task_queue_from_env() -> str:
@@ -32,11 +41,22 @@ def _task_queue_from_env() -> str:
     return task_queue
 
 
+def _load_manifest_registry(
+    manifests_dir: Path = DEFAULT_MANIFESTS_DIR,
+) -> Registry:
+    registry = load_registry(manifests_dir)
+    set_default_registry(registry)
+    hooks = ", ".join(registry.hook_names) or "none"
+    log.info("registry: %s roles loaded; hooks: %s", len(registry), hooks)
+    return registry
+
+
 async def main() -> None:
     task_queue = _task_queue_from_env()
     if task_queue.startswith(AGENT_TASK_QUEUE_PREFIX):
         os.environ.setdefault("DARKFACTORY_WF_ID", task_queue[len(AGENT_TASK_QUEUE_PREFIX):])
     init_observability("darkfactory-worker")
+    _load_manifest_registry()
     address = os.environ.get("TEMPORAL_ADDRESS", DEFAULT_TEMPORAL_ADDRESS)
     tracing_interceptor = TracingInterceptor()
     client = await Client.connect(

@@ -1,15 +1,18 @@
 """Unit tests for stages/verify.py thin verify nodes."""
 from __future__ import annotations
 
+import asyncio
 import types
 
 import pytest
 
+from darkfactory.agents.verifier_semantic import SemanticVerifierOutput
 from darkfactory.stages import verify as verify_mod
 from darkfactory.stages.verify import (
     run_compile_node,
     run_happy_path_node,
     run_linters_node,
+    run_semantic_coverage_node,
     run_tests_node,
 )
 
@@ -178,6 +181,252 @@ def test_run_happy_path_node_is_noop_stub(tmp_path):
     assert run_happy_path_node({}, _runtime(tmp_path)) == {}
 
 
+# --- run_semantic_coverage_node ---
+
+def test_run_semantic_coverage_node_skips_without_predicates(monkeypatch):
+    async def _unexpected(_state):
+        raise AssertionError("semantic verifier should not run without predicates")
+
+    monkeypatch.setattr(verify_mod, "run_verifier_semantic", _unexpected)
+
+    out = asyncio.run(
+        run_semantic_coverage_node(
+            {"verify_summary": {"passed": True, "failed_tests": 0, "hard_findings": 0}}
+        )
+    )
+
+    assert out == {}
+
+
+def test_run_semantic_coverage_node_merges_predicate_coverage(monkeypatch):
+    seen: dict[str, dict] = {}
+
+    async def _fake_semantic(state):
+        seen["state"] = state
+        return SemanticVerifierOutput.model_validate(
+            {
+                "predicate_coverage": [
+                    {
+                        "wp_id": "WP-1",
+                        "predicate": "GET /customers/{unknown_id} returns 404",
+                        "status": "covered",
+                        "evidence": "CustomerControllerTest.missingCustomerReturns404",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(verify_mod, "run_verifier_semantic", _fake_semantic)
+
+    state = {
+        "implementation_brief": {
+            "work_packages": [
+                {
+                    "id": "WP-1",
+                    "verification": ["GET /customers/{unknown_id} returns 404"],
+                }
+            ]
+        },
+        "coverage_entries": [
+            {
+                "wp_id": "WP-1",
+                "predicate": "GET /customers/{unknown_id} returns 404",
+                "test_names": ["CustomerControllerTest.missingCustomerReturns404"],
+            }
+        ],
+        "test_results": [
+            {
+                "runner": "maven",
+                "returncode": 0,
+                "passed": 1,
+                "failed": 0,
+                "errors": [],
+                "duration_s": 0.1,
+            }
+        ],
+        "findings": [],
+        "verify_summary": {"passed": True, "failed_tests": 0, "hard_findings": 0},
+    }
+
+    out = asyncio.run(run_semantic_coverage_node(state))
+
+    assert seen["state"]["test_results"][0]["passed"] == 1
+    assert out["verify_summary"]["passed"] is True
+    assert out["verify_summary"]["failed_tests"] == 0
+    assert out["verify_summary"]["predicate_coverage"] == [
+        {
+            "wp_id": "WP-1",
+            "predicate": "GET /customers/{unknown_id} returns 404",
+            "status": "covered",
+            "evidence": "CustomerControllerTest.missingCustomerReturns404",
+        }
+    ]
+
+
+def test_run_semantic_coverage_node_fails_on_uncovered_predicate(monkeypatch):
+    async def _fake_semantic(_state):
+        return SemanticVerifierOutput.model_validate(
+            {
+                "predicate_coverage": [
+                    {
+                        "wp_id": "WP-1",
+                        "predicate": "GET /customers/{unknown_id} returns 404",
+                        "status": "uncovered",
+                        "evidence": "",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(verify_mod, "run_verifier_semantic", _fake_semantic)
+
+    state = {
+        "implementation_brief": {
+            "work_packages": [
+                {
+                    "id": "WP-1",
+                    "verification": ["GET /customers/{unknown_id} returns 404"],
+                }
+            ]
+        },
+        "test_results": [
+            {
+                "runner": "maven",
+                "returncode": 0,
+                "passed": 1,
+                "failed": 0,
+                "errors": [],
+                "duration_s": 0.1,
+            }
+        ],
+        "findings": [],
+        "verify_summary": {"passed": True, "failed_tests": 0, "hard_findings": 0},
+        "verify_retries": 0,
+    }
+
+    out = asyncio.run(run_semantic_coverage_node(state))
+
+    assert out["verify_summary"]["passed"] is False
+    assert out["verify_summary"]["uncovered_predicates"] == 1
+    assert out["verify_retries"] == 1
+
+
+def test_run_semantic_coverage_node_fails_on_missing_predicate_coverage(monkeypatch):
+    async def _fake_semantic(_state):
+        return SemanticVerifierOutput.model_validate({"predicate_coverage": []})
+
+    monkeypatch.setattr(verify_mod, "run_verifier_semantic", _fake_semantic)
+
+    state = {
+        "implementation_brief": {
+            "work_packages": [
+                {
+                    "id": "WP-1",
+                    "verification": ["response body contains nextCursor"],
+                }
+            ]
+        },
+        "test_results": [
+            {
+                "runner": "maven",
+                "returncode": 0,
+                "passed": 1,
+                "failed": 0,
+                "errors": [],
+                "duration_s": 0.1,
+            }
+        ],
+        "findings": [],
+        "verify_summary": {"passed": True, "failed_tests": 0, "hard_findings": 0},
+        "verify_retries": 0,
+    }
+
+    out = asyncio.run(run_semantic_coverage_node(state))
+
+    assert out["verify_summary"]["passed"] is False
+    assert out["verify_summary"]["uncovered_predicates"] == 1
+    assert out["verify_retries"] == 1
+
+
+def test_run_semantic_coverage_node_keeps_mechanical_failure(monkeypatch):
+    async def _fake_semantic(_state):
+        return SemanticVerifierOutput.model_validate(
+            {
+                "predicate_coverage": [
+                    {
+                        "wp_id": "WP-1",
+                        "predicate": "response body contains nextCursor",
+                        "status": "covered",
+                        "evidence": "PaginationTest.assertsNextCursor",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(verify_mod, "run_verifier_semantic", _fake_semantic)
+
+    state = {
+        "implementation_brief": {
+            "work_packages": [
+                {
+                    "id": "WP-1",
+                    "verification": ["response body contains nextCursor"],
+                }
+            ]
+        },
+        "test_results": [
+            {
+                "runner": "maven",
+                "returncode": 1,
+                "passed": 0,
+                "failed": 1,
+                "errors": [],
+                "duration_s": 0.1,
+            }
+        ],
+        "findings": [],
+        "verify_summary": {"passed": False, "failed_tests": 1, "hard_findings": 0},
+        "verify_retries": 1,
+    }
+
+    out = asyncio.run(run_semantic_coverage_node(state))
+
+    assert out["verify_summary"]["passed"] is False
+    assert out["verify_summary"]["failed_tests"] == 1
+    assert out["verify_summary"]["uncovered_predicates"] == 0
+    assert "verify_retries" not in out
+
+
+def test_aggregate_fails_on_blocking_tester_finding():
+    state = {
+        "test_results": [
+            {
+                "runner": "maven",
+                "returncode": 0,
+                "passed": 1,
+                "failed": 0,
+                "errors": [],
+                "duration_s": 0.1,
+            }
+        ],
+        "findings": [],
+        "tester_findings": [
+            {
+                "kind": "behavior_mismatch",
+                "wp_id": "WP-1",
+                "detail": "Implementation returns offset pagination.",
+            }
+        ],
+        "verify_retries": 0,
+    }
+
+    out = verify_mod.aggregate(state)
+
+    assert out["verify_summary"]["passed"] is False
+    assert out["verify_summary"]["blocking_tester_findings"] == 1
+    assert out["verify_retries"] == 1
+
+
 # --- verify_fanout / verify_subgraph ---
 
 def test_verify_fanout_emits_one_send_per_target():
@@ -258,11 +507,18 @@ def test_verify_subgraph_defers_aggregate_until_all_fanout_nodes_finish(monkeypa
     monkeypatch.setattr(verify_mod, "run_happy_path_node", _stub("happy"))
     monkeypatch.setattr(verify_mod, "aggregate", _aggregate)
 
-    sg = verify_subgraph()
-    out = sg.invoke({"user_request": "x"})
+    async def _semantic(state, runtime=None):  # noqa: ARG001
+        calls.append("semantic")
+        assert state["verify_summary"]["passed"] is True
+        return {}
 
-    assert set(calls[:-1]) == {"compile", "happy", "linters", "tests"}
-    assert calls[-1] == "aggregate"
+    monkeypatch.setattr(verify_mod, "run_semantic_coverage_node", _semantic)
+
+    sg = verify_subgraph()
+    out = asyncio.run(sg.ainvoke({"user_request": "x"}))
+
+    assert set(calls[:-2]) == {"compile", "happy", "linters", "tests"}
+    assert calls[-2:] == ["aggregate", "semantic"]
     assert seen == {"test_results": 1, "findings": 2}
     assert out["verify_summary"] == {
         "passed": True,

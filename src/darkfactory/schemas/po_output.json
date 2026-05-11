@@ -1,0 +1,64 @@
+{
+  "type": "object",
+  "title": "POOutput",
+  "description": "Product Owner output: brief-intent fields plus user stories.",
+  "additionalProperties": false,
+  "properties": {
+    "problem": {
+      "type": "string",
+      "description": "One-sentence statement of the user's pain."
+    },
+    "expected_behavior": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Externally observable outcomes that prove the request was satisfied. Each item should be testable from outside the code."
+    },
+    "compatibility_risks": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Existing behaviour in the system that could break as a result of the change."
+    },
+    "open_assumptions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Facts the agent assumed but could not verify from the supplied repo context."
+    },
+    "stories": {
+      "type": "array",
+      "maxItems": 4,
+      "description": "1-4 user stories. Fewer is better. Split only when a story hides independently-testable behaviours.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "title", "as_a", "i_want", "so_that"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Stable id like 'US-1', numeric suffix starting at 1."
+          },
+          "title": {
+            "type": "string",
+            "description": "Short verb phrase summarizing the story."
+          },
+          "as_a": {
+            "type": "string",
+            "description": "The role taking the action, e.g. 'API consumer', 'operator'."
+          },
+          "i_want": {
+            "type": "string",
+            "description": "The capability the role wants, in one sentence."
+          },
+          "so_that": {
+            "type": "string",
+            "description": "The business value, in one sentence."
+          },
+          "acceptance_criteria": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Testable bullets, each observable from outside the code: an HTTP response shape, a stored row, a log line, a test name. No 'refactor X' or 'clean up Y' criteria."
+          }
+        }
+      }
+    }
+  }
+}

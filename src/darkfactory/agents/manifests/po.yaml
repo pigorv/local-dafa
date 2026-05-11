@@ -1,0 +1,58 @@
+identity:
+  role: po
+  description: >-
+    Reasoning-only Product Owner role that turns a user request plus
+    repo context into a list of user stories and the v2 brief-intent
+    fields (problem, expected_behavior, compatibility_risks,
+    open_assumptions).
+  when_to_use: >-
+    Inside the discovery subgraph as the first planning step, before
+    the Architect turns the stories into a topo-sortable list of work
+    packages.
+
+llm:
+  model: claude-haiku-4-5-20251001
+  temperature: 0.3
+  thinking:
+    enabled: false
+  prompt_path: prompts/po.md
+  prompt_as_user_message: true
+  structured_output: schemas/po_output.json
+
+tools:
+  allowed: []
+  disallowed: []
+  argv_allowlist: []
+  role_owned_argv_prefixes: []
+  edit_path_allowlist: []
+
+mcp: []
+
+hooks:
+  - event: PreToolUse
+    name: loop_breaker
+    parameters: {}
+  - event: PreToolUse
+    name: call_cap
+    parameters: {}
+  - event: UserPromptSubmit
+    name: goal_pin
+    parameters: {}
+  - event: PostToolUse
+    name: prompt_injection_guard
+    parameters: {}
+
+budgets:
+  retry_caps: {}
+
+io_contract:
+  reads:
+    - user_request
+    - repo_context
+    - planning_feedback
+  writes:
+    - stories
+    - problem
+    - expected_behavior
+    - compatibility_risks
+    - open_assumptions

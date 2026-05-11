@@ -10,6 +10,7 @@ from darkfactory.runtime.phase_comment import (
     end_marker_for,
     marker_for,
     render_phase_comment,
+    render_spec_markdown,
 )
 
 
@@ -26,6 +27,50 @@ def test_marker_for_uses_per_run_markers_and_design_revisions() -> None:
         "design",
         rev=1,
     )
+
+
+def test_marker_for_review_requires_iteration_per_pass() -> None:
+    wf_id = "df-issue-octo-demo-42-run-1"
+
+    assert marker_for(wf_id, "review", attempt=1) == (
+        f"<!-- df-phase:{wf_id}:review:1 -->"
+    )
+    assert marker_for(wf_id, "review", attempt=2) != marker_for(
+        wf_id,
+        "review",
+        attempt=1,
+    )
+
+    try:
+        marker_for(wf_id, "review")
+    except ValueError:
+        pass
+    else:  # pragma: no cover - defensive
+        raise AssertionError("review marker without iteration should raise")
+
+
+def test_render_review_recommends_action_based_on_verdict() -> None:
+    body = render_phase_comment(
+        "review",
+        "done",
+        {
+            "pr_url": "https://example/pr/1",
+            "review_decision": {
+                "recommendation": "request_changes",
+                "severity": "medium",
+                "issues": ["lint regression"],
+            },
+            "include_merge_instructions": True,
+        },
+        wf_id="wf-1",
+        attempt=1,
+    )
+
+    assert body.startswith("<!-- df-phase:wf-1:review:1 -->")
+    assert "### Recommended next actions" in body
+    assert "Reviewer recommends: **fix**." in body
+    assert "`/df fix <focus>` — re-run Fixer and Verifier ← recommended" in body
+    assert "`/df approve` — merge the PR" in body
 
 
 def test_render_phase_comment_includes_status_fields_and_workflow() -> None:
@@ -49,6 +94,44 @@ def test_render_phase_comment_includes_status_fields_and_workflow() -> None:
     assert "Derived request: Build the thing." in body
     assert "Next: design" in body
     assert "Workflow: `wf-1`" in body
+
+
+def test_render_spec_markdown_frames_work_package_files_as_hints() -> None:
+    body = render_spec_markdown(
+        user_request="Expose cursor pagination.",
+        stories=[
+            {
+                "id": "US-1",
+                "title": "Cursor pagination",
+                "acceptance_criteria": ["clients can request the next page"],
+            }
+        ],
+        spec=[
+            {
+                "id": "WP-1",
+                "story_id": "US-1",
+                "title": "Cursor token flow",
+                "intent": "Return and consume stable cursor tokens.",
+                "repo_areas": ["API user lookup flow"],
+                "candidate_files": ["src/users/api.py", "tests/test_users_api.py"],
+                "verification": [
+                    "first page returns a next cursor",
+                    {"predicate": "second page starts after the cursor"},
+                ],
+                "dependencies": [],
+            }
+        ],
+    )
+
+    assert "### Work Packages" in body
+    assert "- **WP-1**: Cursor token flow" in body
+    assert "Candidate files (hints): src/users/api.py, tests/test_users_api.py" in body
+    assert "  - Verification predicates:" in body
+    assert "    - first page returns a next cursor" in body
+    assert "    - second page starts after the cursor" in body
+    assert "allowed files" not in body.lower()
+    assert "must edit" not in body.lower()
+    assert "Affected files" not in body
 
 
 class _Sandbox:

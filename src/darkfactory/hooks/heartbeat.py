@@ -9,8 +9,8 @@ Temporal that the activity is still alive.
 
 The hook is a no-op when not running inside a Temporal activity worker
 (unit tests, ad-hoc CLI runs from the orchestrator), so it can be
-attached unconditionally to every ``ClaudeSDKClient`` produced by the
-``make_<role>_client`` helpers without breaking standalone usage.
+attached unconditionally to every ``ClaudeSDKClient`` produced by
+``compose(role, ...)`` without breaking standalone usage.
 """
 from __future__ import annotations
 

@@ -15,7 +15,7 @@ Add cursor-based pagination to /api/users with tests
 ## Why this fixture converges
 
 - The seed code already exposes `/api/users` and the existing test only asserts response shape under offset pagination, so the agent has a clear "before" surface to extend.
-- Adding a `cursor` query param + a `nextCursor` field in the response is a small, mechanically obvious change: the agent's discovery stage produces one backend slice and one unit-test slice; build/verify pass on the first iteration; code-quality returns `approve`; the gate is the only human step.
+- Adding a `cursor` query param + a `nextCursor` field in the response is a small, mechanically obvious change: the agent's discovery stage produces one API work package and one test work package; build/verify pass on the first iteration; reviewer returns `approve`; the gate is the only human step.
 - The 50-user seed is large enough that cursor pagination is meaningful but small enough that the test suite runs in seconds.
 
 ## Local sanity check (host-side)

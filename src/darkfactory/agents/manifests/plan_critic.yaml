@@ -1,0 +1,52 @@
+identity:
+  role: plan_critic
+  description: >-
+    Reasoning-only critic that reviews the Architect's work packages
+    against the original user stories and either approves the brief or
+    returns targeted edits keyed by story id.
+  when_to_use: >-
+    Inside the discovery subgraph after the Architect emits work
+    packages, before the brief gate. Up to PLANNING_MAX_ATTEMPTS=3
+    rejection cycles re-feed planning_feedback into the Architect.
+
+llm:
+  model: claude-sonnet-4-5-20250929
+  temperature: 0.3
+  thinking:
+    enabled: false
+  prompt_path: prompts/plan_critic.md
+
+tools:
+  allowed: []
+  disallowed: []
+  argv_allowlist: []
+  role_owned_argv_prefixes: []
+  edit_path_allowlist: []
+
+mcp: []
+
+hooks:
+  - event: PreToolUse
+    name: loop_breaker
+    parameters: {}
+  - event: PreToolUse
+    name: call_cap
+    parameters: {}
+  - event: UserPromptSubmit
+    name: goal_pin
+    parameters: {}
+
+budgets:
+  retry_caps: {}
+
+io_contract:
+  reads:
+    - user_request
+    - stories
+    - work_packages
+    - spec
+    - planning_attempts
+    - planning_feedback
+  writes:
+    - planning_feedback
+    - planning_decision

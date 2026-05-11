@@ -9,8 +9,50 @@ from typing import Any, Iterable
 from darkfactory.state import PipelineState
 
 REPO_MAP_CHAR_BUDGET = 4096  # ~1024 tokens at ~4 chars/token
+STYLE_CONFIG_SNIPPET_BUDGET = 800  # per-file char cap when surfacing style rules
+STYLE_CONFIG_TOTAL_BUDGET = 3200   # all style configs combined
+STYLE_CONFIG_NAMES = (
+    "checkstyle.xml",
+    "google_checks.xml",
+    "sun_checks.xml",
+    "pmd.xml",
+    "ruleset.xml",
+    "spotbugs.xml",
+    "spotbugs-exclude.xml",
+    "findbugs.xml",
+    ".editorconfig",
+    ".eslintrc",
+    ".eslintrc.json",
+    ".eslintrc.js",
+    ".eslintrc.cjs",
+    ".eslintrc.yml",
+    ".eslintrc.yaml",
+    ".prettierrc",
+    ".prettierrc.json",
+    ".prettierrc.js",
+    ".prettierrc.yml",
+    ".prettierrc.yaml",
+    "prettier.config.js",
+    "ruff.toml",
+    ".ruff.toml",
+    "pyproject.toml",
+    "setup.cfg",
+    ".flake8",
+    "tox.ini",
+    "tslint.json",
+    "biome.json",
+    "rustfmt.toml",
+    ".rustfmt.toml",
+    "clippy.toml",
+    ".golangci.yml",
+    ".golangci.yaml",
+    ".rubocop.yml",
+    ".stylelintrc",
+    ".stylelintrc.json",
+)
 ISSUE_VIEW_JSON_FIELDS = "title,body,labels,comments,assignees,milestone"
 DF_CLARIFY_MARKER_RE = re.compile(r"<!--\s*df-clarify:[^>]*-->")
+DF_NOISE_MARKER_RE = re.compile(r"<!--\s*df-(?:clarify|quarantine):[^>]*-->")
 
 SOURCE_EXTENSIONS = {
     ".py", ".java", ".kt", ".kts", ".ts", ".tsx", ".js", ".jsx",
@@ -92,6 +134,51 @@ def _build_repo_map(root: Path, budget: int = REPO_MAP_CHAR_BUDGET) -> str:
     return "\n".join(out).strip()
 
 
+def _collect_style_configs(root: Path) -> list[dict[str, str]]:
+    """Find well-known lint/style config files at the repo root.
+
+    Surfaces existence + a head snippet so the Builder can match the
+    repo's checkstyle/lint rules (Javadoc, magic numbers, whitespace,
+    naming) without hard-finding the verify step.
+    """
+    found: list[dict[str, str]] = []
+    used = 0
+    for name in STYLE_CONFIG_NAMES:
+        path = root / name
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if name == "pyproject.toml" and not _pyproject_has_style_section(text):
+            # Skip pyprojects that are just packaging metadata; we want
+            # the ones that actually configure ruff/black/isort/flake8.
+            continue
+        snippet = text.strip()
+        if len(snippet) > STYLE_CONFIG_SNIPPET_BUDGET:
+            snippet = snippet[:STYLE_CONFIG_SNIPPET_BUDGET].rstrip() + "\n…"
+        if used + len(snippet) > STYLE_CONFIG_TOTAL_BUDGET and found:
+            break
+        found.append({"path": name, "content": snippet})
+        used += len(snippet)
+    return found
+
+
+_PYPROJECT_STYLE_SECTIONS = (
+    "[tool.ruff",
+    "[tool.black",
+    "[tool.isort",
+    "[tool.flake8",
+    "[tool.pylint",
+    "[tool.pycodestyle",
+)
+
+
+def _pyproject_has_style_section(text: str) -> bool:
+    return any(section in text for section in _PYPROJECT_STYLE_SECTIONS)
+
+
 def _read_agents_md(root: Path) -> str:
     for name in ("AGENTS.md", "agents.md"):
         p = root / name
@@ -150,7 +237,7 @@ def _collect_issue_context(repo: str, issue_number: int) -> dict[str, Any]:
         "comments": [
             comment
             for comment in comments
-            if not DF_CLARIFY_MARKER_RE.search(str(comment.get("body") or ""))
+            if not DF_NOISE_MARKER_RE.search(str(comment.get("body") or ""))
         ],
         "assignees": issue.get("assignees") or [],
         "milestone": issue.get("milestone"),
@@ -212,13 +299,17 @@ def _normalise_issue(issue: Any, collected: dict[str, Any]) -> dict[str, Any]:
 
 
 def hydrate(root: str | Path) -> dict:
-    """Build repo_context from a repo root: AGENTS.md, repo map, git log."""
+    """Build repo_context from a repo root: AGENTS.md, repo map, git log,
+    plus detected lint/style configs so downstream agents can match the
+    repo's checkstyle/lint policy.
+    """
     repo_root = Path(root).resolve()
     return {
         "repo_root": str(repo_root),
         "agents_md": _read_agents_md(repo_root),
         "repo_map": _build_repo_map(repo_root),
         "git_log": _git_log_oneline(repo_root, 10),
+        "style_configs": _collect_style_configs(repo_root),
     }
 
 

@@ -22,9 +22,9 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * Deliberately unsatisfiable contract used to demo the exhausted-retries
  * terminal status. The two assertions below are mutually exclusive: a cursor
  * cannot simultaneously be a base64 string and a plain decimal integer. No
- * implementation can satisfy both, so spec_adjustment cannot reconcile the
- * verify failure and the workflow returns RunResult(status="exhausted_retries")
- * after VERIFY_RETRY_CAP=3 iterations.
+ * implementation can satisfy both, so Fixer cannot reconcile the verify
+ * failure and the workflow returns RunResult(status="needs_human",
+ * reason="fixer_budget_exhausted") after the repair budget is exhausted.
  */
 @SpringBootTest
 @AutoConfigureMockMvc

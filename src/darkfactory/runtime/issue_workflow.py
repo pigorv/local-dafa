@@ -13,7 +13,19 @@ from darkfactory.runtime.phase_comment import (
     render_phase_comment,
     render_spec_markdown,
 )
-from darkfactory.runtime.workflow import SUPERVISOR_TASK_QUEUE, VERIFY_RETRY_CAP
+from darkfactory.runtime.workflow import (
+    PLANNING_MAX_ATTEMPTS,
+    SUPERVISOR_TASK_QUEUE,
+    _fixer_budget_exhaustion,
+    _fixer_decision_escalation,
+    _fixer_escalation_delta,
+    _planning_approved,
+    _planning_attempt_log_entry,
+    _planning_feedback_from_decision,
+    _planning_feedback_from_human_revise,
+    _record_fixer_attempt_delta,
+    _reset_planning_artifacts,
+)
 from darkfactory.state import (
     GateDecision,
     IssueComment,
@@ -32,6 +44,9 @@ DF_AWAITING_APPROVAL = "df:awaiting-approval"
 DF_APPROVED = "df:approved"
 DF_BUILDING = "df:building"
 DF_VERIFYING = "df:verifying"
+DF_REVIEWING = "df:reviewing"
+DF_AWAITING_MERGE = "df:awaiting-merge"
+DF_FIXING = "df:fixing"
 DF_IN_PROGRESS = "df:in-progress"
 DF_DONE = "df:done"
 DF_NEEDS_HUMAN = "df:needs-human"
@@ -78,20 +93,16 @@ def _last_comment_id(comments: list[object]) -> int | None:
     return max(ids) if ids else None
 
 
-def _phase_key(phase: str, rev: int | None = None) -> str:
-    return f"{phase}:{rev}" if phase == "design" and rev is not None else phase
-
-
-def _quality_approved(decision: Any) -> bool:
-    if not decision:
-        return True
-    recommendation = str(_state_value(decision, "recommendation", "") or "").lower()
-    if recommendation:
-        return recommendation == "approve"
-    approved = _state_value(decision, "approved", None)
-    if approved is not None:
-        return bool(approved)
-    return True
+def _phase_key(
+    phase: str,
+    rev: int | None = None,
+    attempt: int | None = None,
+) -> str:
+    if phase == "design" and rev is not None:
+        return f"{phase}:{rev}"
+    if phase == "review" and attempt is not None:
+        return f"{phase}:{attempt}"
+    return phase
 
 
 def _patch_paths(patches: Any) -> list[str]:
@@ -110,6 +121,7 @@ class DarkFactoryIssueWorkflow:
         self._new_comments: list[IssueComment] = []
         self._state: dict = {}
         self._phase_started_at: dict[str, datetime] = {}
+        self._pending_gate: str | None = None
 
     @workflow.run
     async def run(self, req: IssueRunRequest) -> RunResult:
@@ -183,15 +195,15 @@ class DarkFactoryIssueWorkflow:
                 "done",
                 {
                     "pr_url": self._state.get("pr_url"),
-                    "next": "merge",
+                    "next": "review",
                 },
             )
-            await self._swap_label(agent_tq, DF_VERIFYING, DF_IN_PROGRESS)
 
-            cancel_result = await self._cancel_if_requested(agent_tq, DF_IN_PROGRESS)
-            if cancel_result is not None:
-                return cancel_result
+            review_result = await self._run_review_and_merge_gate(agent_tq)
+            if review_result is not None:
+                return review_result
 
+            await self._swap_label(agent_tq, DF_AWAITING_MERGE, DF_IN_PROGRESS)
             await self._phase(agent_tq, "merge", "running", {})
             self._state = merge(
                 self._state,
@@ -248,14 +260,32 @@ class DarkFactoryIssueWorkflow:
             if cancel_result is not None:
                 return cancel_result
 
+            # Absorb any forwarded comments queued before this loop began
+            # (e.g. the fresh-run history fanout from
+            # `start_or_update_issue_workflow_activity`). Without this drain
+            # the wait_condition below would unblock immediately on the first
+            # clarify and burn a round before any user actually replied.
+            if self._new_comments:
+                pre_existing = list(self._new_comments)
+                self._new_comments = []
+                self._state = merge(
+                    self._state,
+                    {"issue_comments": pre_existing},
+                )
+
             triage = await workflow.execute_activity(
                 "triage_stage",
                 self._state,
                 task_queue=agent_tq,
                 start_to_close_timeout=timedelta(minutes=5),
-                heartbeat_timeout=timedelta(minutes=1),
+                heartbeat_timeout=timedelta(minutes=5),
                 retry_policy=RetryPolicy(
-                    maximum_attempts=2,
+                    # Outer activity retry covers account-tier quota windows
+                    # that exceed the Claude Agent SDK's per-call backoff.
+                    maximum_attempts=5,
+                    initial_interval=timedelta(seconds=15),
+                    maximum_interval=timedelta(minutes=2),
+                    backoff_coefficient=2.0,
                     non_retryable_error_types=["ParseError"],
                 ),
             )
@@ -372,40 +402,30 @@ class DarkFactoryIssueWorkflow:
     async def _run_design_gate(self, agent_tq: str) -> RunResult | None:
         while True:
             rev = int(self._state.get("latest_spec_rev") or 1)
-            await self._phase(
+            critic_approved, spec_markdown = await self._run_planning_loop(
                 agent_tq,
-                "design",
-                "running",
-                {"feedback": self._state.get("revision_feedback", "")},
-                rev=rev,
+                rev,
             )
-            self._state = merge(
-                self._state,
-                await workflow.execute_activity(
-                    "discovery_stage",
-                    self._state,
-                    task_queue=agent_tq,
-                    start_to_close_timeout=timedelta(minutes=8),
-                    heartbeat_timeout=timedelta(minutes=2),
-                    retry_policy=RetryPolicy(
-                        maximum_attempts=2,
-                        non_retryable_error_types=["ParseError"],
-                    ),
-                ),
-            )
-            spec_markdown = render_spec_markdown(
-                user_request=str(self._state.get("user_request") or ""),
-                stories=self._state.get("stories") or [],
-                spec=self._state.get("spec") or [],
-                review_decision=self._state.get("review_decision"),
-            )
-            self._state = merge(
-                self._state,
-                {
-                    "latest_spec_rev": rev,
-                    "latest_spec_markdown": spec_markdown,
-                },
-            )
+            if not critic_approved:
+                await self._phase(
+                    agent_tq,
+                    "design",
+                    "failed",
+                    {
+                        "spec_markdown": spec_markdown,
+                        "approval_note": "Plan Critic rejected the brief after the retry budget.",
+                        "include_approval_instructions": False,
+                        "next": "human",
+                    },
+                    rev=rev,
+                )
+                await self._swap_label(agent_tq, DF_DESIGNING, DF_NEEDS_HUMAN)
+                return RunResult(
+                    status="needs_human",
+                    state=self._state,
+                    reason="planning_retry_cap",
+                )
+
             await self._phase(
                 agent_tq,
                 "design",
@@ -425,6 +445,7 @@ class DarkFactoryIssueWorkflow:
             self._record_last_seen(signal.comment_id)
 
             if signal.kind == "Revise":
+                human_feedback = _planning_feedback_from_human_revise(signal)
                 await self._phase(
                     agent_tq,
                     "design",
@@ -444,6 +465,19 @@ class DarkFactoryIssueWorkflow:
                     {
                         "latest_spec_rev": rev + 1,
                         "revision_feedback": signal.text,
+                        "planning_attempts": 0,
+                        "planning_feedback": [human_feedback],
+                        "planning_attempt_log": [
+                            _planning_attempt_log_entry(
+                                source="human_revise",
+                                attempt=int(self._state.get("planning_attempts") or 0),
+                                rev=rev,
+                                next_rev=rev + 1,
+                                feedback=human_feedback,
+                                author=signal.author,
+                                comment_id=signal.comment_id,
+                            )
+                        ],
                     },
                 )
                 await self._swap_label(agent_tq, DF_AWAITING_APPROVAL, DF_DESIGNING)
@@ -511,6 +545,82 @@ class DarkFactoryIssueWorkflow:
                 )
                 return None
 
+    async def _run_planning_loop(
+        self,
+        agent_tq: str,
+        rev: int,
+    ) -> tuple[bool, str]:
+        feedback = list(self._state.get("planning_feedback") or [])
+        spec_markdown = ""
+        for attempt in range(PLANNING_MAX_ATTEMPTS):
+            attempt_number = attempt + 1
+            visible_feedback = "\n".join(str(item) for item in feedback if item)
+            await self._phase(
+                agent_tq,
+                "design",
+                "running",
+                {"feedback": visible_feedback},
+                rev=rev,
+                attempt=attempt_number,
+            )
+            self._state = merge(
+                self._state,
+                {
+                    "planning_attempts": attempt_number,
+                    "planning_feedback": feedback,
+                },
+            )
+            self._state = _reset_planning_artifacts(self._state)
+            self._state = merge(
+                self._state,
+                await workflow.execute_activity(
+                    "discovery_stage",
+                    self._state,
+                    task_queue=agent_tq,
+                    start_to_close_timeout=timedelta(minutes=8),
+                    heartbeat_timeout=timedelta(minutes=5),
+                    retry_policy=RetryPolicy(
+                        maximum_attempts=2,
+                        non_retryable_error_types=["ParseError"],
+                    ),
+                ),
+            )
+            spec_markdown = render_spec_markdown(
+                user_request=str(self._state.get("user_request") or ""),
+                stories=self._state.get("stories") or [],
+                spec=self._state.get("spec") or [],
+                review_decision=self._state.get("review_decision"),
+            )
+            self._state = merge(
+                self._state,
+                {
+                    "latest_spec_rev": rev,
+                    "latest_spec_markdown": spec_markdown,
+                },
+            )
+            decision = self._state.get("review_decision")
+            if _planning_approved(decision):
+                return True, spec_markdown
+
+            feedback_item = _planning_feedback_from_decision(decision)
+            feedback = [*feedback, feedback_item]
+            self._state = merge(
+                self._state,
+                {
+                    "planning_feedback": feedback,
+                    "planning_attempt_log": [
+                        _planning_attempt_log_entry(
+                            source="plan_critic_reject",
+                            attempt=attempt_number,
+                            rev=rev,
+                            feedback=feedback_item,
+                        )
+                    ],
+                },
+            )
+
+        return False, spec_markdown
+
     async def _run_build_verify(self, agent_tq: str) -> RunResult | None:
         build_attempts: list[str] = []
         verify_attempts: list[str] = []
@@ -521,53 +631,43 @@ class DarkFactoryIssueWorkflow:
             {"branch": self._state.get("feature_branch")},
             attempt=1,
         )
-        for attempt in range(VERIFY_RETRY_CAP):
-            attempt_number = attempt + 1
-            self._state = merge(self._state, {"verify_retries": attempt})
-            if attempt > 0:
-                await self._swap_label(agent_tq, DF_VERIFYING, DF_BUILDING)
-                await self._phase(
-                    agent_tq,
-                    "build",
-                    "running",
-                    {
-                        "branch": self._state.get("feature_branch"),
-                        "attempts": build_attempts,
-                    },
-                    attempt=attempt_number,
-                )
+        cancel_result = await self._cancel_if_requested(agent_tq, DF_BUILDING)
+        if cancel_result is not None:
+            return cancel_result
 
-            cancel_result = await self._cancel_if_requested(agent_tq, DF_BUILDING)
-            if cancel_result is not None:
-                return cancel_result
-
-            self._state = merge(
+        self._state = merge(
+            self._state,
+            await workflow.execute_activity(
+                "build_stage",
                 self._state,
-                await workflow.execute_activity(
-                    "build_stage",
-                    self._state,
-                    task_queue=agent_tq,
-                    start_to_close_timeout=timedelta(minutes=15),
-                    heartbeat_timeout=timedelta(minutes=2),
+                task_queue=agent_tq,
+                start_to_close_timeout=timedelta(minutes=15),
+                heartbeat_timeout=timedelta(minutes=5),
+                retry_policy=RetryPolicy(
+                    maximum_attempts=2,
+                    non_retryable_error_types=["ParseError"],
                 ),
-            )
-            paths = _patch_paths(self._state.get("patches"))
-            build_attempts.append(
-                f"attempt {attempt_number}: {len(paths)} files changed"
-            )
-            await self._phase(
-                agent_tq,
-                "build",
-                "done",
-                {
-                    "commit_count": len(self._state.get("patches") or []),
-                    "files_changed": len(paths),
-                    "branch": self._state.get("feature_branch"),
-                    "attempts": build_attempts,
-                    "next": "verify",
-                },
-            )
-            await self._swap_label(agent_tq, DF_BUILDING, DF_VERIFYING)
+            ),
+        )
+        paths = _patch_paths(self._state.get("patches"))
+        build_attempts.append(f"attempt 1: {len(paths)} files changed")
+        await self._phase(
+            agent_tq,
+            "build",
+            "done",
+            {
+                "commit_count": len(self._state.get("patches") or []),
+                "files_changed": len(paths),
+                "branch": self._state.get("feature_branch"),
+                "attempts": build_attempts,
+                "next": "verify",
+            },
+        )
+        await self._swap_label(agent_tq, DF_BUILDING, DF_VERIFYING)
+
+        attempt_number = 0
+        while True:
+            attempt_number += 1
             await self._phase(
                 agent_tq,
                 "verify",
@@ -582,40 +682,19 @@ class DarkFactoryIssueWorkflow:
                     self._state,
                     task_queue=agent_tq,
                     start_to_close_timeout=timedelta(minutes=10),
-                    heartbeat_timeout=timedelta(minutes=2),
+                    heartbeat_timeout=timedelta(minutes=5),
+                    retry_policy=RetryPolicy(
+                        maximum_attempts=2,
+                        non_retryable_error_types=["ParseError"],
+                    ),
                 ),
             )
             summary = self._state.get("verify_summary") or {}
             passed = bool(_state_value(summary, "passed", False))
-            verify_attempts.append(f"attempt {attempt_number}: {'passed' if passed else 'failed'}")
+            verify_attempts.append(
+                f"attempt {attempt_number}: {'passed' if passed else 'failed'}"
+            )
             if passed:
-                self._state = merge(
-                    self._state,
-                    await workflow.execute_activity(
-                        "code_quality_stage",
-                        self._state,
-                        task_queue=agent_tq,
-                        start_to_close_timeout=timedelta(minutes=5),
-                    ),
-                )
-                if not _quality_approved(self._state.get("review_decision")):
-                    await self._phase(
-                        agent_tq,
-                        "verify",
-                        "failed",
-                        {
-                            "summary": summary,
-                            "quality": self._state.get("review_decision"),
-                            "attempts": verify_attempts,
-                            "next": "human",
-                        },
-                    )
-                    await self._swap_label(agent_tq, DF_VERIFYING, DF_NEEDS_HUMAN)
-                    return RunResult(
-                        status="needs_human",
-                        state=self._state,
-                        reason="code_quality_failed",
-                    )
                 await self._phase(
                     agent_tq,
                     "verify",
@@ -629,7 +708,12 @@ class DarkFactoryIssueWorkflow:
                 )
                 return None
 
-            if attempt == VERIFY_RETRY_CAP - 1:
+            escalation = _fixer_budget_exhaustion(self._state)
+            if escalation is not None:
+                self._state = merge(
+                    self._state,
+                    _fixer_escalation_delta(escalation),
+                )
                 await self._phase(
                     agent_tq,
                     "verify",
@@ -644,7 +728,7 @@ class DarkFactoryIssueWorkflow:
                 return RunResult(
                     status="needs_human",
                     state=self._state,
-                    reason="verify_retry_cap",
+                    reason=str(escalation["reason"]),
                 )
 
             await self._phase(
@@ -659,14 +743,202 @@ class DarkFactoryIssueWorkflow:
             )
             self._state = merge(
                 self._state,
+                _record_fixer_attempt_delta(self._state),
+            )
+            self._state = merge(
+                self._state,
                 await workflow.execute_activity(
-                    "spec_adjustment_stage",
+                    "fixer_stage",
+                    self._state,
+                    task_queue=agent_tq,
+                    start_to_close_timeout=timedelta(minutes=5),
+                    retry_policy=RetryPolicy(
+                        maximum_attempts=2,
+                        non_retryable_error_types=["ParseError"],
+                    ),
+                ),
+            )
+            escalation = _fixer_decision_escalation(self._state)
+            if escalation is not None:
+                self._state = merge(
+                    self._state,
+                    _fixer_escalation_delta(escalation),
+                )
+                await self._phase(
+                    agent_tq,
+                    "verify",
+                    "failed",
+                    {
+                        "summary": self._state.get("verify_summary") or {},
+                        "attempts": verify_attempts,
+                        "next": "human",
+                    },
+                )
+                await self._swap_label(agent_tq, DF_VERIFYING, DF_NEEDS_HUMAN)
+                return RunResult(
+                    status="needs_human",
+                    state=self._state,
+                    reason=str(escalation["reason"]),
+                )
+
+    async def _run_review_and_merge_gate(self, agent_tq: str) -> RunResult | None:
+        iteration = 0
+        while True:
+            iteration += 1
+            await self._swap_label(
+                agent_tq,
+                [DF_VERIFYING, DF_FIXING, DF_BUILDING, DF_AWAITING_MERGE],
+                DF_REVIEWING,
+            )
+            await self._phase(
+                agent_tq,
+                "review",
+                "running",
+                {"pr_url": self._state.get("pr_url")},
+                attempt=iteration,
+            )
+            self._state = merge(
+                self._state,
+                await workflow.execute_activity(
+                    "reviewer_stage",
                     self._state,
                     task_queue=agent_tq,
                     start_to_close_timeout=timedelta(minutes=5),
                 ),
             )
-        return RunResult(status="needs_human", state=self._state, reason="verify_retry_cap")
+            await self._phase(
+                agent_tq,
+                "review",
+                "done",
+                {
+                    "pr_url": self._state.get("pr_url"),
+                    "review_decision": self._state.get("review_decision"),
+                    "verify_summary": self._state.get("verify_summary"),
+                    "include_merge_instructions": True,
+                    "next": "human",
+                },
+                attempt=iteration,
+            )
+            await self._swap_label(agent_tq, DF_REVIEWING, DF_AWAITING_MERGE)
+
+            self._approval_signal = None
+            self._pending_gate = "merge"
+            await workflow.wait_condition(lambda: self._approval_signal is not None)
+            signal = self._approval_signal
+            self._pending_gate = None
+            if signal is None:
+                continue
+            self._record_last_seen(signal.comment_id)
+
+            if signal.kind in {"Reject", "Cancel"}:
+                closure = "rejected" if signal.kind == "Reject" else "canceled"
+                await self._swap_label(
+                    agent_tq,
+                    [DF_AWAITING_MERGE, DF_CANCEL],
+                    DF_CANCELED,
+                )
+                await self._quarantine(closure)
+                return RunResult(
+                    status="canceled" if signal.kind == "Cancel" else "rejected",
+                    state=self._state,
+                    reason=signal.text or signal.kind,
+                )
+
+            if signal.kind == "Approve":
+                self._state = merge(
+                    self._state,
+                    {
+                        "merge_gate_approved": True,
+                        "merge_gate_reason": signal.text,
+                        "merge_gate_author": signal.author,
+                        "gate_approved": True,
+                    },
+                )
+                return None
+
+            if signal.kind == "Fix":
+                await self._swap_label(agent_tq, DF_AWAITING_MERGE, DF_FIXING)
+                self._state = merge(
+                    self._state,
+                    {
+                        "human_fix_focus": signal.text,
+                        "human_fix_author": signal.author,
+                    },
+                )
+                self._state = merge(
+                    self._state,
+                    _record_fixer_attempt_delta(self._state),
+                )
+                self._state = merge(
+                    self._state,
+                    await workflow.execute_activity(
+                        "fixer_stage",
+                        self._state,
+                        task_queue=agent_tq,
+                        start_to_close_timeout=timedelta(minutes=5),
+                        retry_policy=RetryPolicy(
+                            maximum_attempts=2,
+                            non_retryable_error_types=["ParseError"],
+                        ),
+                    ),
+                )
+                self._state = merge(
+                    self._state,
+                    await workflow.execute_activity(
+                        "verify_stage",
+                        self._state,
+                        task_queue=agent_tq,
+                        start_to_close_timeout=timedelta(minutes=10),
+                        heartbeat_timeout=timedelta(minutes=5),
+                        retry_policy=RetryPolicy(
+                            maximum_attempts=2,
+                            non_retryable_error_types=["ParseError"],
+                        ),
+                    ),
+                )
+                continue
+
+            if signal.kind == "Rebuild":
+                await self._swap_label(agent_tq, DF_AWAITING_MERGE, DF_BUILDING)
+                self._state = merge(
+                    self._state,
+                    {
+                        "human_rebuild_focus": signal.text,
+                        "human_rebuild_author": signal.author,
+                    },
+                )
+                self._state = merge(
+                    self._state,
+                    await workflow.execute_activity(
+                        "build_stage",
+                        self._state,
+                        task_queue=agent_tq,
+                        start_to_close_timeout=timedelta(minutes=15),
+                        heartbeat_timeout=timedelta(minutes=5),
+                        retry_policy=RetryPolicy(
+                            maximum_attempts=2,
+                            non_retryable_error_types=["ParseError"],
+                        ),
+                    ),
+                )
+                self._state = merge(
+                    self._state,
+                    await workflow.execute_activity(
+                        "verify_stage",
+                        self._state,
+                        task_queue=agent_tq,
+                        start_to_close_timeout=timedelta(minutes=10),
+                        heartbeat_timeout=timedelta(minutes=5),
+                        retry_policy=RetryPolicy(
+                            maximum_attempts=2,
+                            non_retryable_error_types=["ParseError"],
+                        ),
+                    ),
+                )
+                continue
+
+            # Revise or unknown kind: ignore and re-render the verdict.
+            continue
 
     async def _phase(
         self,
@@ -678,13 +950,18 @@ class DarkFactoryIssueWorkflow:
         rev: int | None = None,
         attempt: int | None = None,
     ) -> None:
-        key = _phase_key(phase, rev)
+        key = _phase_key(phase, rev=rev, attempt=attempt)
         started_at = self._phase_started_at.get(key)
         if started_at is None or status == "running" and key not in self._phase_started_at:
             started_at = workflow.now()
             self._phase_started_at[key] = started_at
         ended_at = workflow.now() if status != "running" else None
-        marker = marker_for(str(self._state.get("wf_id") or ""), phase, rev=rev)
+        marker = marker_for(
+            str(self._state.get("wf_id") or ""),
+            phase,
+            rev=rev,
+            attempt=attempt,
+        )
         body = render_phase_comment(
             phase,
             status,
@@ -795,11 +1072,66 @@ class DarkFactoryIssueWorkflow:
 
     @workflow.update
     def approve_gate(self, decision: GateDecision) -> None:
+        # Backwards-compatible alias. Prefer the dedicated `approve_brief`,
+        # `approve_merge`, or `reject_*` update methods for new callers.
         self._approval_signal = ApprovalSignal(
             kind="Approve" if decision.approved else "Reject",
             author="temporal",
             text=decision.reason,
         )
+
+    def _signal_from_gate(
+        self,
+        kind: str,
+        decision: GateDecision,
+    ) -> ApprovalSignal:
+        return ApprovalSignal(
+            kind=kind,
+            author="temporal",
+            text=str(decision.reason or ""),
+        )
+
+    @workflow.update
+    def approve_brief(self, decision: GateDecision) -> None:
+        approval = self._signal_from_gate("Approve", decision)
+        self._approval_signal = approval
+        self._record_last_seen(approval.comment_id)
+
+    @workflow.update
+    def revise_brief(self, decision: GateDecision) -> None:
+        approval = self._signal_from_gate("Revise", decision)
+        self._approval_signal = approval
+        self._record_last_seen(approval.comment_id)
+
+    @workflow.update
+    def reject_brief(self, decision: GateDecision) -> None:
+        approval = self._signal_from_gate("Reject", decision)
+        self._approval_signal = approval
+        self._record_last_seen(approval.comment_id)
+
+    @workflow.update
+    def approve_merge(self, decision: GateDecision) -> None:
+        approval = self._signal_from_gate("Approve", decision)
+        self._approval_signal = approval
+        self._record_last_seen(approval.comment_id)
+
+    @workflow.update
+    def reject_merge(self, decision: GateDecision) -> None:
+        approval = self._signal_from_gate("Reject", decision)
+        self._approval_signal = approval
+        self._record_last_seen(approval.comment_id)
+
+    @workflow.update
+    def trigger_fix(self, decision: GateDecision) -> None:
+        approval = self._signal_from_gate("Fix", decision)
+        self._approval_signal = approval
+        self._record_last_seen(approval.comment_id)
+
+    @workflow.update
+    def trigger_rebuild(self, decision: GateDecision) -> None:
+        approval = self._signal_from_gate("Rebuild", decision)
+        self._approval_signal = approval
+        self._record_last_seen(approval.comment_id)
 
     @workflow.update
     def post_new_comments(self, comments: list[IssueComment]) -> None:
@@ -815,22 +1147,46 @@ class DarkFactoryIssueWorkflow:
             int(self._state.get("last_seen_comment_id") or 0),
             _last_comment_id([*issue_comments, *pending_comments]) or 0,
         )
+        current_label = self._state.get("current_df_label")
         approval_waiting = (
-            self._state.get("current_df_label") == DF_AWAITING_APPROVAL
+            current_label == DF_AWAITING_APPROVAL
             and self._approval_signal is None
         )
+        merge_gate_waiting = (
+            current_label == DF_AWAITING_MERGE
+            and self._approval_signal is None
+        )
+        pending_gate: str | None = None
+        if approval_waiting:
+            pending_gate = "design"
+        elif merge_gate_waiting:
+            pending_gate = "merge"
+        gate_pending = approval_waiting or merge_gate_waiting
         return {
+            "planning_attempts": self._state.get("planning_attempts", 0),
+            "planning_feedback": self._state.get("planning_feedback", []),
+            "planning_attempt_log": self._state.get("planning_attempt_log", []),
             "verify_retries": self._state.get("verify_retries", 0),
             "verify_summary": self._state.get("verify_summary"),
+            "fixer_attempts_by_predicate": self._state.get(
+                "fixer_attempts_by_predicate", {}
+            ),
+            "fixer_attempts_by_wp": self._state.get("fixer_attempts_by_wp", {}),
+            "attempt_log": self._state.get("attempt_log", []),
             "gate_approved": self._state.get("gate_approved", False),
-            "gate_pending": approval_waiting,
+            "merge_gate_approved": self._state.get("merge_gate_approved", False),
+            "gate_pending": gate_pending,
+            "pending_gate": pending_gate,
+            "design_gate_pending": approval_waiting,
+            "merge_gate_pending": merge_gate_waiting,
             "approval_waiting": approval_waiting,
             "approval_signal_pending": self._approval_signal is not None,
             "latest_spec_rev": self._state.get("latest_spec_rev", 1),
             "approval_record": self._state.get("approval_record"),
-            "current_df_label": self._state.get("current_df_label"),
+            "current_df_label": current_label,
             "current_slice": self._state.get("current_slice"),
             "pr_url": self._state.get("pr_url"),
+            "review_decision": self._state.get("review_decision"),
             "ready_to_build": self._state.get("ready_to_build"),
             "clarification_questions": self._state.get("clarification_questions", []),
             "issue": _issue_summary(self._state.get("issue")),

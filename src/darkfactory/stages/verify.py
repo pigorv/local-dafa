@@ -7,10 +7,12 @@ the parallel `verify_fanout` (Phase 3 task 3.3) and aggregated by a
 `deferred=True` collector (task 3.4).
 
 State deltas:
-- `run_tests_node`     → appends one TestResult to `test_results`.
-- `run_linters_node`   → appends Findings (Checkstyle + Spotless) to `findings`.
-- `run_compile_node`   → appends Findings (javac errors) to `findings`.
-- `run_happy_path_node`→ optional smoke test; currently a no-op stub.
+- `run_tests_node`             → appends one TestResult to `test_results`.
+- `run_linters_node`           → appends Findings (Checkstyle + Spotless) to `findings`.
+- `run_compile_node`           → appends Findings (javac errors) to `findings`.
+- `run_happy_path_node`        → optional smoke test; currently a no-op stub.
+- `run_semantic_coverage_node` → adds predicate coverage and final pass/fail to
+  `verify_summary`.
 """
 from __future__ import annotations
 
@@ -27,6 +29,7 @@ from darkfactory.state import (
     TestResult,
     VerifySummary,
 )
+from darkfactory.agents.verifier_semantic import run_verifier_semantic
 from darkfactory.tools.linters import (
     detect_build,
     parse_checkstyle,
@@ -184,6 +187,124 @@ def run_happy_path_node(state: PipelineState, runtime=None) -> dict:
     return {}
 
 
+def _text_present(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set)):
+        return any(_text_present(item) for item in value)
+    root = getattr(value, "root", None)
+    if root is not None:
+        return _text_present(root)
+    return bool(value)
+
+
+def _read_field(value: Any, field: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(field, default)
+    return getattr(value, field, default)
+
+
+def _predicate_text(value: Any) -> str:
+    root = getattr(value, "root", None)
+    if root is not None:
+        return str(root).strip()
+    if isinstance(value, dict):
+        for key in ("root", "predicate", "value"):
+            if key in value:
+                return str(value[key]).strip()
+    return str(value).strip()
+
+
+def _predicate_values(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, (list, tuple, set)):
+        return [
+            text
+            for text in (_predicate_text(item) for item in value)
+            if text
+        ]
+    text = _predicate_text(value)
+    return [text] if text else []
+
+
+def _expected_predicates(state: PipelineState) -> list[tuple[str, str]]:
+    expected: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(wp_id: str, predicates: Any) -> None:
+        for predicate in _predicate_values(predicates):
+            key = (wp_id, predicate)
+            if key in seen:
+                continue
+            seen.add(key)
+            expected.append(key)
+
+    brief = state.get("implementation_brief")
+    for wp in _read_field(brief, "work_packages", []) or []:
+        wp_id = str(
+            _read_field(wp, "id", None)
+            or _read_field(wp, "story_id", "")
+        )
+        add(wp_id, _read_field(wp, "verification", []))
+
+    for spec_slice in state.get("spec") or []:
+        wp_id = str(
+            _read_field(spec_slice, "id", None)
+            or _read_field(spec_slice, "story_id", "")
+        )
+        add(wp_id, _read_field(spec_slice, "verification", None))
+
+    return expected
+
+
+def _has_verification_predicates(state: PipelineState) -> bool:
+    if _expected_predicates(state):
+        return True
+    for entry in state.get("coverage_entries") or []:
+        if _text_present(_read_field(entry, "predicate", None)):
+            return True
+
+    return False
+
+
+def _coverage_to_dict(item: Any) -> dict[str, Any]:
+    if hasattr(item, "model_dump"):
+        return item.model_dump(mode="json")
+    return dict(item)
+
+
+async def run_semantic_coverage_node(state: PipelineState, runtime=None) -> dict:
+    """Ask the Semantic Verifier to map WP predicates to evidence.
+
+    The first aggregate node owns mechanical pass/fail. This node attaches the
+    semantic coverage map and then recomputes the final verifier verdict across
+    mechanical checks, predicate coverage, and blocking Tester findings.
+    """
+    if not _has_verification_predicates(state):
+        return {}
+
+    result = await run_verifier_semantic(dict(state))
+    predicate_coverage = [
+        _coverage_to_dict(item)
+        for item in (getattr(result, "predicate_coverage", None) or [])
+    ]
+    summary = _aggregate_verify_summary(
+        state,
+        predicate_coverage=predicate_coverage,
+        include_semantic=True,
+    )
+    delta: dict[str, Any] = {"verify_summary": summary}
+    previous_summary = state.get("verify_summary") or {}
+    if not summary["passed"] and previous_summary.get("passed", True):
+        delta["verify_retries"] = (state.get("verify_retries") or 0) + 1
+    return delta
+
+
 VERIFY_TARGETS = ("run_tests", "run_linters", "run_compile", "run_happy_path")
 
 
@@ -198,7 +319,48 @@ def verify_fanout(state: PipelineState) -> list[Send]:
     return [Send(target, state) for target in VERIFY_TARGETS]
 
 
-def _aggregate_verify_summary(state: PipelineState) -> VerifySummary:
+def _blocking_tester_findings(state: PipelineState) -> int:
+    count = 0
+    for finding in state.get("tester_findings") or []:
+        if _read_field(finding, "resolved", False):
+            continue
+        if _read_field(finding, "blocking", True):
+            count += 1
+    return count
+
+
+def _uncovered_predicates(
+    expected: list[tuple[str, str]],
+    predicate_coverage: list[dict[str, Any]],
+) -> int:
+    coverage_by_key: dict[tuple[str, str], str] = {}
+    for item in predicate_coverage:
+        wp_id = str(_read_field(item, "wp_id", ""))
+        predicate = str(_read_field(item, "predicate", "")).strip()
+        if not predicate:
+            continue
+        coverage_by_key[(wp_id, predicate)] = str(_read_field(item, "status", ""))
+
+    if expected:
+        return sum(
+            1
+            for key in expected
+            if coverage_by_key.get(key) != "covered"
+        )
+
+    return sum(
+        1
+        for item in predicate_coverage
+        if str(_read_field(item, "status", "")) != "covered"
+    )
+
+
+def _aggregate_verify_summary(
+    state: PipelineState,
+    *,
+    predicate_coverage: list[dict[str, Any]] | None = None,
+    include_semantic: bool = False,
+) -> VerifySummary:
     """Reduce the current verify snapshot to a pass/fail verdict."""
     failed_tests = sum(
         1
@@ -212,11 +374,31 @@ def _aggregate_verify_summary(state: PipelineState) -> VerifySummary:
         for finding in (state.get("findings") or [])
         if finding.get("severity") in ("error", "critical")
     )
-    return VerifySummary(
-        passed=(failed_tests == 0 and hard_findings == 0),
+    blocking_tester_findings = _blocking_tester_findings(state)
+    passed = (
+        failed_tests == 0
+        and hard_findings == 0
+        and blocking_tester_findings == 0
+    )
+    summary = VerifySummary(
+        passed=passed,
         failed_tests=failed_tests,
         hard_findings=hard_findings,
     )
+    if blocking_tester_findings:
+        summary["blocking_tester_findings"] = blocking_tester_findings
+
+    if include_semantic:
+        coverage = predicate_coverage or []
+        uncovered_predicates = _uncovered_predicates(
+            _expected_predicates(state),
+            coverage,
+        )
+        summary["predicate_coverage"] = coverage
+        summary["uncovered_predicates"] = uncovered_predicates
+        summary["passed"] = passed and uncovered_predicates == 0
+
+    return summary
 
 
 def aggregate(state: PipelineState, runtime=None) -> dict:
@@ -235,7 +417,7 @@ def aggregate(state: PipelineState, runtime=None) -> dict:
 
 
 def verify_subgraph() -> Any:
-    """Verify subgraph: START -[fanout]-> {tests, linters, compile, happy} -> aggregate -> END.
+    """Verify subgraph: fan out mechanical checks, aggregate, then cover predicates.
 
     Compiled with `RunContext` so the inner nodes see `runtime.context`
     (sandbox, repo_path) when invoked from the top-level graph.
@@ -246,9 +428,11 @@ def verify_subgraph() -> Any:
     g.add_node("run_compile", run_compile_node)
     g.add_node("run_happy_path", run_happy_path_node)
     g.add_node("aggregate", aggregate, defer=True)
+    g.add_node("run_semantic_coverage", run_semantic_coverage_node)
 
     g.add_conditional_edges(START, verify_fanout, list(VERIFY_TARGETS))
     for target in VERIFY_TARGETS:
         g.add_edge(target, "aggregate")
-    g.add_edge("aggregate", END)
+    g.add_edge("aggregate", "run_semantic_coverage")
+    g.add_edge("run_semantic_coverage", END)
     return g.compile()

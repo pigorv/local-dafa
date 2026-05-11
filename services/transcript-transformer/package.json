@@ -1,0 +1,13 @@
+{
+  "name": "transcript-transformer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Rewrites Claude Code JSONL transcripts from dark-factory workers so each workflow shows as a distinct project in claude-monitor.",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

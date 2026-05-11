@@ -14,6 +14,11 @@ from temporalio.client import Client
 from temporalio.contrib.opentelemetry import TracingInterceptor
 from temporalio.contrib.pydantic import pydantic_data_converter
 
+from darkfactory.agents.registry import (
+    DEFAULT_MANIFESTS_DIR,
+    load_registry,
+    role_summaries,
+)
 from darkfactory.bootstrap import init_observability
 from darkfactory.runtime import schedule_admin
 from darkfactory.runtime.workflow import DarkFactoryWorkflow
@@ -73,6 +78,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="include schedules outside the df-watch-* namespace",
     )
     list_parser.add_argument("--page-size", type=int, default=1000)
+
+    roles_parser = subparsers.add_parser("roles")
+    roles_subparsers = roles_parser.add_subparsers(
+        dest="roles_command",
+        required=True,
+    )
+    roles_subparsers.add_parser("list")
 
     return parser
 
@@ -290,6 +302,34 @@ def _print_schedule_list(
         )
 
 
+def roles_command(args: argparse.Namespace) -> int:
+    if args.roles_command == "list":
+        return _roles_list()
+    raise SystemExit(f"unknown roles command: {args.roles_command}")
+
+
+def _roles_list() -> int:
+    registry = load_registry(DEFAULT_MANIFESTS_DIR)
+    if len(registry) == 0:
+        print("0 roles registered (migration not started)")
+        return 0
+    summaries = role_summaries(registry)
+    for index, summary in enumerate(summaries):
+        if index:
+            print()
+        hooks = ", ".join(summary.hook_names) or "-"
+        mcp = ", ".join(summary.mcp_servers) or "-"
+        print(f"role: {summary.role}")
+        print(f"model: {summary.model}")
+        print(f"prompt: {summary.prompt_path}")
+        print(f"allowed_tools: {summary.allowed_tool_count}")
+        print(f"hooks: {hooks}")
+        print(f"mcp: {mcp}")
+        print(f"manifest_sha: {summary.manifest_sha}")
+        print(f"prompt_sha: {summary.prompt_sha}")
+    return 0
+
+
 def _flush_traces() -> None:
     """Flush BatchSpanProcessor before the CLI exits so spans aren't lost."""
     provider = trace.get_tracer_provider()
@@ -307,6 +347,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(run_command(args))
     if args.command == "schedule":
         return asyncio.run(schedule_command(args))
+    if args.command == "roles":
+        return roles_command(args)
 
     parser.error(f"unknown command: {args.command}")
     return 2

@@ -23,8 +23,8 @@ def _ctx() -> dict[str, Any]:
     return {"signal": None}
 
 
-def test_default_cap_is_25() -> None:
-    assert CALL_CAP_DEFAULT == 25
+def test_default_cap_is_80() -> None:
+    assert CALL_CAP_DEFAULT == 80
 
 
 def test_below_cap_allows() -> None:

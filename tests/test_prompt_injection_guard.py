@@ -29,7 +29,7 @@ def _post(tool_name: str, tool_response: Any) -> dict[str, Any]:
         "transcript_path": "/tmp/transcript",
         "cwd": "/workspace",
         "agent_id": "agent-test",
-        "agent_type": "backend",
+        "agent_type": "builder",
         "hook_event_name": "PostToolUse",
         "tool_name": tool_name,
         "tool_input": {},

@@ -1,0 +1,58 @@
+identity:
+  role: reviewer
+  description: >-
+    Reasoning-only Reviewer role that audits the patches produced by Build
+    plus the Verify summary and emits a small structured ReviewerSummary
+    for the human merge gate. No tools, no MCP, no shell access — Haiku
+    by default.
+  when_to_use: >-
+    After verify converges and a PR has been published, before the merge
+    gate. Consumes the implementation brief, approved spec, patches,
+    verify summary, predicate coverage, test results, findings, audit
+    log, and attempt log; emits the ReviewerSummary that the merge gate
+    surfaces to the human approver.
+
+llm:
+  model: claude-haiku-4-5-20251001
+  temperature: 0.2
+  thinking:
+    enabled: false
+  prompt_path: prompts/reviewer.md
+
+tools:
+  allowed: []
+  disallowed: []
+  argv_allowlist: []
+  role_owned_argv_prefixes: []
+  edit_path_allowlist: []
+
+mcp: []
+
+hooks:
+  - event: PreToolUse
+    name: loop_breaker
+    parameters: {}
+  - event: PreToolUse
+    name: call_cap
+    parameters: {}
+  - event: UserPromptSubmit
+    name: goal_pin
+    parameters: {}
+
+budgets:
+  retry_caps: {}
+
+io_contract:
+  reads:
+    - user_request
+    - pr_url
+    - implementation_brief
+    - approved_spec_markdown
+    - patches
+    - verify_summary
+    - findings
+    - test_results
+    - audit_log
+    - attempt_log
+  writes:
+    - reviewer_summary

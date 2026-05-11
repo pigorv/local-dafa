@@ -1,0 +1,26 @@
+identity:
+  role: noop
+  description: No-op role for composer tests.
+  when_to_use: Use only as a composer fixture.
+llm:
+  model: claude-sonnet-4-5-20250929
+  temperature: 0.0
+  thinking:
+    enabled: false
+  prompt_path: tests/fixtures/prompts/noop.md
+tools:
+  allowed:
+    - Read
+  disallowed: []
+  argv_allowlist: []
+  role_owned_argv_prefixes: []
+  edit_path_allowlist: []
+mcp: []
+hooks: []
+budgets:
+  timeout: null
+  heartbeat: null
+  retry_caps: {}
+io_contract:
+  reads: []
+  writes: []

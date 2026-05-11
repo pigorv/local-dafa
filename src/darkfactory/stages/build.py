@@ -5,25 +5,23 @@ from typing import Any, Awaitable, Callable
 from langgraph.graph import END, START, StateGraph
 
 from darkfactory.agents._sdk_common import WorkerOutput
-from darkfactory.agents.backend import run_backend
+from darkfactory.agents.builder import run_builder
 from darkfactory.agents.builder_supervisor import (
     SUPERVISOR_NAME,
     builder_supervisor_node,
 )
-from darkfactory.agents.database import run_database
 from darkfactory.agents.frontend import run_frontend
-from darkfactory.agents.unit_test import run_unit_test
+from darkfactory.agents.tester import run_tester
 from darkfactory.state import PipelineState
 from darkfactory.tools.sandbox import RepoSandbox
 from darkfactory.tools.shell import get_sandbox, register_sandbox
 
-WORKER_NAMES = ("backend", "database", "unit_test", "frontend")
+WORKER_NAMES = ("builder", "tester", "frontend")
 BRANCH_INIT_NAME = "branch_init"
 
 WORKER_RUNNERS: dict[str, Callable[[dict], Awaitable[Any]]] = {
-    "backend": run_backend,
-    "database": run_database,
-    "unit_test": run_unit_test,
+    "builder": run_builder,
+    "tester": run_tester,
     "frontend": run_frontend,
 }
 
@@ -68,7 +66,48 @@ def _patches_from_result(result: Any) -> list[dict]:
         return [dict(p) for p in result.patches]
     if isinstance(result, dict):
         return list(result.get("patches") or [])
+    patches = getattr(result, "patches", None)
+    if patches is not None:
+        return [dict(p) for p in patches]
     return []
+
+
+def _coverage_entries_from_result(result: Any) -> list[dict]:
+    if isinstance(result, dict):
+        entries = result.get("coverage_entries")
+        if entries is None:
+            entries = result.get("coverage")
+    else:
+        entries = getattr(result, "coverage_entries", None)
+        if entries is None:
+            entries = getattr(result, "coverage", None)
+
+    out: list[dict] = []
+    for entry in entries or []:
+        if hasattr(entry, "model_dump"):
+            out.append(entry.model_dump())
+        elif isinstance(entry, dict):
+            out.append(dict(entry))
+    return out
+
+
+def _tester_findings_from_result(result: Any) -> list[dict]:
+    if isinstance(result, dict):
+        findings = result.get("tester_findings")
+        if findings is None:
+            findings = result.get("findings")
+    else:
+        findings = getattr(result, "tester_findings", None)
+        if findings is None:
+            findings = getattr(result, "findings", None)
+
+    out: list[dict] = []
+    for finding in findings or []:
+        if hasattr(finding, "model_dump"):
+            out.append(finding.model_dump())
+        elif isinstance(finding, dict):
+            out.append(dict(finding))
+    return out
 
 
 def _worker_node_factory(name: str):
@@ -91,11 +130,14 @@ def _worker_node_factory(name: str):
             }
 
         patches = _patches_from_result(result)
+        coverage_entries = _coverage_entries_from_result(result)
+        tester_findings = _tester_findings_from_result(result)
+        delta: dict[str, Any] = {}
         if patches:
-            return {"patches": patches}
-        # Synthesize a completion marker so the supervisor advances build_order.
-        return {
-            "patches": [
+            delta["patches"] = patches
+        else:
+            # Synthesize a completion marker so the supervisor advances build_order.
+            delta["patches"] = [
                 {
                     "path": "(worker-completion)",
                     "diff": "",
@@ -103,13 +145,17 @@ def _worker_node_factory(name: str):
                     "slice_id": slice_id,
                 }
             ]
-        }
+        if coverage_entries:
+            delta["coverage_entries"] = coverage_entries
+        if tester_findings:
+            delta["tester_findings"] = tester_findings
+        return delta
 
     return worker_node
 
 
 def build_subgraph() -> Any:
-    """Build subgraph: supervisor dispatches slices to workers, loops until done.
+    """Build subgraph: supervisor dispatches slices to Builder/Tester.
 
     Structure: START → branch_init → supervisor → (worker ↔ supervisor)* → END.
     The supervisor returns `Command(goto=<worker>|END)`; each worker edges

@@ -8,11 +8,11 @@ fails it raises `ParseError`.
 
 `load_prompt` reads a system-prompt markdown file from `darkfactory/prompts/`.
 
-`WorkerOutput` is the shared return type of `run_<role>` for the build-stage
-workers (backend, database, unit_test). The patches list is populated by the
-`diff_capture` PostToolUse hook the role attaches to its SDK client, not by
-parsing the assistant's final message — workers commit code through `Edit` /
-`Write`, not by emitting a structured JSON blob.
+`WorkerOutput` is the shared return type of SDK build-stage workers that
+summarize free-form work. The patches list is populated by the `diff_capture`
+PostToolUse hook the role attaches to its SDK client, not by parsing the
+assistant's final message — workers commit code through `Edit` / `Write`, not
+by emitting a structured JSON blob.
 """
 from __future__ import annotations
 
@@ -27,13 +27,16 @@ from claude_agent_sdk import (
     ResultMessage,
     TextBlock,
 )
+from claude_agent_sdk.types import ToolUseBlock
 from pydantic import BaseModel, Field, ValidationError
+
+STRUCTURED_OUTPUT_TOOL_NAME = "StructuredOutput"
 
 T = TypeVar("T", bound=BaseModel)
 
 
 class WorkerOutput(BaseModel):
-    """Result of running a build-stage worker (backend / database / unit_test).
+    """Result of running a free-form build-stage worker.
 
     ``patches`` is the list of ``Patch`` TypedDicts captured by the
     ``diff_capture`` hook over the role's SDK loop. ``summary`` is the final
@@ -67,6 +70,19 @@ def repo_summary(repo_context: dict | None) -> str:
     repo_map = repo_context.get("repo_map") or ""
     if repo_map:
         parts.append(f"Repo map:\n{repo_map[:2000]}")
+    style_configs = repo_context.get("style_configs") or []
+    if style_configs:
+        rendered: list[str] = ["Style / lint configs (match these rules in new files):"]
+        for entry in style_configs:
+            if not isinstance(entry, dict):
+                continue
+            path = entry.get("path") or ""
+            content = entry.get("content") or ""
+            if path:
+                rendered.append(f"--- {path} ---")
+            if content:
+                rendered.append(content)
+        parts.append("\n".join(rendered))
     git_log = repo_context.get("git_log") or []
     if git_log:
         parts.append("Recent commits:\n" + "\n".join(git_log[:10]))
@@ -114,18 +130,39 @@ def _extract_json(text: str) -> str | None:
     return None
 
 
-async def _drain(client: ClaudeSDKClient) -> tuple[str, ResultMessage | None]:
-    """Iterate `receive_response()` to exhaustion; return (last assistant text, ResultMessage)."""
+async def _drain(
+    client: ClaudeSDKClient,
+) -> tuple[str, dict[str, Any] | None, ResultMessage | None]:
+    """Iterate `receive_response()` to exhaustion.
+
+    Returns ``(last_assistant_text, structured_output, ResultMessage)``.
+
+    ``structured_output`` is the ``input`` of the most recent
+    ``ToolUseBlock`` named ``StructuredOutput`` — the SDK implements
+    ``ClaudeAgentOptions.output_format`` as a synthetic tool, so when the
+    caller declared a JSON Schema the model's structured response arrives
+    here rather than in a ``TextBlock``.
+    """
     last_text_chunks: list[str] = []
+    structured: dict[str, Any] | None = None
     final: ResultMessage | None = None
     async for msg in client.receive_response():
         if isinstance(msg, AssistantMessage):
-            last_text_chunks = [
-                block.text for block in msg.content if isinstance(block, TextBlock)
-            ]
+            text_chunks: list[str] = []
+            for block in msg.content:
+                if isinstance(block, TextBlock):
+                    text_chunks.append(block.text)
+                elif (
+                    isinstance(block, ToolUseBlock)
+                    and block.name == STRUCTURED_OUTPUT_TOOL_NAME
+                    and isinstance(block.input, dict)
+                ):
+                    structured = block.input
+            if text_chunks:
+                last_text_chunks = text_chunks
         elif isinstance(msg, ResultMessage):
             final = msg
-    return "".join(last_text_chunks), final
+    return "".join(last_text_chunks), structured, final
 
 
 async def run_to_completion(
@@ -137,15 +174,24 @@ async def run_to_completion(
 
     Without ``expect``: returns ``{"text": <last assistant text>, "result": <ResultMessage|None>}``.
 
-    With ``expect``: extracts a JSON block from the final assistant message and
-    validates it against the Pydantic model. If parsing or validation fails, the
-    function sends a single re-prompt requesting a JSON object that matches the
-    model's schema and tries once more. On a second failure it raises `ParseError`.
+    With ``expect``: returns the validated Pydantic model. The structured
+    output is preferred from a ``StructuredOutput`` tool-use block (emitted
+    when ``output_format`` is set on the SDK options) and falls back to a
+    JSON object scraped out of the assistant text. On parse / validation
+    failure the function sends a single re-prompt requesting a JSON object
+    that matches the model's schema and tries once more. On a second
+    failure it raises ``ParseError``.
     """
-    text, result = await _drain(client)
+    text, structured, result = await _drain(client)
 
     if expect is None:
         return {"text": text, "result": result}
+
+    if structured is not None:
+        try:
+            return expect.model_validate(structured)
+        except ValidationError:
+            pass
 
     raw = _extract_json(text)
     if raw is not None:
@@ -161,7 +207,12 @@ async def run_to_completion(
         "JSON Schema. Do not include code fences, commentary, or preamble — "
         "only the raw JSON object.\n\nSchema:\n" + schema
     )
-    text, _ = await _drain(client)
+    text, structured, _ = await _drain(client)
+    if structured is not None:
+        try:
+            return expect.model_validate(structured)
+        except ValidationError:
+            pass
     raw = _extract_json(text) or text.strip()
     try:
         return expect.model_validate_json(raw)
@@ -172,7 +223,7 @@ async def run_to_completion(
 
 
 def _resolve_slice(state_slice: dict) -> dict:
-    """Return the SpecSlice for ``current_slice`` or an empty dict.
+    """Return the Work Package for ``current_slice`` or an empty dict.
 
     Build-stage workers expect the activity to thread both the spec list and
     the active slice id through ``state_slice``. We look up by ``story_id``;
@@ -190,12 +241,12 @@ def worker_user_message(state_slice: dict) -> str:
     """Format the per-turn user message for a build-stage worker.
 
     The role-specific instructions live in the system prompt; the user
-    message just hands the worker the SpecSlice it should execute and a
+    message just hands the worker the Work Package it should execute and a
     short reminder of what "done" looks like.
     """
     slice_ = _resolve_slice(state_slice)
     return (
-        f"SpecSlice (JSON):\n{json.dumps(slice_, indent=2)}\n\n"
+        f"Work Package (JSON):\n{json.dumps(slice_, indent=2)}\n\n"
         "Execute this slice end-to-end. Read the affected files first, make "
         "the minimal change, run the relevant build / test command via "
         "sandbox_bash to verify, then commit via sandbox_bash. Stay inside "

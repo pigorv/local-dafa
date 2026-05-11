@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from claude_agent_sdk.types import HookContext, HookJSONOutput, PreToolUseHookInput
 
-CALL_CAP_DEFAULT = 25
+CALL_CAP_DEFAULT = 80
 
 
 def make_call_cap(cap: int = CALL_CAP_DEFAULT):

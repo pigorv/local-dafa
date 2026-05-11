@@ -5,14 +5,14 @@ from typing import Iterable, Literal
 from langgraph.graph import END
 from langgraph.types import Command
 
-from darkfactory.state import PipelineState, SpecSlice
+from darkfactory.state import PipelineState, WorkPackageDict
 
-WorkerName = Literal["backend", "database", "unit_test", "frontend"]
+WorkerName = Literal["builder", "tester", "frontend"]
 
 SUPERVISOR_NAME = "builder_supervisor"
 
 
-def topo_sort(spec: list[SpecSlice]) -> list[str]:
+def topo_sort(spec: list[WorkPackageDict]) -> list[str]:
     """Return slice story_ids in dependency order (Kahn's algorithm).
 
     Slices not in `spec` referenced via `depends_on` are treated as already-met.
@@ -44,41 +44,59 @@ def _has_ext(paths: Iterable[str], exts: tuple[str, ...]) -> bool:
     return any(p.lower().endswith(exts) for p in paths)
 
 
-def _has_path_fragment(paths: Iterable[str], fragments: tuple[str, ...]) -> bool:
-    lowered = [p.lower() for p in paths]
-    return any(frag in p for p in lowered for frag in fragments)
+def route_slice(slice_: WorkPackageDict) -> WorkerName:
+    """Pick the implementation worker for a slice.
 
-
-def route_slice(slice_: SpecSlice) -> WorkerName:
-    """Pick a worker for a slice based on the files it touches.
-
-    Rules (first match wins):
-      1. Any SQL file or Flyway migration path → database.
-      2. Frontend file extensions → frontend.
-      3. Slice touches only test files → unit_test.
-      4. Otherwise → backend.
+    The v2 build stage uses Builder + Tester for ordinary work. Frontend
+    remains a no-op escape hatch for the current Java-only target app.
     """
     affected = list(slice_.get("affected_files") or [])
     new_files = list(slice_.get("new_files") or [])
     test_files = list(slice_.get("test_files") or [])
     all_paths = affected + new_files + test_files
-    source_paths = affected + new_files
-
-    if _has_ext(all_paths, (".sql",)) or _has_path_fragment(all_paths, ("db/migration",)):
-        return "database"
-    if _has_ext(all_paths, (".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte", ".css", ".html")):
+    if _has_ext(
+        all_paths,
+        (".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte", ".css", ".html"),
+    ):
         return "frontend"
-    if test_files and not source_paths:
-        return "unit_test"
-    return "backend"
+    return "builder"
+
+
+def _slice_has_worker_patch(
+    state: PipelineState,
+    slice_id: str,
+    worker: WorkerName,
+) -> bool:
+    return any(
+        p.get("slice_id") == slice_id and p.get("author_agent") == worker
+        for p in (state.get("patches") or [])
+    )
+
+
+def _next_worker_for_slice(
+    state: PipelineState,
+    slice_: WorkPackageDict,
+) -> WorkerName | None:
+    """Return the next v2 build-stage worker needed for one slice."""
+    slice_id = slice_["story_id"]
+    implementation_worker = route_slice(slice_)
+    if not _slice_has_worker_patch(state, slice_id, implementation_worker):
+        return implementation_worker
+    if implementation_worker == "frontend":
+        return None
+    if not _slice_has_worker_patch(state, slice_id, "tester"):
+        return "tester"
+    return None
 
 
 def builder_supervisor_node(state: PipelineState) -> Command:
     """Topo-sort the spec, dispatch the next un-built slice, or finish.
 
-    Completion is detected by matching `patches[*].slice_id` against `build_order`.
-    Returns `Command(goto=<worker>)` with `current_slice` pinned, or `Command(goto=END)`
-    when every planned slice has at least one patch.
+    Completion is detected by matching Builder/Tester completion patches
+    against each `build_order` item.
+    Returns `Command(goto=<worker>)` with `current_slice` pinned, or
+    `Command(goto=END)` when every planned slice has its required worker
+    completion patches.
     """
     spec = list(state.get("spec") or [])
     if not spec:
@@ -86,14 +104,12 @@ def builder_supervisor_node(state: PipelineState) -> Command:
 
     by_id = {s["story_id"]: s for s in spec}
     build_order = state.get("build_order") or topo_sort(spec)
-    done = {p.get("slice_id") for p in (state.get("patches") or [])}
+    for slice_id in build_order:
+        worker = _next_worker_for_slice(state, by_id[slice_id])
+        if worker is not None:
+            return Command(
+                goto=worker,
+                update={"build_order": build_order, "current_slice": slice_id},
+            )
 
-    next_slice_id = next((sid for sid in build_order if sid not in done), None)
-    if next_slice_id is None:
-        return Command(goto=END, update={"build_order": build_order})
-
-    worker = route_slice(by_id[next_slice_id])
-    return Command(
-        goto=worker,
-        update={"build_order": build_order, "current_slice": next_slice_id},
-    )
+    return Command(goto=END, update={"build_order": build_order})

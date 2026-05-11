@@ -6,8 +6,8 @@ wrapper. Whenever a build-stage role uses the SDK's built-in ``Edit`` or
 we want a record of *what changed* — keyed by the build slice the role is
 working on, attributed to the role, and stamped with the current commit
 sha. Those records flow into ``state['patches']`` (per the channel reducer
-in ``state.py``) so downstream stages (``verify``, ``spec_adjustment``,
-``code_quality``, ``pr_creator``) can reason about the change set.
+in ``state.py``) so downstream stages (``verify``, ``fixer``,
+``reviewer``, ``pr_creator``) can reason about the change set.
 
 The hook fires *after* the SDK has run the tool, so the working tree is
 already in the post-edit state. We:
@@ -68,13 +68,16 @@ def make_diff_capture(
     slice_id: str,
     task_id: str,
     sink: list[Patch],
+    *,
+    edit_kind: str | None = None,
+    justification: str | None = None,
 ):
     """Return a PostToolUse hook callback that records Edit/Write diffs.
 
     Parameters
     ----------
     role:
-        Author tag stored on each captured ``Patch`` (e.g. ``"backend"``).
+        Author tag stored on each captured ``Patch`` (e.g. ``"builder"``).
     slice_id:
         Build-slice identifier the role is currently working on; copied
         verbatim into ``Patch.slice_id``.
@@ -85,6 +88,10 @@ def make_diff_capture(
         Mutable list the hook appends to. The caller (a stage activity
         body) reads this list once the SDK loop finishes and folds the
         entries into the state delta returned to the workflow.
+    edit_kind:
+        Optional audit label for the type of edit captured.
+    justification:
+        Optional brief/WP trace explaining why the edit belongs in scope.
     """
 
     async def diff_capture_hook(
@@ -147,6 +154,10 @@ def make_diff_capture(
             "slice_id": slice_id,
             "sha": sha,
         }
+        if edit_kind:
+            patch["edit_kind"] = edit_kind
+        if justification:
+            patch["justification"] = justification
         sink.append(patch)
         return {}
 

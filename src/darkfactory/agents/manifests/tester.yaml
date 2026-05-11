@@ -1,0 +1,90 @@
+identity:
+  role: tester
+  description: >-
+    Single-generalist test-writing role. Owns ``src/test/...`` and derives
+    assertions from each Work Package's ``verification`` predicate (the
+    diff-blindness rule: it reads the Builder's diff for shapes only, not
+    for assertions). Production-code edits are restricted to the
+    ``tester_mechanical`` category — rename / import / signature alignment;
+    anything semantic returns a structured finding for the Fixer to handle.
+  when_to_use: >-
+    Inside the build subgraph, after Builder finishes a Work Package, to
+    write tests against that WP's verification predicate before the verify
+    sweep runs.
+
+llm:
+  model: claude-sonnet-4-5-20250929
+  temperature: 0.1
+  thinking:
+    enabled: false
+  prompt_path: prompts/tester.md
+
+tools:
+  allowed:
+    - Read
+    - Write
+    - Edit
+    - Grep
+    - Glob
+    - Bash
+    - sandbox_bash
+  disallowed: []
+  argv_allowlist:
+    - mvn
+    - gradle
+    - ./gradlew
+    - git
+    - cat
+    - ls
+  role_owned_argv_prefixes: []
+  edit_path_allowlist: []
+
+mcp:
+  - darkfactory
+
+hooks:
+  - event: PreToolUse
+    name: loop_breaker
+    parameters: {}
+  - event: PreToolUse
+    name: call_cap
+    parameters: {}
+  - event: PreToolUse
+    name: heartbeat
+    parameters:
+      detail: "tester: pre tool"
+  - event: PostToolUse
+    name: diff_capture
+    parameters:
+      edit_kind: tester_mechanical
+      justification_template: "WP {slice_id} tests: {slice_intent}"
+  - event: PostToolUse
+    name: prompt_injection_guard
+    parameters: {}
+  - event: PostToolUse
+    name: heartbeat
+    parameters:
+      detail: "tester: post tool"
+  - event: UserPromptSubmit
+    name: goal_pin
+    parameters: {}
+  - event: Stop
+    name: heartbeat
+    parameters:
+      detail: "tester: turn boundary"
+
+budgets:
+  retry_caps: {}
+
+io_contract:
+  reads:
+    - user_request
+    - task_id
+    - wf_id
+    - current_slice
+    - spec
+    - patches
+    - builder_summary
+  writes:
+    - patches
+    - tester_findings

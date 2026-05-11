@@ -24,8 +24,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * Strict cursor-pagination contract. Pins shape and cursor encoding tightly
  * so a naive first implementation that re-uses the offset-pagination shape
  * (e.g. retains "offset"/"total" keys, or returns nextCursor="" on the last
- * page, or encodes the cursor as a plain integer) will fail. spec_adjustment
- * narrows the spec on the second iteration and the run converges.
+ * page, or encodes the cursor as a plain integer) will fail. Fixer repairs
+ * the implementation on a later verify iteration and the run converges.
  */
 @SpringBootTest
 @AutoConfigureMockMvc

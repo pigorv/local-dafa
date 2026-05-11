@@ -5,12 +5,12 @@ from typing import Any
 
 from temporalio import activity
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from darkfactory.runtime.approval import ApprovalSignal
 from darkfactory.runtime.issue_workflow import DarkFactoryIssueWorkflow
 from darkfactory.state import IssueRef, IssueRunRequest
+from tests.temporal_testing import start_time_skipping_env
 
 
 _CALLS: dict[str, int] = {
@@ -20,7 +20,7 @@ _CALLS: dict[str, int] = {
     "discovery": 0,
     "build": 0,
     "verify": 0,
-    "code_quality": 0,
+    "reviewer": 0,
     "pr_creator": 0,
     "merge": 0,
     "mark_done": 0,
@@ -29,6 +29,7 @@ _CALLS: dict[str, int] = {
 }
 _PHASES: list[dict[str, Any]] = []
 _LABELS: list[dict[str, Any]] = []
+_REVIEW_PR_URLS: list[str | None] = []
 _QUALITY_APPROVES = True
 
 
@@ -39,6 +40,7 @@ def _reset(*, quality_approves: bool = True) -> None:
         _CALLS[key] = 0
     _PHASES.clear()
     _LABELS.clear()
+    _REVIEW_PR_URLS.clear()
 
 
 def _req() -> IssueRunRequest:
@@ -133,6 +135,7 @@ async def discovery(state: dict) -> dict:
                 "affected_files": ["src/darkfactory/runtime/issue_workflow.py"],
                 "new_files": [],
                 "test_files": ["tests/test_issue_workflow_phases.py"],
+                "verification": ["design comment presents file paths as hints"],
                 "risks": [],
                 "depends_on": [],
             }
@@ -147,7 +150,7 @@ async def build(state: dict) -> dict:  # noqa: ARG001
     return {
         "build_order": ["story-1"],
         "current_slice": "story-1",
-        "patches": [{"path": "src/demo.py", "diff": "", "author_agent": "backend", "slice_id": "story-1"}],
+        "patches": [{"path": "src/demo.py", "diff": "", "author_agent": "builder", "slice_id": "story-1"}],
     }
 
 
@@ -161,14 +164,15 @@ async def verify(state: dict) -> dict:  # noqa: ARG001
     }
 
 
-@activity.defn(name="spec_adjustment_stage")
-async def spec_adjustment(state: dict) -> dict:  # noqa: ARG001
+@activity.defn(name="fixer_stage")
+async def fixer(state: dict) -> dict:  # noqa: ARG001
     return {}
 
 
-@activity.defn(name="code_quality_stage")
-async def code_quality(state: dict) -> dict:  # noqa: ARG001
-    _CALLS["code_quality"] += 1
+@activity.defn(name="reviewer_stage")
+async def reviewer(state: dict) -> dict:
+    _CALLS["reviewer"] += 1
+    _REVIEW_PR_URLS.append(state.get("pr_url"))
     return {
         "review_decision": {
             "severity": "low" if _QUALITY_APPROVES else "high",
@@ -213,8 +217,8 @@ _AGENT = (
     discovery,
     build,
     verify,
-    spec_adjustment,
-    code_quality,
+    fixer,
+    reviewer,
     pr_creator,
     merge_branch,
     mark_done,
@@ -229,16 +233,22 @@ async def _run_happy() -> None:
     _reset()
     result = await _run_until_terminal(
         "test-issue-phases-happy",
-        [ApprovalSignal(kind="Approve", author="octocat", comment_id=201)],
+        [
+            ApprovalSignal(kind="Approve", author="octocat", comment_id=201),
+            ApprovalSignal(kind="Approve", author="octocat", comment_id=251),
+        ],
     )
 
     assert result.status == "merged"
+    assert _REVIEW_PR_URLS == ["https://github.example/octo-org/octo-repo/pull/9"]
     assert [item["add"] for item in _LABELS] == [
         "df:triaging",
         "df:designing",
         "df:awaiting-approval",
         "df:building",
         "df:verifying",
+        "df:reviewing",
+        "df:awaiting-merge",
         "df:in-progress",
         "df:done",
     ]
@@ -248,7 +258,32 @@ async def _run_happy() -> None:
     assert any(":build" in marker for marker in markers)
     assert any(":verify" in marker for marker in markers)
     assert any(":pr" in marker for marker in markers)
+    assert any(":review:1" in marker for marker in markers)
     assert any(":merge" in marker for marker in markers)
+    review_bodies = [
+        item["body"] for item in _PHASES if ":review" in item["marker"]
+    ]
+    review_done = next(
+        body for body in reversed(review_bodies) if "Recommendation:" in body
+    )
+    assert "PR: https://github.example/octo-org/octo-repo/pull/9" in review_done
+    assert "Recommendation: approve" in review_done
+    assert "### Recommended next actions" in review_done
+    assert "Reviewer recommends: **approve**." in review_done
+    assert "`/df approve`" in review_done
+    assert "`/df fix <focus>`" in review_done
+    assert "`/df rebuild <focus>`" in review_done
+    design_body = next(
+        item["body"]
+        for item in _PHASES
+        if ":design:1" in item["marker"] and "### Work Packages" in item["body"]
+    )
+    assert "### Work Packages" in design_body
+    assert "Candidate files (hints): src/darkfactory/runtime/issue_workflow.py" in design_body
+    assert "  - Verification predicates:" in design_body
+    assert "    - design comment presents file paths as hints" in design_body
+    assert "allowed files" not in design_body.lower()
+    assert "must edit" not in design_body.lower()
 
 
 def test_issue_workflow_revise_posts_new_design_revision() -> None:
@@ -267,6 +302,7 @@ async def _run_revise() -> None:
                 text="Add an edge case.",
             ),
             ApprovalSignal(kind="Approve", author="octocat", comment_id=302),
+            ApprovalSignal(kind="Approve", author="octocat", comment_id=352),
         ],
     )
 
@@ -305,7 +341,7 @@ async def _run_reject() -> None:
     }
 
 
-def test_issue_workflow_quality_failure_escalates_to_needs_human() -> None:
+def test_issue_workflow_quality_failure_waits_for_human_at_merge_gate() -> None:
     asyncio.run(_run_quality_failure())
 
 
@@ -313,20 +349,92 @@ async def _run_quality_failure() -> None:
     _reset(quality_approves=False)
     result = await _run_until_terminal(
         "test-issue-phases-quality",
-        [ApprovalSignal(kind="Approve", author="octocat", comment_id=501)],
+        [
+            ApprovalSignal(kind="Approve", author="octocat", comment_id=501),
+            ApprovalSignal(
+                kind="Reject",
+                author="octocat",
+                comment_id=551,
+                text="Reviewer flagged a regression.",
+            ),
+        ],
     )
 
-    assert result.status == "needs_human"
-    assert result.reason == "code_quality_failed"
-    assert _CALLS["pr_creator"] == 0
-    assert _LABELS[-1] == {"remove": "df:verifying", "add": "df:needs-human"}
+    assert result.status == "rejected"
+    assert result.reason == "Reviewer flagged a regression."
+    assert _CALLS["pr_creator"] == 1
+    assert _REVIEW_PR_URLS == ["https://github.example/octo-org/octo-repo/pull/9"]
+    assert _CALLS["merge"] == 0
+    assert _CALLS["quarantine"] == 1
+    review_bodies = [
+        item["body"] for item in _PHASES if ":review" in item["marker"]
+    ]
+    review_done = next(
+        body for body in reversed(review_bodies) if "Recommendation:" in body
+    )
+    assert "Recommendation: request_changes" in review_done
+    assert "lint regression" in review_done
+    assert _LABELS[-1] == {
+        "remove": ["df:awaiting-merge", "df:cancel"],
+        "add": "df:canceled",
+    }
+
+
+def test_issue_workflow_fix_then_approve_emits_distinct_review_passes() -> None:
+    asyncio.run(_run_fix_then_approve())
+
+
+async def _run_fix_then_approve() -> None:
+    _reset()
+    result = await _run_until_terminal(
+        "test-issue-phases-fix",
+        [
+            ApprovalSignal(kind="Approve", author="octocat", comment_id=600),
+            ApprovalSignal(
+                kind="Fix",
+                author="octocat",
+                comment_id=601,
+                text="address lint regression",
+            ),
+            ApprovalSignal(kind="Approve", author="octocat", comment_id=602),
+        ],
+    )
+
+    assert result.status == "merged"
+    assert _CALLS["reviewer"] == 2
+    assert _REVIEW_PR_URLS == [
+        "https://github.example/octo-org/octo-repo/pull/9",
+        "https://github.example/octo-org/octo-repo/pull/9",
+    ]
+
+    review_markers = sorted(
+        {item["marker"] for item in _PHASES if ":review:" in item["marker"]}
+    )
+    assert any(marker.endswith(":review:1 -->") for marker in review_markers)
+    assert any(marker.endswith(":review:2 -->") for marker in review_markers)
+    # idempotent within a pass — exactly one comment id per pass.
+    review_done_per_pass: dict[str, int] = {}
+    for item in _PHASES:
+        marker = item["marker"]
+        if ":review:" not in marker:
+            continue
+        if "Recommendation:" in item["body"]:
+            review_done_per_pass[marker] = (
+                review_done_per_pass.get(marker, 0) + 1
+            )
+    assert all(count == 1 for count in review_done_per_pass.values())
+
+    label_adds = [item["add"] for item in _LABELS]
+    assert "df:reviewing" in label_adds
+    assert "df:awaiting-merge" in label_adds
+    assert "df:fixing" in label_adds
 
 
 async def _run_until_terminal(
     wf_id: str,
     signals: list[ApprovalSignal],
 ):
-    async with await WorkflowEnvironment.start_time_skipping(
+    async with await start_time_skipping_env(
         data_converter=pydantic_data_converter
     ) as env:
         async with Worker(
@@ -355,9 +463,19 @@ async def _run_until_terminal(
 
 
 async def _wait_until_gate(handle, comment_id: int) -> None:  # noqa: ARG001
-    for _ in range(80):
+    # First, wait for any in-flight signal to be consumed by the workflow.
+    for _ in range(160):
         summary = await handle.query(DarkFactoryIssueWorkflow.current_state_summary)
-        if summary["gate_pending"] is True:
+        if summary.get("approval_signal_pending") is False:
+            break
+        await asyncio.sleep(0.05)
+    # Then, wait for the workflow to open the next gate.
+    for _ in range(160):
+        summary = await handle.query(DarkFactoryIssueWorkflow.current_state_summary)
+        if (
+            summary["gate_pending"] is True
+            and summary.get("approval_signal_pending") is False
+        ):
             return
         await asyncio.sleep(0.05)
-    raise AssertionError("workflow did not reach spec approval gate")
+    raise AssertionError("workflow did not reach the next approval gate")

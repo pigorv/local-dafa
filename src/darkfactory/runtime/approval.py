@@ -6,7 +6,7 @@ import re
 from typing import Any, Callable, Literal
 
 
-ApprovalKind = Literal["Approve", "Revise", "Reject", "Cancel"]
+ApprovalKind = Literal["Approve", "Revise", "Reject", "Cancel", "Fix", "Rebuild"]
 
 _COMMAND_RE = re.compile(
     r"^\s*(?:@\S+\s+)*\/df\s+"
@@ -140,6 +140,8 @@ def _normalise_kind(raw: Any) -> ApprovalKind:
         "cancel": "Cancel",
         "canceled": "Cancel",
         "cancelled": "Cancel",
+        "fix": "Fix",
+        "rebuild": "Rebuild",
     }
     if value not in mapping:
         raise ValueError(f"unknown approval signal kind: {raw!r}")

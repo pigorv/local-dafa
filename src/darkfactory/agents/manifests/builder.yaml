@@ -1,0 +1,87 @@
+identity:
+  role: builder
+  description: >-
+    Single-generalist build-stage worker that implements one Work
+    Package end-to-end across Java sources, Flyway/SQL migrations, and
+    fixtures. Reads and writes via the SDK's built-in file tools and
+    shells out through the per-task ``sandbox_bash`` MCP tool. Never
+    edits anything under ``src/test/...`` — that belongs to Tester.
+  when_to_use: >-
+    Inside the build subgraph, per Work Package in topo order, before
+    Tester writes assertions and before the verify sweep runs.
+
+llm:
+  model: claude-sonnet-4-5-20250929
+  temperature: 0.1
+  thinking:
+    enabled: false
+  prompt_path: prompts/builder.md
+
+tools:
+  allowed:
+    - Read
+    - Write
+    - Edit
+    - Grep
+    - Glob
+    - Bash
+    - sandbox_bash
+  disallowed: []
+  argv_allowlist:
+    - mvn
+    - gradle
+    - ./gradlew
+    - git
+    - cat
+    - ls
+  role_owned_argv_prefixes: []
+  edit_path_allowlist: []
+
+mcp:
+  - darkfactory
+
+hooks:
+  - event: PreToolUse
+    name: loop_breaker
+    parameters: {}
+  - event: PreToolUse
+    name: call_cap
+    parameters: {}
+  - event: PreToolUse
+    name: heartbeat
+    parameters:
+      detail: "builder: pre tool"
+  - event: PostToolUse
+    name: diff_capture
+    parameters:
+      edit_kind: builder
+      justification_template: "WP {slice_id}: {slice_intent}"
+  - event: PostToolUse
+    name: prompt_injection_guard
+    parameters: {}
+  - event: PostToolUse
+    name: heartbeat
+    parameters:
+      detail: "builder: post tool"
+  - event: UserPromptSubmit
+    name: goal_pin
+    parameters: {}
+  - event: Stop
+    name: heartbeat
+    parameters:
+      detail: "builder: turn boundary"
+
+budgets:
+  retry_caps: {}
+
+io_contract:
+  reads:
+    - user_request
+    - task_id
+    - wf_id
+    - current_slice
+    - spec
+    - dependency_changes_authorized
+  writes:
+    - patches
+    - builder_summary

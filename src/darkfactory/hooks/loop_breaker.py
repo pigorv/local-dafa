@@ -28,23 +28,33 @@ def hash_tool_call(tool_name: str, tool_input: dict[str, Any] | None) -> str:
     return f"{tool_name}|{args_key}"
 
 
-def detect_repeating_triplet(hashes: list[str]) -> bool:
-    if len(hashes) < 3:
+def detect_repeating_triplet(hashes: list[str], min_repeats: int = 2) -> bool:
+    """Return True when any 3-gram in ``hashes`` appears at least ``min_repeats`` times.
+
+    ``min_repeats=2`` matches the legacy "deny on first repeat" behaviour;
+    higher values give agents more room before the loop breaker fires.
+    """
+    if len(hashes) < 3 or min_repeats < 2:
         return False
-    seen: set[tuple[str, str, str]] = set()
+    counts: dict[tuple[str, str, str], int] = {}
     for i in range(len(hashes) - 2):
         tri = (hashes[i], hashes[i + 1], hashes[i + 2])
-        if tri in seen:
+        counts[tri] = counts.get(tri, 0) + 1
+        if counts[tri] >= min_repeats:
             return True
-        seen.add(tri)
     return False
 
 
-def make_loop_breaker(window: int = 5):
+def make_loop_breaker(window: int = 8, min_repeats: int = 3):
     """Return a PreToolUse hook callback with private window state.
 
     The returned callable conforms to ``claude_agent_sdk.HookCallback``: it
     takes (input, tool_use_id, context) and returns a ``HookJSONOutput``.
+
+    Defaults: ``window=8``, ``min_repeats=3`` — an agent has to repeat the
+    same 3-gram three times within the recent 8 calls before being told to
+    reconsider. Earlier callers can pass ``min_repeats=2`` for the strict
+    legacy behaviour.
     """
     history: list[str] = []
 
@@ -56,7 +66,7 @@ def make_loop_breaker(window: int = 5):
         history.append(hash_tool_call(input_data["tool_name"], input_data.get("tool_input")))
         if len(history) > window:
             del history[: len(history) - window]
-        if not detect_repeating_triplet(history):
+        if not detect_repeating_triplet(history, min_repeats=min_repeats):
             return {}
         return {
             "hookSpecificOutput": {

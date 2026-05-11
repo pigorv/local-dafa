@@ -6,15 +6,15 @@ from typing import Any
 
 from temporalio import activity
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
+from darkfactory.runtime.approval import ApprovalSignal
 from darkfactory.runtime.issue_workflow import (
     MAX_CLARIFICATION_ROUNDS,
     DarkFactoryIssueWorkflow,
 )
-from darkfactory.runtime.approval import ApprovalSignal
 from darkfactory.state import IssueComment, IssueRef, IssueRunRequest
+from tests.temporal_testing import start_time_skipping_env
 
 
 _CALLS: dict[str, int] = {
@@ -24,8 +24,8 @@ _CALLS: dict[str, int] = {
     "discovery": 0,
     "build": 0,
     "verify": 0,
-    "spec_adjustment": 0,
-    "code_quality": 0,
+    "fixer": 0,
+    "reviewer": 0,
     "pr_creator": 0,
     "merge": 0,
     "mark_done": 0,
@@ -232,16 +232,17 @@ async def stub_verify_stage(state: dict) -> dict:
     }
 
 
-@activity.defn(name="spec_adjustment_stage")
-async def stub_spec_adjustment_stage(state: dict) -> dict:
-    _CALLS["spec_adjustment"] += 1
+@activity.defn(name="fixer_stage")
+async def stub_fixer_stage(state: dict) -> dict:
+    _CALLS["fixer"] += 1
     return {}
 
 
-@activity.defn(name="code_quality_stage")
-async def stub_code_quality_stage(state: dict) -> dict:
-    _CALLS["code_quality"] += 1
+@activity.defn(name="reviewer_stage")
+async def stub_reviewer_stage(state: dict) -> dict:
+    _CALLS["reviewer"] += 1
     assert state["verify_summary"]["passed"] is True
+    assert state["pr_url"] == "https://github.example/octo-org/octo-repo/pull/7"
     return {
         "review_decision": {
             "severity": "low",
@@ -255,6 +256,7 @@ async def stub_code_quality_stage(state: dict) -> dict:
 async def stub_pr_creator_stage(state: dict) -> dict:
     _CALLS["pr_creator"] += 1
     assert state["gate_approved"] is True
+    assert state.get("merge_gate_approved", False) is False
     assert state["issue"]["number"] == 42
     return {"pr_url": "https://github.example/octo-org/octo-repo/pull/7"}
 
@@ -293,8 +295,8 @@ _AGENT_ACTIVITIES = (
     stub_discovery_stage,
     stub_build_stage,
     stub_verify_stage,
-    stub_spec_adjustment_stage,
-    stub_code_quality_stage,
+    stub_fixer_stage,
+    stub_reviewer_stage,
     stub_pr_creator_stage,
     stub_merge_branch,
     stub_mark_issue_done_activity,
@@ -310,7 +312,7 @@ async def _run_issue_workflow_happy_path() -> None:
     wf_id = "test-issue-workflow-happy-path"
     req = _issue_run_request()
 
-    async with await WorkflowEnvironment.start_time_skipping(
+    async with await start_time_skipping_env(
         data_converter=pydantic_data_converter
     ) as env:
         async with Worker(
@@ -338,7 +340,7 @@ async def _run_issue_workflow_happy_path() -> None:
             assert _CALLS["triage"] == 1
             assert _CALLS["discovery"] == 1
             assert _CALLS["build"] == 0
-            assert _CALLS["code_quality"] == 0
+            assert _CALLS["reviewer"] == 0
             assert _CALLS["pr_creator"] == 0
             assert _CALLS["merge"] == 0
 
@@ -351,6 +353,17 @@ async def _run_issue_workflow_happy_path() -> None:
                     text="happy path accepted",
                 ),
             )
+
+            await _wait_until_merge_gate_pending(handle)
+            await handle.execute_update(
+                DarkFactoryIssueWorkflow.signal_approval,
+                ApprovalSignal(
+                    kind="Approve",
+                    author="octocat",
+                    comment_id=950,
+                    text="merge approved",
+                ),
+            )
             result = await handle.result()
 
     assert result.status == "merged"
@@ -358,6 +371,7 @@ async def _run_issue_workflow_happy_path() -> None:
     assert result.state["ready_to_build"] is True
     assert result.state["user_request"] == "Implement the fully specified issue."
     assert result.state["gate_approved"] is True
+    assert result.state["merge_gate_approved"] is True
     assert result.state["approval_record"]["author"] == "octocat"
     assert result.state["approved_spec_rev"] == 1
     assert result.state["pr_url"] == "https://github.example/octo-org/octo-repo/pull/7"
@@ -371,8 +385,8 @@ async def _run_issue_workflow_happy_path() -> None:
         "discovery": 1,
         "build": 1,
         "verify": 1,
-        "spec_adjustment": 0,
-        "code_quality": 1,
+        "fixer": 0,
+        "reviewer": 1,
         "pr_creator": 1,
         "merge": 1,
         "mark_done": 1,
@@ -403,7 +417,7 @@ async def _run_issue_workflow_comment_update() -> None:
         ]
     )
 
-    async with await WorkflowEnvironment.start_time_skipping(
+    async with await start_time_skipping_env(
         data_converter=pydantic_data_converter
     ) as env:
         async with Worker(
@@ -477,6 +491,16 @@ async def _run_issue_workflow_comment_update() -> None:
                     text="clarified path accepted",
                 ),
             )
+            await _wait_until_merge_gate_pending(handle)
+            await handle.execute_update(
+                DarkFactoryIssueWorkflow.signal_approval,
+                ApprovalSignal(
+                    kind="Approve",
+                    author="octocat",
+                    comment_id=951,
+                    text="merge approved",
+                ),
+            )
             result = await handle.result()
 
     assert result.status == "merged"
@@ -504,7 +528,7 @@ async def _run_issue_workflow_clarification_cap() -> None:
         for round_number in range(1, MAX_CLARIFICATION_ROUNDS + 2)
     )
 
-    async with await WorkflowEnvironment.start_time_skipping(
+    async with await start_time_skipping_env(
         data_converter=pydantic_data_converter
     ) as env:
         async with Worker(
@@ -565,7 +589,7 @@ async def _run_issue_workflow_clarification_cap() -> None:
     assert _CALLS["discovery"] == 0
     assert _CALLS["build"] == 0
     assert _CALLS["verify"] == 0
-    assert _CALLS["code_quality"] == 0
+    assert _CALLS["reviewer"] == 0
     assert _CALLS["pr_creator"] == 0
     assert _CALLS["merge"] == 0
     assert _CALLS["mark_done"] == 0
@@ -579,6 +603,15 @@ async def _wait_until_spec_gate_pending(handle) -> dict:
             return summary
         await asyncio.sleep(0.05)
     raise AssertionError("issue workflow did not reach the spec approval gate")
+
+
+async def _wait_until_merge_gate_pending(handle) -> dict:
+    for _ in range(80):
+        summary = await handle.query(DarkFactoryIssueWorkflow.current_state_summary)
+        if summary.get("pending_gate") == "merge":
+            return summary
+        await asyncio.sleep(0.05)
+    raise AssertionError("issue workflow did not reach the merge approval gate")
 
 
 async def _wait_until_posted_comments(count: int) -> None:

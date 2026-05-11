@@ -12,6 +12,10 @@ volumes:
   redis-data:
   otel-config:
   minio-data:
+  raw-claude:
+  cooked-projects:
+  monitor-db:
+  npx-cache:
 
 services:
   temporal:
@@ -270,6 +274,40 @@ services:
       LANGFUSE_INIT_PROJECT_SECRET_KEY: sk-lf-local
     networks:
       - darkfactory-net
+
+  transcript-transformer:
+    build:
+      context: ./services/transcript-transformer
+    container_name: darkfactory-transcript-transformer
+    restart: unless-stopped
+    environment:
+      WATCH_INTERVAL_S: "10"
+      RAW_ROOT: /raw
+      COOKED_ROOT: /cooked
+      ORIGINAL_CWD: /workspace
+    volumes:
+      - raw-claude:/raw:ro
+      - cooked-projects:/cooked
+    networks:
+      - darkfactory-net
+
+  claude-monitor:
+    image: node:20-alpine
+    container_name: darkfactory-claude-monitor
+    restart: unless-stopped
+    command: ["npx", "--yes", "@pigorv/claude-monitor", "start"]
+    volumes:
+      - cooked-projects:/root/.claude/projects
+      - monitor-db:/root/.claude-monitor
+      - npx-cache:/root/.npm
+    ports:
+      # Host port 4174 to avoid clashing with a local claude-monitor on 4173.
+      # The dashboard inside the container always listens on 4173.
+      - "4174:4173"
+    networks:
+      - darkfactory-net
+    depends_on:
+      - transcript-transformer
 
   darkfactory-orchestrator:
     image: darkfactory-orchestrator:dev

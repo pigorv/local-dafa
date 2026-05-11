@@ -27,11 +27,12 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
 from temporalio import activity, workflow
 from temporalio.contrib.opentelemetry import TracingInterceptor
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.testing import ActivityEnvironment, WorkflowEnvironment
+from temporalio.testing import ActivityEnvironment
 from temporalio.worker import Worker
 
 from darkfactory.bootstrap import SessionStampingSpanProcessor
 from darkfactory.runtime.activities import _stamp_temporal_activity_attrs
+from tests.temporal_testing import start_time_skipping_env
 
 
 def _attach_in_memory_exporter() -> InMemorySpanExporter:
@@ -131,7 +132,7 @@ async def _run_workflow_probe() -> None:
     interceptor = TracingInterceptor()
     wf_id = "test-wf-attr-probe"
 
-    async with await WorkflowEnvironment.start_time_skipping(
+    async with await start_time_skipping_env(
         data_converter=pydantic_data_converter,
         interceptors=[interceptor],
     ) as env:

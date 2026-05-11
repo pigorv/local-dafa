@@ -4,44 +4,32 @@ import asyncio
 
 import pytest
 
-from darkfactory.agents.triage import make_triage_client
+from claude_agent_sdk import ClaudeSDKClient
+
+from darkfactory.agents.compose import ComposeState, compose
 from darkfactory.state import IssueComment, IssueRef
 from darkfactory.stages import triage as triage_mod
 from darkfactory.stages.triage import CLARIFY_EDGE, READY_EDGE, triage_subgraph
 
 
-_AUTH_ENV_VARS = (
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-)
+def _triage_client() -> ClaudeSDKClient:
+    state = ComposeState.from_mapping({})
+    return compose("triage", state, task_id=state.task_id)
 
 
-def _clear_auth_env(monkeypatch) -> None:
-    for var in _AUTH_ENV_VARS:
-        monkeypatch.delenv(var, raising=False)
+def test_triage_client_returns_sdk_client_with_triage_prompt():
+    client = _triage_client()
+    assert isinstance(client, ClaudeSDKClient)
+    options = client.options
+    assert options.allowed_tools == []
+    assert "Triage" in options.system_prompt or "triage" in options.system_prompt
+    assert options.mcp_servers == {}
 
 
-def test_make_triage_client_uses_anthropic_api_key_when_set(monkeypatch):
-    _clear_auth_env(monkeypatch)
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    client = make_triage_client()
-    assert client.api_key == "sk-test"
-    assert client.auth_token is None
-
-
-def test_make_triage_client_falls_back_to_claude_code_oauth_token(monkeypatch):
-    _clear_auth_env(monkeypatch)
-    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-test-token")
-    client = make_triage_client()
-    assert client.api_key is None
-    assert client.auth_token == "oauth-test-token"
-
-
-def test_make_triage_client_raises_when_no_auth_present(monkeypatch):
-    _clear_auth_env(monkeypatch)
-    with pytest.raises(RuntimeError, match="Triage agent requires"):
-        make_triage_client()
+def test_triage_client_respects_env_model_override(monkeypatch):
+    monkeypatch.setenv("LLM_TRIAGE_MODEL", "claude-haiku-override")
+    client = _triage_client()
+    assert client.options.model == "claude-haiku-override"
 
 
 @pytest.mark.parametrize(

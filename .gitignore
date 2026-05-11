@@ -16,5 +16,10 @@ wheels/
 
 # Local runtime state
 .darkfactory/
+.cache/
 .langgraph_api/
 .pytest_cache/
+
+# Claude local-only settings
+.claude/settings.local.json
+.claude/worktrees/

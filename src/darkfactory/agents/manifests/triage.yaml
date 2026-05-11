@@ -1,0 +1,54 @@
+identity:
+  role: triage
+  description: >-
+    Reasoning-only triage role that decides whether a labeled GitHub
+    issue is ready for Dark Factory to build or needs clarification
+    questions back to the author.
+  when_to_use: >-
+    First step of the issue-driven workflow, before discovery.
+    Consumes the issue title/body/comments plus repo context; emits
+    ready_to_build + clarification_questions or derived_user_request.
+
+llm:
+  model: claude-haiku-4-5-20251001
+  temperature: 0.2
+  thinking:
+    enabled: false
+  prompt_path: prompts/triage.md
+
+tools:
+  allowed: []
+  disallowed: []
+  argv_allowlist: []
+  role_owned_argv_prefixes: []
+  edit_path_allowlist: []
+
+mcp: []
+
+hooks:
+  - event: PreToolUse
+    name: loop_breaker
+    parameters: {}
+  - event: PreToolUse
+    name: call_cap
+    parameters: {}
+  - event: UserPromptSubmit
+    name: goal_pin
+    parameters: {}
+
+budgets:
+  retry_caps: {}
+
+io_contract:
+  reads:
+    - issue
+    - issue_title
+    - issue_body
+    - issue_comments
+    - repo_context
+  writes:
+    - ready_to_build
+    - clarification_questions
+    - derived_user_request
+    - confidence
+    - rationale

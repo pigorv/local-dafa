@@ -11,6 +11,7 @@ PHASE_MARKERS: dict[str, str] = {
     "build": "<!-- df-phase:{wf}:build -->",
     "verify": "<!-- df-phase:{wf}:verify -->",
     "pr": "<!-- df-phase:{wf}:pr -->",
+    "review": "<!-- df-phase:{wf}:review:{iteration} -->",
     "merge": "<!-- df-phase:{wf}:merge -->",
 }
 
@@ -20,6 +21,7 @@ PHASE_TITLES: dict[str, str] = {
     "build": "Build",
     "verify": "Verify",
     "pr": "PR",
+    "review": "PR Review",
     "merge": "Merge",
 }
 
@@ -34,6 +36,13 @@ def marker_for(wf_id: str, phase: str, **kwargs: Any) -> str:
         if rev < 1:
             raise ValueError("design phase marker requires rev >= 1")
         return PHASE_MARKERS[phase].format(wf=wf_id, rev=rev)
+    if phase == "review":
+        iteration = int(
+            kwargs.get("iteration") or kwargs.get("attempt") or 0
+        )
+        if iteration < 1:
+            raise ValueError("review phase marker requires iteration >= 1")
+        return PHASE_MARKERS[phase].format(wf=wf_id, iteration=iteration)
     return PHASE_MARKERS[phase].format(wf=wf_id)
 
 
@@ -55,7 +64,7 @@ def render_phase_comment(
     across activity retries and workflow replays.
     """
     fields = dict(fields or {})
-    marker = marker_for(wf_id, phase, rev=rev)
+    marker = marker_for(wf_id, phase, rev=rev, attempt=attempt)
     title = PHASE_TITLES.get(phase, phase.title())
     suffix_parts: list[str] = []
     if rev is not None:
@@ -105,22 +114,39 @@ def render_spec_markdown(
 
     spec_list = list(spec or [])
     if spec_list:
-        lines.extend(["", "### Implementation Slices"])
+        lines.extend(["", "### Work Packages"])
         for item in spec_list:
-            story_id = str(item.get("story_id") or "slice")
-            lines.append(f"- **{story_id}**")
+            wp_id = str(item.get("id") or item.get("story_id") or "work-package")
+            title = str(item.get("title") or "").strip()
+            suffix = f": {title}" if title and title != wp_id else ""
+            lines.append(f"- **{wp_id}**{suffix}")
             for key, label in (
+                ("intent", "Intent"),
                 ("approach", "Approach"),
-                ("affected_files", "Affected files"),
-                ("new_files", "New files"),
-                ("test_files", "Tests"),
-                ("risks", "Risks"),
-                ("depends_on", "Depends on"),
+                ("repo_areas", "Repo areas"),
             ):
-                value = item.get(key)
-                rendered = _compact_value(value)
+                rendered = _compact_value(item.get(key))
                 if rendered:
                     lines.append(f"  - {label}: {rendered}")
+
+            candidate_files = _candidate_files_for(item)
+            rendered_candidates = _compact_value(candidate_files)
+            if rendered_candidates:
+                lines.append(f"  - Candidate files (hints): {rendered_candidates}")
+
+            verification = _verification_predicates_for(item)
+            if verification:
+                lines.append("  - Verification predicates:")
+                lines.extend(f"    - {predicate}" for predicate in verification)
+
+            for key, label in (("test_files", "Tests"), ("risks", "Risks")):
+                rendered = _compact_value(item.get(key))
+                if rendered:
+                    lines.append(f"  - {label}: {rendered}")
+            dependencies = _first_present(item, "dependencies", "depends_on")
+            rendered_dependencies = _compact_value(dependencies)
+            if rendered_dependencies:
+                lines.append(f"  - Depends on: {rendered_dependencies}")
 
     if review_decision:
         lines.extend(["", "### Spec Review", _compact_value(review_decision)])
@@ -188,6 +214,8 @@ def _render_phase_fields(phase: str, status: str, fields: dict[str, Any]) -> str
         return _render_verify(fields)
     if phase == "pr":
         return _render_pr(fields)
+    if phase == "review":
+        return _render_review(status, fields)
     if phase == "merge":
         return _render_merge(fields)
     return "\n".join(f"{key}: {_compact_value(value)}" for key, value in fields.items())
@@ -292,6 +320,85 @@ def _render_pr(fields: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def merge_gate_instructions(recommendation: str = "") -> str:
+    suggested = _suggested_action(recommendation)
+    lines = ["### Recommended next actions"]
+    if suggested:
+        lines.append(f"Reviewer recommends: **{suggested}**.")
+    else:
+        lines.append("Reply with one of:")
+    options: list[tuple[str, str, str]] = [
+        ("approve", "`/df approve`", "merge the PR"),
+        ("fix", "`/df fix <focus>`", "re-run Fixer and Verifier"),
+        ("rebuild", "`/df rebuild <focus>`", "re-run Builder, Tester and Verifier"),
+        ("reject", "`/df reject <reason>`", "close the issue and quarantine"),
+    ]
+    for key, command, description in options:
+        marker = " ← recommended" if key == suggested else ""
+        lines.append(f"- {command} — {description}{marker}")
+    lines.extend(
+        [
+            "",
+            "Allowed approvers: repo collaborators with write access.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _suggested_action(recommendation: str) -> str:
+    value = (recommendation or "").strip().lower()
+    if not value:
+        return ""
+    if value == "approve":
+        return "approve"
+    if value in {"reject", "block"}:
+        return "reject"
+    if value in {"request_changes", "needs_changes", "changes_requested"}:
+        return "fix"
+    if value in {"rebuild", "needs_rebuild"}:
+        return "rebuild"
+    return ""
+
+
+def _render_review(status: str, fields: dict[str, Any]) -> str:
+    lines: list[str] = []
+    pr_url = str(fields.get("pr_url") or "").strip()
+    if pr_url:
+        lines.append(f"PR: {pr_url}")
+
+    decision = fields.get("review_decision") or {}
+    recommendation = str(_decision_field(decision, "recommendation") or "").strip()
+    severity = str(_decision_field(decision, "severity") or "").strip()
+    if recommendation:
+        lines.append(f"Recommendation: {recommendation}")
+    if severity:
+        lines.append(f"Severity: {severity}")
+    issues = _decision_field(decision, "issues") or []
+    if issues:
+        lines.extend(["", "Issues:"])
+        for issue in issues:
+            lines.append(f"- {_compact_value(issue)}")
+
+    summary = fields.get("verify_summary")
+    if summary:
+        lines.append("")
+        lines.append(f"Verify summary: {_compact_value(summary)}")
+
+    decision_note = str(fields.get("decision_note") or "").strip()
+    if decision_note:
+        lines.extend(["", decision_note])
+
+    if status != "running" and fields.get("include_merge_instructions", True):
+        lines.extend(["", merge_gate_instructions(recommendation)])
+    return "\n".join(line for line in lines if line is not None).strip()
+
+
+def _decision_field(decision: Any, key: str) -> Any:
+    if isinstance(decision, dict):
+        return decision.get(key)
+    return getattr(decision, key, None)
+
+
 def _render_merge(fields: dict[str, Any]) -> str:
     lines = []
     for key, label in (
@@ -319,6 +426,64 @@ def _compact_value(value: Any) -> str:
         items = [_compact_value(item) for item in value]
         return ", ".join(item for item in items if item)
     return str(value)
+
+
+def _candidate_files_for(item: dict[str, Any]) -> list[str]:
+    explicit = _list_value(item.get("candidate_files"))
+    if explicit:
+        return explicit
+    return _dedupe(
+        _list_value(item.get("affected_files")) + _list_value(item.get("new_files"))
+    )
+
+
+def _verification_predicates_for(item: dict[str, Any]) -> list[str]:
+    predicates: list[str] = []
+    for value in _list_value(item.get("verification")):
+        predicates.extend(
+            line.strip()
+            for line in _predicate_text(value).splitlines()
+            if line.strip()
+        )
+    return predicates
+
+
+def _predicate_text(value: Any) -> str:
+    if isinstance(value, dict):
+        return _compact_value(value.get("root") or value.get("predicate") or value)
+    return _compact_value(value)
+
+
+def _list_value(value: Any) -> list[Any]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, Iterable):
+        return list(value)
+    return [value]
+
+
+def _first_present(item: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = item.get(key)
+        if value not in (None, "", []):
+            return value
+    return None
+
+
+def _dedupe(values: list[Any]) -> list[Any]:
+    seen: set[str] = set()
+    deduped: list[Any] = []
+    for value in values:
+        key = _compact_value(value)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(value)
+    return deduped
 
 
 def _format_ts(value: str | datetime | None) -> str:

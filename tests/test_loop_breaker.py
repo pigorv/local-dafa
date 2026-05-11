@@ -31,12 +31,19 @@ def _ctx() -> dict[str, Any]:
 
 def test_triplet_detector_flags_repeat() -> None:
     # A B A B A -> triplets (A,B,A), (B,A,B), (A,B,A) — repeat.
-    assert detect_repeating_triplet(["A", "B", "A", "B", "A"])
+    assert detect_repeating_triplet(["A", "B", "A", "B", "A"], min_repeats=2)
 
 
 def test_triplet_detector_ignores_non_repeat() -> None:
-    assert not detect_repeating_triplet(["A", "B", "C", "D", "E"])
-    assert not detect_repeating_triplet(["A", "B"])  # too short
+    assert not detect_repeating_triplet(["A", "B", "C", "D", "E"], min_repeats=2)
+    assert not detect_repeating_triplet(["A", "B"], min_repeats=2)  # too short
+
+
+def test_triplet_detector_min_repeats_three_needs_third_occurrence() -> None:
+    # (A,B,A) appears twice in "A B A B A" — not enough for min_repeats=3.
+    assert not detect_repeating_triplet(["A", "B", "A", "B", "A"], min_repeats=3)
+    # Adding one more cycle makes (A,B,A) appear three times.
+    assert detect_repeating_triplet(["A", "B", "A", "B", "A", "B", "A"], min_repeats=3)
 
 
 def test_hash_is_stable_for_same_call() -> None:
@@ -52,9 +59,9 @@ def test_hash_differs_on_args() -> None:
 
 
 def test_hook_denies_on_rigged_sequence() -> None:
-    # Read(x) -> Write(y) -> Read(x) -> Write(y) -> Read(x)
-    # Triplet (Read(x), Write(y), Read(x)) appears twice.
-    hook = make_loop_breaker(window=5)
+    # Read(x) -> Write(y) -> Read(x) -> Write(y) -> Read(x) — strict mode.
+    # Triplet (Read(x), Write(y), Read(x)) appears twice → deny when min_repeats=2.
+    hook = make_loop_breaker(window=5, min_repeats=2)
     sequence = [
         _pre("Read", path="x.py"),
         _pre("Write", path="y.py"),
@@ -73,6 +80,25 @@ def test_hook_denies_on_rigged_sequence() -> None:
     assert final["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
     assert final["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert final["hookSpecificOutput"]["permissionDecisionReason"] == RECONSIDER_TEXT
+
+
+def test_hook_default_tolerates_one_repeat() -> None:
+    # Default min_repeats=3 — a single repeat of the same triplet is allowed
+    # so agents can retry an action once before being told to stop.
+    hook = make_loop_breaker()
+    sequence = [
+        _pre("Read", path="x.py"),
+        _pre("Write", path="y.py"),
+        _pre("Read", path="x.py"),
+        _pre("Write", path="y.py"),
+        _pre("Read", path="x.py"),
+    ]
+
+    async def drive() -> list[dict[str, Any]]:
+        return [await hook(item, item["tool_use_id"], _ctx()) for item in sequence]
+
+    outputs = asyncio.run(drive())
+    assert outputs == [{}, {}, {}, {}, {}]
 
 
 def test_hook_silent_on_distinct_calls() -> None:
@@ -117,8 +143,8 @@ def test_hook_window_drops_old_calls() -> None:
 
 def test_each_factory_has_independent_state() -> None:
     # Two independent hook instances must not share window history.
-    h1 = make_loop_breaker(window=5)
-    h2 = make_loop_breaker(window=5)
+    h1 = make_loop_breaker(window=5, min_repeats=2)
+    h2 = make_loop_breaker(window=5, min_repeats=2)
     rigged = [
         _pre("Read", path="x.py"),
         _pre("Write", path="y.py"),

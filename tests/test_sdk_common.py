@@ -5,7 +5,12 @@ import asyncio
 from collections.abc import AsyncIterator
 
 import pytest
-from claude_agent_sdk.types import AssistantMessage, ResultMessage, TextBlock
+from claude_agent_sdk.types import (
+    AssistantMessage,
+    ResultMessage,
+    TextBlock,
+    ToolUseBlock,
+)
 from pydantic import BaseModel
 
 from darkfactory.agents._sdk_common import ParseError, run_to_completion
@@ -129,6 +134,63 @@ def test_run_to_completion_raises_parse_error_after_one_retry() -> None:
     with pytest.raises(ParseError):
         asyncio.run(run_to_completion(client, expect=Greeting))  # type: ignore[arg-type]
     assert len(client.queries) == 1
+
+
+def _structured_assistant(payload: dict) -> AssistantMessage:
+    """An assistant turn that emits the SDK's synthetic StructuredOutput tool."""
+    return AssistantMessage(
+        content=[
+            ToolUseBlock(
+                id="toolu_struct_1",
+                name="StructuredOutput",
+                input=payload,
+            )
+        ],
+        model="fake-model",
+        usage=None,
+        message_id="msg-struct-1",
+        session_id="session-1",
+        stop_reason="end_turn",
+    )
+
+
+def test_run_to_completion_reads_structured_output_tool_block() -> None:
+    payload = {"hello": "structured", "n": 9}
+    client = FakeClient([[_structured_assistant(payload), _result()]])
+
+    out = asyncio.run(run_to_completion(client, expect=Greeting))  # type: ignore[arg-type]
+
+    assert isinstance(out, Greeting)
+    assert out.hello == "structured"
+    assert out.n == 9
+    assert client.queries == []  # no retry needed
+
+
+def test_run_to_completion_prefers_structured_block_over_text() -> None:
+    """If both arrive, the tool-block payload wins — text is the model's
+    narration, the tool input is the actual structured output."""
+    text_payload = '{"hello": "narration", "n": 1}'
+    struct_payload = {"hello": "structured", "n": 2}
+    msg = AssistantMessage(
+        content=[
+            TextBlock(text=text_payload),
+            ToolUseBlock(
+                id="toolu_struct_2",
+                name="StructuredOutput",
+                input=struct_payload,
+            ),
+        ],
+        model="fake-model",
+        usage=None,
+        message_id="msg-mixed",
+        session_id="session-1",
+        stop_reason="end_turn",
+    )
+    client = FakeClient([[msg, _result()]])
+
+    out = asyncio.run(run_to_completion(client, expect=Greeting))  # type: ignore[arg-type]
+    assert isinstance(out, Greeting)
+    assert out.hello == "structured"
 
 
 def test_run_to_completion_without_schema_returns_text_and_result() -> None:

@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 from typing import Any, Awaitable, Callable, TypeVar
@@ -32,6 +33,10 @@ from darkfactory.state import IssueComment, IssueRef, IssueRunRequest
 
 WORKER_IMAGE = "darkfactory-worker:latest"
 WORKER_NETWORK = "darkfactory-net"
+WORKER_TRANSCRIPTS_VOLUME = os.environ.get(
+    "DARKFACTORY_TRANSCRIPTS_VOLUME", "darkfactory_raw-claude"
+)
+WORKER_CLAUDE_HOME = "/home/agent/.claude"
 DEFAULT_TEMPORAL_ADDRESS = "localhost:7233"
 DEFAULT_OTLP_ENDPOINT = "http://otel-collector:4317"
 DEFAULT_TEMPORAL_NAMESPACE = "default"
@@ -279,11 +284,20 @@ def _comment_author_name(author: Any) -> str:
     return str(getattr(author, "login", None) or getattr(author, "name", "") or "")
 
 
+_COMMENT_URL_ID_RE = re.compile(r"#issuecomment-(\d+)\b")
+
+
 def _comment_int_id(comment: Any) -> int:
     raw = _state_value(comment, "databaseId", None) or _state_value(comment, "id", 0)
     try:
         return int(raw)
     except (TypeError, ValueError):
+        # `gh issue list --json comments` returns the GraphQL global id (e.g.
+        # `IC_kwDOSVokaM8…`), which can't be coerced. Recover the numeric id
+        # from the comment URL when available.
+        match = _COMMENT_URL_ID_RE.search(str(_state_value(comment, "url", "") or ""))
+        if match:
+            return int(match.group(1))
         return 0
 
 
@@ -914,6 +928,29 @@ def _init_worker_branch(container: Any, wf_id: str) -> None:
         container.exec_run(["git", "checkout", "-b", branch], workdir="/workspace")
 
 
+def _ensure_transcripts_subpath(client: Any, wf_id: str) -> None:
+    # Docker's VolumeOptions.Subpath fails the worker start if the per-workflow
+    # subdirectory doesn't already exist on the named volume. Pre-create it via
+    # a throwaway alpine container, and chown it to uid 1000 so the worker (which
+    # runs as agent without CAP_CHOWN) can write transcripts there.
+    client.containers.run(
+        image="alpine:3",
+        command=[
+            "sh",
+            "-c",
+            f"mkdir -p /v/{wf_id} && chown -R 1000:1000 /v/{wf_id}",
+        ],
+        mounts=[
+            docker.types.Mount(
+                target="/v",
+                source=WORKER_TRANSCRIPTS_VOLUME,
+                type="volume",
+            )
+        ],
+        remove=True,
+    )
+
+
 def _is_repo_url(value: str) -> bool:
     return value.startswith(("http://", "https://", "git@", "ssh://", "git://"))
 
@@ -1522,6 +1559,13 @@ async def setup_worker_activity(wf_id: str, repo_url: str) -> str:
     volumes = (
         {} if repo_is_url else {repo_url: {"bind": "/workspace", "mode": "rw"}}
     )
+    _ensure_transcripts_subpath(client, wf_id)
+    transcripts_mount = docker.types.Mount(
+        target=WORKER_CLAUDE_HOME,
+        source=WORKER_TRANSCRIPTS_VOLUME,
+        type="volume",
+    )
+    transcripts_mount["VolumeOptions"] = {"Subpath": wf_id}
     container = client.containers.run(
         image=WORKER_IMAGE,
         name=name,
@@ -1560,6 +1604,7 @@ async def setup_worker_activity(wf_id: str, repo_url: str) -> str:
             ),
         },
         volumes=volumes,
+        mounts=[transcripts_mount],
         cap_drop=["ALL"],
         security_opt=["no-new-privileges"],
         user="1000:1000",
@@ -1609,7 +1654,7 @@ async def hydrate_stage(state: dict) -> dict:
 
 @activity.defn
 async def discovery_stage(state: dict) -> dict:
-    """Run the Discovery subgraph (PO → Architect → SpecReviewer)."""
+    """Run the Discovery subgraph (PO → Architect → Plan Critic)."""
     _stamp_temporal_activity_attrs()
     _heartbeat("discovery: starting subgraph")
     from darkfactory.stages.discovery import discovery_subgraph
@@ -1619,6 +1664,8 @@ async def discovery_stage(state: dict) -> dict:
     return {
         "stories": result.get("stories", []),
         "spec": result.get("spec", []),
+        "work_packages": result.get("work_packages", []),
+        "implementation_brief": result.get("implementation_brief"),
         "review_decision": result.get("review_decision"),
     }
 
@@ -1921,7 +1968,7 @@ async def mark_issue_done_activity(
 @activity.defn
 @with_repo_state("agent/{wf_id}")
 async def build_stage(state: dict) -> dict:
-    """Run the Build subgraph (Builder Supervisor + worker fan-out)."""
+    """Run the Build subgraph (Builder Supervisor + Builder/Tester workers)."""
     _stamp_temporal_activity_attrs()
     _heartbeat("build: starting subgraph")
     from darkfactory.stages.build import build_subgraph
@@ -1932,6 +1979,8 @@ async def build_stage(state: dict) -> dict:
     return {
         "build_order": result.get("build_order"),
         "current_slice": result.get("current_slice"),
+        "coverage_entries": result.get("coverage_entries", []),
+        "tester_findings": result.get("tester_findings", []),
         "patches": result.get("patches", []),
     }
 
@@ -1965,84 +2014,57 @@ async def verify_stage(state: dict) -> dict:
 
 @activity.defn
 @with_repo_state("agent/{wf_id}")
-async def spec_adjustment_stage(state: dict) -> dict:
-    """Decide patch_code vs update_spec on a verify failure (R12).
-
-    For a `patch_code` decision the unified diff is also applied to the
-    workspace via `git apply` so the next verify round actually sees the
-    change. The agent itself has no tools — without this step its diff
-    sits in `state['patches']` as dead data.
-    """
+async def fixer_stage(state: dict) -> dict:
+    """Run Fixer on failing verifier diagnostics and return captured patches."""
     _stamp_temporal_activity_attrs()
-    _heartbeat("spec_adjustment: starting")
-    from darkfactory.agents.spec_adjustment import run_spec_adjustment
+    _heartbeat("fixer: starting")
+    return await _run_fixer_stage(state)
 
-    out = await run_spec_adjustment(state)
-    delta = _spec_adjustment_delta(out)
 
-    if out.decision == "patch_code":
-        sb = _ensure_repo_sandbox(state)
-        if sb is None:
-            log.warning(
-                "spec_adjustment: no sandbox to apply patch_code for "
-                "slice_id=%r path=%r",
-                out.slice_id,
-                out.path,
-            )
-        else:
-            apply_result = sb.exec(["git", "apply", "--whitespace=nowarn", "-"], stdin=out.diff)
-            if int(apply_result.get("returncode", 1)) != 0:
-                log.warning(
-                    "spec_adjustment: git apply failed for slice_id=%r path=%r "
-                    "rc=%s stderr=%s",
-                    out.slice_id,
-                    out.path,
-                    apply_result.get("returncode"),
-                    (apply_result.get("stderr") or "")[:500],
-                )
+async def _run_fixer_stage(state: dict) -> dict:
+    from darkfactory.agents.fixer import run_fixer
 
+    out = await run_fixer(state)
+    return _fixer_delta(out)
+
+
+def _fixer_delta(out: Any) -> dict:
+    """Translate a `FixerOutput` into a workflow-mergeable state delta."""
+    from darkfactory.state import Patch
+
+    patches = []
+    for raw_patch in out.patches or []:
+        patch = dict(raw_patch)
+        if not (patch.get("path") and patch.get("diff")):
+            raise ValueError("fixer patch missing required fields (path, diff)")
+        patch["author_agent"] = "fixer"
+        patch["slice_id"] = str(patch.get("slice_id") or out.target_wp)
+        patches.append(Patch(**patch))
+
+    delta: dict[str, Any] = {
+        "fixer_decision": out.model_dump(exclude={"patches"}, mode="json"),
+        "current_slice": out.target_wp,
+    }
+    if patches:
+        delta["patches"] = patches
     return delta
 
 
-def _spec_adjustment_delta(out: Any) -> dict:
-    """Translate a `SpecAdjustmentOutput` into a workflow-mergeable state delta."""
-    from darkfactory.state import Patch
-
-    if out.decision == "patch_code":
-        if not (out.target_worker and out.slice_id and out.path and out.diff):
-            raise ValueError(
-                "patch_code decision missing required fields "
-                "(target_worker, slice_id, path, diff)"
-            )
-        patch = Patch(
-            path=out.path,
-            diff=out.diff,
-            author_agent="spec_adjustment",
-            slice_id=out.slice_id,
-        )
-        return {"patches": [patch], "current_slice": out.slice_id}
-
-    if out.decision == "update_spec":
-        if out.updated_slice is None:
-            raise ValueError("update_spec decision missing updated_slice")
-        slice_dict = out.updated_slice.model_dump()
-        return {
-            "spec": [slice_dict],
-            "current_slice": slice_dict["story_id"],
-        }
-
-    raise ValueError(f"unknown decision: {out.decision!r}")
-
-
 @activity.defn
-async def code_quality_stage(state: dict) -> dict:
-    """Run the Code Quality reviewer and surface its gate summary."""
+async def reviewer_stage(state: dict) -> dict:
+    """Run the Reviewer and surface its gate summary."""
     _stamp_temporal_activity_attrs()
-    _heartbeat("code_quality: starting")
-    from darkfactory.agents.code_quality import run_code_quality
+    _heartbeat("reviewer: starting")
+    from darkfactory.agents.reviewer import run_reviewer
 
-    result = await run_code_quality(state)
+    result = await run_reviewer(state)
     return {"review_decision": result.model_dump()}
+
+
+@activity.defn(name="code_quality_stage")
+async def code_quality_stage(state: dict) -> dict:
+    """Compatibility alias for historical Temporal activity name."""
+    return await reviewer_stage(state)
 
 
 @activity.defn
@@ -2088,7 +2110,8 @@ STAGE_ACTIVITIES: tuple = (
     discovery_stage,
     build_stage,
     verify_stage,
-    spec_adjustment_stage,
+    fixer_stage,
+    reviewer_stage,
     code_quality_stage,
     pr_creator_stage,
     merge_branch,

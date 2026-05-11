@@ -1,71 +1,112 @@
 """Product Owner — SDK-driven discovery role.
 
-Translates a user request plus repo context into a list of user stories.
-No tools, no MCP servers; reasoning-only role with structured output.
+Reasoning-only role that translates a user request plus repo context into
+a dict of brief-intent fields and user stories. The output shape is
+defined by ``schemas/po_output.json`` (canonical, hand-edited) and
+enforced by the SDK's ``output_format``; this module does not declare a
+Pydantic schema.
+
+Two transforms are applied to the structured output:
+
+- ``_normalize_legacy_aliases`` accepts pre-v2 keys (``acceptance_criteria``,
+  ``risks``, ``assumptions``) and maps them onto the v2 field names. The
+  shim stays until every legacy caller is migrated (per CLAUDE.md).
+- ``_derive_expected_behavior_from_stories`` populates ``expected_behavior``
+  from ``stories[].acceptance_criteria`` when the model left it empty.
+
+``_ensure_defaults`` backfills optional fields so downstream consumers
+always see the full POOutput shape.
 """
 from __future__ import annotations
 
-from claude_agent_sdk import ClaudeSDKClient, HookMatcher
-from pydantic import BaseModel, Field
+from string import Template
+from typing import Any
 
-from darkfactory.agents._sdk_common import (
-    load_prompt,
-    repo_summary,
-    run_to_completion,
-)
-from darkfactory.hooks.call_cap import make_call_cap
-from darkfactory.hooks.goal_pin import make_goal_pin
-from darkfactory.hooks.loop_breaker import make_loop_breaker
-from darkfactory.llm_factory import build_options
+from darkfactory.agents._sdk_common import ParseError, _drain, repo_summary
+from darkfactory.agents.compose import ComposeState, compose
+from darkfactory.agents.registry import get_default_registry, resolve_prompt_path
 
-
-class UserStoryModel(BaseModel):
-    id: str = Field(description="Stable id like US-1.")
-    title: str
-    as_a: str
-    i_want: str
-    so_that: str
-    acceptance_criteria: list[str] = Field(default_factory=list)
+_LEGACY_ALIASES: dict[str, str] = {
+    "acceptance_criteria": "expected_behavior",
+    "risks": "compatibility_risks",
+    "assumptions": "open_assumptions",
+}
 
 
-class POOutput(BaseModel):
-    """Product Owner output: a list of user stories."""
+def _normalize_legacy_aliases(data: dict[str, Any]) -> dict[str, Any]:
+    out = dict(data)
+    for legacy_key, v2_key in _LEGACY_ALIASES.items():
+        if legacy_key in out and v2_key not in out:
+            out[v2_key] = out[legacy_key]
+    return out
 
-    stories: list[UserStoryModel] = Field(default_factory=list)
+
+def _derive_expected_behavior_from_stories(data: dict[str, Any]) -> dict[str, Any]:
+    if data.get("expected_behavior"):
+        return data
+    out = dict(data)
+    derived: list[str] = []
+    for story in out.get("stories") or []:
+        if isinstance(story, dict):
+            derived.extend(story.get("acceptance_criteria") or [])
+    out["expected_behavior"] = derived
+    return out
 
 
-def _user_message(state_slice: dict) -> str:
-    user_request = state_slice.get("user_request", "") or ""
-    ctx_blob = repo_summary(state_slice.get("repo_context"))
-    return (
-        f"User request:\n{user_request}\n\n"
-        f"Repo context:\n{ctx_blob}\n\n"
-        "Produce user stories."
+def _ensure_defaults(data: dict[str, Any]) -> dict[str, Any]:
+    out = dict(data)
+    out.setdefault("problem", "")
+    out.setdefault("expected_behavior", [])
+    out.setdefault("compatibility_risks", [])
+    out.setdefault("open_assumptions", [])
+    out.setdefault("stories", [])
+    return out
+
+
+def normalize_po_output(raw: dict[str, Any]) -> dict[str, Any]:
+    """Public entry-point for legacy-alias + derive transforms.
+
+    Exposed so tests can exercise the shim layer without driving an SDK
+    client.
+    """
+    return _ensure_defaults(
+        _derive_expected_behavior_from_stories(_normalize_legacy_aliases(raw))
     )
 
 
-def make_po_client(state_slice: dict) -> ClaudeSDKClient:
-    user_request = state_slice.get("user_request", "") or ""
-    options = build_options(
+def _planning_feedback_text(state_slice: dict) -> str:
+    feedback = [
+        str(item)
+        for item in state_slice.get("planning_feedback") or []
+        if item
+    ]
+    if not feedback:
+        return "(none)"
+    return "\n".join(f"- {item}" for item in feedback)
+
+
+def _render_user_prompt(state_slice: dict) -> str:
+    manifest = get_default_registry().get("po")
+    template_text = resolve_prompt_path(manifest.llm.prompt_path).read_text(
+        encoding="utf-8"
+    )
+    return Template(template_text).safe_substitute(
+        user_request=state_slice.get("user_request", "") or "",
+        repo_context=repo_summary(state_slice.get("repo_context")),
+        planning_feedback=_planning_feedback_text(state_slice),
+    )
+
+
+async def run_po(state_slice: dict) -> dict[str, Any]:
+    compose_state = ComposeState.from_mapping(state_slice)
+    rendered = _render_user_prompt(state_slice)
+    async with compose(
         "po",
-        system_prompt=load_prompt("po"),
-        allowed_tools=[],
-        hooks={
-            "PreToolUse": [
-                HookMatcher(hooks=[make_loop_breaker(), make_call_cap()]),
-            ],
-            "UserPromptSubmit": [
-                HookMatcher(hooks=[make_goal_pin(user_request)]),
-            ],
-        },
-        mcp_servers={},
-    )
-    return ClaudeSDKClient(options=options)
-
-
-async def run_po(state_slice: dict) -> POOutput:
-    async with make_po_client(state_slice) as client:
-        await client.query(_user_message(state_slice))
-        result = await run_to_completion(client, expect=POOutput)
-        assert isinstance(result, POOutput)
-        return result
+        compose_state,
+        task_id=compose_state.task_id,
+    ) as client:
+        await client.query(rendered)
+        _text, structured, _result = await _drain(client)
+    if structured is None:
+        raise ParseError("PO emitted no structured output")
+    return normalize_po_output(structured)

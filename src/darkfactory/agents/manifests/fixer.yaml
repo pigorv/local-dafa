@@ -1,0 +1,97 @@
+identity:
+  role: fixer
+  description: >-
+    Bounded-repair role invoked when the verifier reports failing
+    diagnostics. Reads the approved Implementation Brief and the verifier's
+    ``predicate_coverage`` plus tester findings, then either patches code to
+    cover the failing predicates (``decision: fixed``), escalates back to
+    the brief gate (``decision: needs_brief_change``), or surrenders the
+    loop (``decision: cannot_fix``). Never widens scope beyond the failing
+    diagnostics; per-WP + per-predicate budgets cap repair attempts.
+  when_to_use: >-
+    After ``verify_stage`` returns a non-passing ``VerifySummary``, inside
+    the workflow's fixer/verify loop, until the budget cap is reached or
+    the fixer escalates.
+
+llm:
+  model: claude-sonnet-4-5-20250929
+  temperature: 0.1
+  thinking:
+    enabled: false
+  prompt_path: prompts/fixer.md
+
+tools:
+  allowed:
+    - Read
+    - Write
+    - Edit
+    - Grep
+    - Glob
+    - Bash
+    - sandbox_bash
+  disallowed: []
+  argv_allowlist:
+    - mvn
+    - gradle
+    - ./gradlew
+    - git
+    - cat
+    - ls
+  role_owned_argv_prefixes: []
+  edit_path_allowlist: []
+
+mcp:
+  - darkfactory
+
+hooks:
+  - event: PreToolUse
+    name: loop_breaker
+    parameters: {}
+  - event: PreToolUse
+    name: call_cap
+    parameters: {}
+  - event: PreToolUse
+    name: heartbeat
+    parameters:
+      detail: "fixer: pre tool"
+  - event: PostToolUse
+    name: diff_capture
+    parameters:
+      edit_kind: fixer
+      justification_template: "{patch_justification}"
+  - event: PostToolUse
+    name: prompt_injection_guard
+    parameters: {}
+  - event: PostToolUse
+    name: heartbeat
+    parameters:
+      detail: "fixer: post tool"
+  - event: UserPromptSubmit
+    name: goal_pin
+    parameters: {}
+  - event: Stop
+    name: heartbeat
+    parameters:
+      detail: "fixer: turn boundary"
+
+budgets:
+  retry_caps: {}
+
+io_contract:
+  reads:
+    - user_request
+    - task_id
+    - wf_id
+    - current_slice
+    - implementation_brief
+    - spec
+    - test_results
+    - findings
+    - tester_findings
+    - review_decision
+    - verify_summary
+    - patches
+    - repo_context
+  writes:
+    - patches
+    - fixer_decision

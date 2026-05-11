@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+from hashlib import sha256
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import yaml
 
-from darkfactory.cli import build_parser, run_command, schedule_command
+from darkfactory.cli import build_parser, roles_command, run_command, schedule_command
 from darkfactory.runtime import schedule_admin
 from darkfactory.runtime.workflow import DarkFactoryWorkflow
 from darkfactory.state import RunRequest, RunResult
@@ -203,6 +205,126 @@ def test_schedule_install_errors_when_repo_missing(monkeypatch):
         asyncio.run(schedule_command(args))
 
     install.assert_not_awaited()
+
+
+def _write_minimal_manifest(
+    manifests_dir: Path,
+    *,
+    role: str = "noop",
+    hooks: list[dict] | None = None,
+    mcp: list[str] | None = None,
+    allowed: list[str] | None = None,
+) -> tuple[Path, Path]:
+    prompt = manifests_dir / f"{role}.md"
+    prompt.write_text(f"{role} system prompt", encoding="utf-8")
+    payload = {
+        "identity": {
+            "role": role,
+            "description": f"{role} role for CLI tests.",
+            "when_to_use": "CLI fixture only.",
+        },
+        "llm": {
+            "model": "claude-sonnet-4-5-20250929",
+            "temperature": 0.0,
+            "thinking": {"enabled": False},
+            "prompt_path": str(prompt),
+        },
+        "tools": {
+            "allowed": allowed or [],
+            "disallowed": [],
+            "argv_allowlist": [],
+            "role_owned_argv_prefixes": [],
+            "edit_path_allowlist": [],
+        },
+        "mcp": mcp or [],
+        "hooks": hooks or [],
+        "budgets": {
+            "timeout": None,
+            "heartbeat": None,
+            "retry_caps": {},
+        },
+        "io_contract": {
+            "reads": [],
+            "writes": [],
+        },
+    }
+    manifest_path = manifests_dir / f"{role}.yaml"
+    manifest_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    return manifest_path, prompt
+
+
+def test_roles_list_with_zero_manifests_prints_sentinel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+):
+    monkeypatch.setattr("darkfactory.cli.DEFAULT_MANIFESTS_DIR", tmp_path)
+    args = _parse(["roles", "list"])
+
+    rc = roles_command(args)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.strip() == "0 roles registered (migration not started)"
+
+
+def test_roles_list_prints_summary_fields_for_each_role(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+):
+    manifest_path, prompt_path = _write_minimal_manifest(
+        tmp_path,
+        role="architect",
+        hooks=[
+            {"event": "PreToolUse", "name": "call_cap", "parameters": {"cap": 1}},
+            {"event": "PreToolUse", "name": "loop_breaker", "parameters": {}},
+        ],
+        mcp=["darkfactory"],
+        allowed=["Read", "Edit", "Write"],
+    )
+    monkeypatch.setattr("darkfactory.cli.DEFAULT_MANIFESTS_DIR", tmp_path)
+    args = _parse(["roles", "list"])
+
+    rc = roles_command(args)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "role: architect" in out
+    assert "model: claude-sonnet-4-5-20250929" in out
+    assert f"prompt: {prompt_path}" in out
+    assert "allowed_tools: 3" in out
+    assert "hooks: call_cap, loop_breaker" in out
+    assert "mcp: darkfactory" in out
+    assert (
+        f"manifest_sha: {sha256(manifest_path.read_bytes()).hexdigest()}"
+        in out
+    )
+    assert (
+        f"prompt_sha: {sha256(prompt_path.read_bytes()).hexdigest()}"
+        in out
+    )
+
+
+def test_roles_list_orders_roles_alphabetically_and_separates_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+):
+    _write_minimal_manifest(tmp_path, role="zeta")
+    _write_minimal_manifest(tmp_path, role="alpha")
+    monkeypatch.setattr("darkfactory.cli.DEFAULT_MANIFESTS_DIR", tmp_path)
+    args = _parse(["roles", "list"])
+
+    rc = roles_command(args)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    alpha_idx = out.index("role: alpha")
+    zeta_idx = out.index("role: zeta")
+    assert alpha_idx < zeta_idx
+    # blank line between the two blocks
+    assert "\n\nrole: zeta" in out
 
 
 def test_schedule_pause_derives_schedule_id_from_repo():

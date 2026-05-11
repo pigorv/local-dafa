@@ -1,0 +1,55 @@
+identity:
+  role: verifier_semantic
+  description: >-
+    Reasoning-only semantic verifier role that maps every Work Package
+    verification predicate to a coverage status (covered, uncovered,
+    weakly_covered) with evidence pulled from tester output and
+    mechanical findings.
+  when_to_use: >-
+    Inside the verify subgraph after the mechanical build/test sweep,
+    before the fixer loop. Consumes the implementation brief, tester
+    coverage entries, test results, and findings; emits the
+    predicate_coverage map the fixer-budget logic depends on.
+
+llm:
+  model: claude-sonnet-4-5-20250929
+  temperature: 0.0
+  thinking:
+    enabled: false
+  prompt_path: prompts/verifier_semantic.md
+
+tools:
+  allowed: []
+  disallowed: []
+  argv_allowlist: []
+  role_owned_argv_prefixes: []
+  edit_path_allowlist: []
+
+mcp: []
+
+hooks:
+  - event: PreToolUse
+    name: loop_breaker
+    parameters: {}
+  - event: PreToolUse
+    name: call_cap
+    parameters: {}
+  - event: UserPromptSubmit
+    name: goal_pin
+    parameters: {}
+
+budgets:
+  retry_caps: {}
+
+io_contract:
+  reads:
+    - implementation_brief
+    - spec
+    - coverage_entries
+    - test_results
+    - findings
+    - tester_findings
+    - test_files
+    - user_request
+  writes:
+    - predicate_coverage
