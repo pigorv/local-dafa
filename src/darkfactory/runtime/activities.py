@@ -961,6 +961,20 @@ def _clone_repo_into_workspace(container: Any, repo_url: str) -> None:
     Used when no host-side checkout exists (issue-triggered runs). The worker
     image already has `gh`, `git`, and the orchestrator-injected GITHUB_TOKEN.
     """
+    # `gh repo clone` shells out to `git clone`, which needs a credential
+    # helper to consume the gh token — otherwise git prompts for a username
+    # on stdin and the clone aborts with "could not read Username".
+    setup = container.exec_run(
+        ["gh", "auth", "setup-git"],
+        workdir="/",
+        user="agent",
+    )
+    setup_rc = _container_exec_returncode(setup)
+    if setup_rc != 0:
+        output = getattr(setup, "output", b"") or b""
+        raise RuntimeError(
+            f"gh auth setup-git failed (rc={setup_rc}, output={output!r})"
+        )
     result = container.exec_run(
         ["gh", "repo", "clone", repo_url, "/workspace"],
         workdir="/",
