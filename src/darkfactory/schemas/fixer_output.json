@@ -1,0 +1,55 @@
+{
+  "type": "object",
+  "title": "FixerDecision",
+  "description": "Fixer decision plus traceability fields. The repair patches themselves are computed deterministically by the activity from `git diff` after the Fixer runs; you declare the edits you intend in the `edits` field so the reconciliation step can compare claim against ground truth. Place these fields directly as the tool input — no outer wrapper.",
+  "additionalProperties": false,
+  "required": ["decision", "target_wp", "summary", "reason"],
+  "properties": {
+    "decision": {
+      "type": "string",
+      "enum": ["fixed", "needs_brief_change", "cannot_fix"],
+      "description": "fixed: the failure is within the approved brief and your edits repair the failing mechanical diagnostic, semantic predicate, Tester finding, or Reviewer finding. needs_brief_change: the accepted behavior is contradictory, missing, untestable, or would require new scope beyond the approved brief — escalates to the human brief gate. cannot_fix: the brief is valid but you cannot safely repair the issue with the available tools or context — escalates the run to a human."
+    },
+    "target_wp": {
+      "type": "string",
+      "description": "Stable Work Package id (e.g. 'WP-1') the repair (or escalation) is scoped to. Use the WP id from the failing predicate_coverage entry or tester_finding."
+    },
+    "target_predicates": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Verbatim verification predicates from the failing predicate_coverage entries this run addressed. Empty when no semantic predicate failure drove the decision (e.g. pure mechanical diagnostic or Reviewer finding)."
+    },
+    "edits": {
+      "type": "array",
+      "description": "One entry per file you created, modified, or deleted in this turn. Empty when `decision` is `needs_brief_change` or `cannot_fix` (no repair edits attempted).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "operation", "intent"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Repository-relative path."
+          },
+          "operation": {
+            "type": "string",
+            "enum": ["create", "modify", "delete"],
+            "description": "create: new file. modify: existing file changed. delete: file removed."
+          },
+          "intent": {
+            "type": "string",
+            "description": "One short sentence: which failing diagnostic this edit repairs."
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "string",
+      "description": "Up to four sentences describing what was changed (for 'fixed') or why repair was not possible (for 'needs_brief_change' / 'cannot_fix'). Reference the failing diagnostic the decision addressed."
+    },
+    "reason": {
+      "type": "string",
+      "description": "One or two sentences justifying the decision against the approved brief and the failing diagnostic. For 'needs_brief_change' explain what the brief is missing or contradicting; for 'cannot_fix' explain the blocker."
+    }
+  }
+}

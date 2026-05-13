@@ -99,7 +99,6 @@ def test_path_guard_is_registered_for_edit_capable_sdk_options() -> None:
     options = build_options(
         "builder",
         model="claude-sonnet-4-5-20250929",
-        temperature=0.1,
         thinking=False,
         system_prompt="x",
         allowed_tools=["Read", "Edit"],
@@ -118,7 +117,6 @@ def test_path_guard_is_not_registered_for_read_only_sdk_options() -> None:
     options = build_options(
         "pr_creator",
         model="claude-haiku-4-5-20251001",
-        temperature=0.1,
         thinking=False,
         system_prompt="x",
         allowed_tools=["Read", "Grep", "Glob"],

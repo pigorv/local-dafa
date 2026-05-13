@@ -9,7 +9,6 @@ identity:
 
 llm:
   model: claude-sonnet-4-5-20250929
-  temperature: 0.3
   thinking:
     enabled: false
   prompt_path: prompts/architect.md
@@ -38,12 +37,27 @@ hooks:
   - event: PreToolUse
     name: call_cap
     parameters: {}
+  - event: PreToolUse
+    name: heartbeat
+    parameters:
+      detail: "architect: pre tool"
   - event: UserPromptSubmit
     name: goal_pin
     parameters: {}
   - event: PostToolUse
     name: prompt_injection_guard
     parameters: {}
+  - event: PostToolUse
+    name: structured_output_hint
+    parameters: {}
+  - event: PostToolUse
+    name: heartbeat
+    parameters:
+      detail: "architect: post tool"
+  - event: Stop
+    name: heartbeat
+    parameters:
+      detail: "architect: turn boundary"
 
 budgets:
   retry_caps: {}

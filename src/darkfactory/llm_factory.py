@@ -99,7 +99,6 @@ def build_options(
     role: str,
     *,
     model: str,
-    temperature: float,
     thinking: bool,
     thinking_budget_tokens: int = _DEFAULT_THINKING_BUDGET_TOKENS,
     system_prompt: str,
@@ -113,24 +112,16 @@ def build_options(
 ) -> ClaudeAgentOptions:
     """Per-role ClaudeAgentOptions with env overrides and path-guard wiring.
 
-    Caller supplies the manifest-derived ``model``/``temperature``/``thinking``
-    knobs explicitly; this function only layers ``LLM_<ROLE>_<KEY>`` env-var
+    Caller supplies the manifest-derived ``model``/``thinking`` knobs
+    explicitly; this function only layers ``LLM_<ROLE>_<KEY>`` env-var
     overrides on top, attaches the path guard for edit-capable roles, and
     stamps the OTel resource attributes the otel-collector needs to coalesce
     orphan ``claude_code.*`` spans. Always sets ``setting_sources=[]`` for
     hermetic runs.
-
-    Temperature is attached to the returned options as a ``temperature``
-    attribute. The Claude Agent SDK does not expose a temperature parameter
-    on ``ClaudeAgentOptions``, but the harness treats it as a per-role knob;
-    keep it accessible so callers and tests can inspect or forward it.
     """
     raw_model = _env(role, "MODEL")
     if raw_model:
         model = raw_model
-    raw_temp = _env(role, "TEMPERATURE")
-    if raw_temp is not None:
-        temperature = float(raw_temp)
     raw_thinking = _env(role, "THINKING")
     if raw_thinking is not None:
         thinking = raw_thinking.lower() in ("on", "true", "1", "yes")
@@ -171,5 +162,4 @@ def build_options(
         permission_mode="bypassPermissions",
         output_format=output_format,
     )
-    options.temperature = temperature
     return options

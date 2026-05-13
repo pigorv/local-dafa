@@ -185,8 +185,17 @@ def test_plan_critic_client_options_are_hermetic_and_no_tool() -> None:
     assert opts.output_format is not None
     assert opts.output_format["type"] == "json_schema"
     # Plan critic is single-turn with zero tools: PreToolUse / per-N-prompt
-    # hooks could never fire, so the manifest carries no hook attachments.
-    assert opts.hooks == {}
+    # hooks could never fire. PostToolUse fires only for the synthetic
+    # StructuredOutput tool, and Stop fires once at the turn boundary.
+    assert "PreToolUse" not in opts.hooks
+    assert "UserPromptSubmit" not in opts.hooks
+    post_hook_names = [
+        hook.__name__
+        for matcher in opts.hooks.get("PostToolUse") or []
+        for hook in matcher.hooks
+    ]
+    assert post_hook_names == ["structured_output_hint_hook"]
+    assert "Stop" in opts.hooks
 
 
 # ---------- run_<role>: structured-output round-trips ----------

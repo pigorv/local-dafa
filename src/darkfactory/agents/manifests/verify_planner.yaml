@@ -1,0 +1,67 @@
+identity:
+  role: verify_planner
+  description: >-
+    Reasoning-only discovery role that reads the target repository and
+    emits a language-agnostic VerificationPlan listing the project's
+    canonical test / compile / lint commands plus report-file globs the
+    verifier should parse.
+  when_to_use: >-
+    Inside the verify subgraph, once per workflow, before the first
+    run_plan execution. The resulting plan is cached on
+    PipelineState.verification_plan and reused for every subsequent
+    verify iteration.
+
+llm:
+  model: claude-haiku-4-5-20251001
+  thinking:
+    enabled: false
+  prompt_path: prompts/verify_planner.md
+  prompt_as_user_message: true
+  structured_output: schemas/verify_planner_output.json
+
+tools:
+  allowed:
+    - Read
+    - Grep
+    - Glob
+  disallowed:
+    - Bash
+    - Edit
+    - Write
+  argv_allowlist: []
+  role_owned_argv_prefixes: []
+  edit_path_allowlist: []
+
+mcp: []
+
+hooks:
+  - event: PreToolUse
+    name: loop_breaker
+    parameters: {}
+  - event: PreToolUse
+    name: call_cap
+    parameters: {}
+  - event: PreToolUse
+    name: heartbeat
+    parameters:
+      detail: "verify_planner: pre tool"
+  - event: UserPromptSubmit
+    name: goal_pin
+    parameters: {}
+  - event: PostToolUse
+    name: prompt_injection_guard
+    parameters: {}
+  - event: PostToolUse
+    name: structured_output_hint
+    parameters: {}
+  - event: PostToolUse
+    name: heartbeat
+    parameters:
+      detail: "verify_planner: post tool"
+  - event: Stop
+    name: heartbeat
+    parameters:
+      detail: "verify_planner: turn boundary"
+
+budgets:
+  retry_caps: {}

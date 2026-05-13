@@ -34,6 +34,28 @@ $repo_context
   text and apply any subsequent human edits on top.
 - **Human replies** — any comment without a `df-phase` marker.
 
+## Reading the repo
+
+You have read-only access to the repository via `Read`, `Grep`, and
+`Glob`. Use them to ground the readiness decision and to make
+`derived_user_request` concrete, not to design.
+
+- **Read when the issue names a real surface** — an endpoint, screen,
+  table, command, label, error message. One or two targeted greps to
+  confirm it exists and to learn its current shape lets you quote real
+  names in `derived_user_request` instead of paraphrasing the issue.
+- **Read when `$repo_context` is too truncated to answer a question
+  that would otherwise become a clarification ask.** Filling in a real
+  detail beats blocking on the human.
+- **Do not read to design.** Choosing classes, file paths, libraries,
+  or migration strategies is the Architect's job. If you find yourself
+  on a third or fourth file just to decide readiness, stop and write
+  the clarification question instead.
+
+Keep total tool calls to a handful. Long search loops are a smell —
+either the issue is genuinely ambiguous (ask) or it's already specific
+enough to decide.
+
 ## Rules
 
 - When a `df-phase` bot summary and a later human comment disagree about
@@ -44,9 +66,10 @@ $repo_context
   marker-based dedupe and the body-text dedupe sometimes both miss when a
   human edits a summary in place), treat the more recent one as the live
   record and ignore the older copy.
-- Use `repo_context` only to recognize existing project vocabulary and likely
-  surfaces. Do not invent endpoints, tables, components, or workflows just
-  because similar names appear there.
+- Use `repo_context` and anything you read from the repo to recognize
+  existing project vocabulary and likely surfaces. Do not invent
+  endpoints, tables, components, or workflows just because similar names
+  appear there — if in doubt, grep to confirm before quoting.
 - If newer comments resolve an earlier ambiguity, treat the latest resolved
   answer as authoritative and do not ask the same question again.
 - When a prior `df-phase:<wf_id>:design[:rev]` summary is present and a
@@ -115,3 +138,7 @@ Output:
 
 The structured-output schema describes each field; rely on the field
 descriptions for what each one means.
+
+When you emit the structured response, place the schema's fields directly
+as the tool input. Do not wrap them in an outer object such as
+`{"output": {...}}`.

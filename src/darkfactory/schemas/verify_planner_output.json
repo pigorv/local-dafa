@@ -1,0 +1,112 @@
+{
+  "type": "object",
+  "title": "VerificationPlan",
+  "description": "Verification plan for the target repository: the test, compile, lint, and notes fields below. Place these fields directly as the tool input — no outer wrapper. Omit any step the repo does not support (e.g. omit 'compile' for an interpreted-only project).",
+  "additionalProperties": false,
+  "properties": {
+    "test": {
+      "type": "object",
+      "description": "Single command that runs the project's test suite. Prefer an invocation that emits JUnit-XML reports — declare the resulting report glob(s) in 'report_paths' with report_kind='junit-xml'.",
+      "additionalProperties": false,
+      "required": ["name", "argv"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Stable label for this step, e.g. 'test'."
+        },
+        "argv": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "description": "Exact argv passed to the sandbox. No shell metacharacters. Avoid log-suppressing flags that strip report-emitter output (e.g. mvn -q)."
+        },
+        "report_paths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Optional globs (relative to repo root) that match report files this command produces. Strongly prefer commands that emit reports — they give the verifier per-test counts and findings instead of just an exit code."
+        },
+        "report_kind": {
+          "type": "string",
+          "enum": ["junit-xml", "checkstyle-xml", "sarif"],
+          "description": "Format of the files matched by 'report_paths'. Required when 'report_paths' is non-empty."
+        },
+        "required": {
+          "type": "boolean",
+          "description": "Whether a non-zero exit code with no parsed report should fail the verify gate. Default true."
+        },
+        "timeout_s": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Per-step timeout in seconds. Default 600."
+        }
+      }
+    },
+    "compile": {
+      "type": "object",
+      "description": "Optional compile / type-check step run separately from tests. Use for compiled languages where a clean compile is itself a verification signal (Java javac, TypeScript tsc --noEmit, Go vet). Omit for projects without a meaningful compile step (e.g. pure Python).",
+      "additionalProperties": false,
+      "required": ["name", "argv"],
+      "properties": {
+        "name": { "type": "string" },
+        "argv": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1
+        },
+        "report_paths": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "report_kind": {
+          "type": "string",
+          "enum": ["junit-xml", "checkstyle-xml", "sarif"]
+        },
+        "required": { "type": "boolean" },
+        "timeout_s": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "lint": {
+      "type": "array",
+      "description": "Zero or more lint / static-analysis steps. Each step is independent and runs in declaration order. Prefer SARIF or Checkstyle XML output where the linter supports it.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "argv"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Stable label, e.g. 'checkstyle', 'eslint', 'mypy', 'ruff'."
+          },
+          "argv": {
+            "type": "array",
+            "items": { "type": "string" },
+            "minItems": 1
+          },
+          "report_paths": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "report_kind": {
+            "type": "string",
+            "enum": ["junit-xml", "checkstyle-xml", "sarif"]
+          },
+          "required": {
+            "type": "boolean",
+            "description": "Default true. Set false for advisory-only checks the gate should not block on."
+          },
+          "timeout_s": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      }
+    },
+    "notes": {
+      "type": "string",
+      "description": "Free text the planner wants downstream consumers to see — caveats, missing flags the planner could not configure, repos where a category genuinely has no canonical command."
+    }
+  }
+}

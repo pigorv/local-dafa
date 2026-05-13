@@ -1,0 +1,51 @@
+{
+  "type": "object",
+  "title": "BuilderReport",
+  "description": "Builder report describing the outcome of one Work Package implementation turn. Place these fields directly as the tool input — no outer wrapper.",
+  "additionalProperties": false,
+  "required": ["wp_id", "status", "edits", "blockers", "summary"],
+  "properties": {
+    "wp_id": {
+      "type": "string",
+      "description": "The Work Package's story_id (the same id used in the input Work Package JSON)."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["done", "no_changes_needed", "blocked"],
+      "description": "done: edits were made (or attempted) that should satisfy the Work Package's verification predicates. no_changes_needed: the repository already satisfies the WP — no edits required. blocked: you could not complete the WP (unclear brief, missing authorization, infeasible predicate, etc.) — populate `blockers` with one entry per reason."
+    },
+    "edits": {
+      "type": "array",
+      "description": "One entry per file you created, modified, or deleted in this turn. Empty when status is `no_changes_needed` or `blocked` with zero attempted edits.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "operation", "intent"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Repository-relative path (e.g. 'src/main/java/com/example/users/Order.java')."
+          },
+          "operation": {
+            "type": "string",
+            "enum": ["create", "modify", "delete"],
+            "description": "create: new file. modify: existing file changed. delete: file removed."
+          },
+          "intent": {
+            "type": "string",
+            "description": "One short sentence explaining what this edit accomplishes and which brief or WP element it traces to."
+          }
+        }
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "description": "Required when status is `blocked`. One sentence per blocker — what stopped you, and what authorization or clarification would unblock the WP. Empty list when status is not `blocked`.",
+      "items": { "type": "string" }
+    },
+    "summary": {
+      "type": "string",
+      "description": "Up to four sentences describing what you changed and why. The diff is the primary record — keep prose minimal."
+    }
+  }
+}

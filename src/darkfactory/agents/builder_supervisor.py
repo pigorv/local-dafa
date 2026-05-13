@@ -73,6 +73,32 @@ def _slice_has_worker_patch(
     )
 
 
+def _slice_has_builder_run(state: PipelineState, slice_id: str) -> bool:
+    """Did the Builder produce a structured output for this slice?
+
+    PR B: the Builder no longer emits a ``(worker-completion)`` sentinel
+    patch when it makes no edits, so the supervisor advances on the
+    Builder's declared structured output (any status — ``done``,
+    ``no_changes_needed``, ``blocked``) rather than on patch presence.
+    """
+    return any(
+        out.get("wp_id") == slice_id
+        for out in (state.get("builder_outputs") or [])
+    )
+
+
+def _slice_has_tester_run(state: PipelineState, slice_id: str) -> bool:
+    """Did the Tester produce a structured output for this slice?
+
+    PR C: same migration as Builder — Tester no longer emits a sentinel
+    patch, so supervisor advancement reads ``tester_outputs`` instead.
+    """
+    return any(
+        out.get("wp_id") == slice_id
+        for out in (state.get("tester_outputs") or [])
+    )
+
+
 def _next_worker_for_slice(
     state: PipelineState,
     slice_: WorkPackageDict,
@@ -80,11 +106,16 @@ def _next_worker_for_slice(
     """Return the next v2 build-stage worker needed for one slice."""
     slice_id = slice_["story_id"]
     implementation_worker = route_slice(slice_)
-    if not _slice_has_worker_patch(state, slice_id, implementation_worker):
+    if implementation_worker == "builder":
+        if not _slice_has_builder_run(state, slice_id):
+            return "builder"
+    elif not _slice_has_worker_patch(
+        state, slice_id, implementation_worker
+    ):
         return implementation_worker
     if implementation_worker == "frontend":
         return None
-    if not _slice_has_worker_patch(state, slice_id, "tester"):
+    if not _slice_has_tester_run(state, slice_id):
         return "tester"
     return None
 

@@ -4,10 +4,11 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import pytest
-from claude_agent_sdk import HookMatcher
+from claude_agent_sdk import ClaudeSDKClient, HookMatcher
 from claude_agent_sdk.types import (
     AssistantMessage,
     PermissionResultAllow,
@@ -15,26 +16,14 @@ from claude_agent_sdk.types import (
     ResultMessage,
     TextBlock,
     ToolPermissionContext,
+    ToolUseBlock,
 )
-from pydantic import ValidationError
-
-from claude_agent_sdk import ClaudeSDKClient
 
 from darkfactory.agents import fixer as fixer_mod
-from darkfactory.agents._sdk_common import load_prompt
+from darkfactory.agents._sdk_common import load_prompt, render_role_user_message
 from darkfactory.agents.compose import ComposeState, compose
-from darkfactory.agents.fixer import FixerOutput, run_fixer
+from darkfactory.agents.fixer import run_fixer
 from darkfactory.agents.registry import get_default_registry
-
-
-# Matches the canonical worker allowlist; kept inline so the test fails loud
-# if the manifest's allowed-tools list drifts from ARCHITECTURE.md §5.5.
-ALLOWED_TOOLS: list[str] = ["Read", "Write", "Edit", "Grep", "Glob", "Bash", "sandbox_bash"]
-
-
-def _fixer_client(state_slice: dict) -> ClaudeSDKClient:
-    state = ComposeState.from_mapping(state_slice)
-    return compose("fixer", state, task_id=state.task_id)
 from darkfactory.runtime.workflow import (
     FIXER_MAX_ATTEMPTS,
     _fixer_budget_exhaustion,
@@ -50,8 +39,34 @@ from darkfactory.state import (
 )
 
 
+# Matches the canonical worker allowlist; kept inline so the test fails loud
+# if the manifest's allowed-tools list drifts. Fixer mirrors Builder/Tester:
+# built-in Bash with a pure denylist, no sandbox_bash, no MCP.
+ALLOWED_TOOLS: list[str] = ["Read", "Write", "Edit", "Grep", "Glob", "Bash"]
+FIXER_DENYLIST: tuple[tuple[str, ...], ...] = (("git", "push"),)
+
+
+def _fixer_client(state_slice: dict) -> ClaudeSDKClient:
+    state = ComposeState.from_mapping(state_slice)
+    return compose("fixer", state, task_id=state.task_id)
+
+
 def _assistant(text: str) -> AssistantMessage:
     return AssistantMessage(content=[TextBlock(text=text)], model="fake-model")
+
+
+def _structured_assistant(payload: dict) -> AssistantMessage:
+    """An assistant turn that emits the SDK's synthetic StructuredOutput tool."""
+    return AssistantMessage(
+        content=[
+            ToolUseBlock(
+                id="toolu_fixer_1",
+                name="StructuredOutput",
+                input=payload,
+            )
+        ],
+        model="fake-model",
+    )
 
 
 def _result() -> ResultMessage:
@@ -67,20 +82,11 @@ def _result() -> ResultMessage:
 
 
 class _FakeClient:
-    def __init__(
-        self,
-        responses: list[list[Any]],
-        seeded_sink: list[dict[str, Any]] | None = None,
-        patches_sink: list[dict[str, Any]] | None = None,
-    ) -> None:
+    def __init__(self, responses: list[list[Any]]) -> None:
         self._responses = list(responses)
-        self._seeded_sink = list(seeded_sink or [])
-        self._patches_sink = patches_sink
         self.queries: list[str] = []
 
     async def __aenter__(self) -> "_FakeClient":
-        if self._patches_sink is not None:
-            self._patches_sink.extend(self._seeded_sink)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:  # noqa: ANN001
@@ -103,7 +109,6 @@ class _FakeClient:
 
 def _patch_client(monkeypatch: pytest.MonkeyPatch, fake: _FakeClient) -> None:
     def _compose(role: str, compose_state: Any, **_kwargs: Any) -> _FakeClient:
-        fake._patches_sink = compose_state.patches_sink
         return fake
 
     monkeypatch.setattr(fixer_mod, "compose", _compose)
@@ -216,26 +221,43 @@ def test_fixer_client_options_are_tool_using_and_hermetic() -> None:
     opts = client.options
     assert opts is not None
 
+    # Fixer mirrors Builder/Tester's shell pattern: built-in ``Bash`` with a
+    # pure denylist (no ``sandbox_bash``, no ``darkfactory`` MCP server).
     assert opts.setting_sources == []
     assert opts.allowed_tools == ALLOWED_TOOLS
-    assert "Bash" in opts.allowed_tools  # built-in Bash enabled for the Fixer
+    assert "Bash" in opts.allowed_tools
+    assert "sandbox_bash" not in opts.allowed_tools
     assert opts.cwd == "/workspace"
-    assert "darkfactory" in opts.mcp_servers
+    assert "darkfactory" not in opts.mcp_servers
+
+    # Bash + non-empty argv_denylist → gate is installed even though the
+    # allowlist is empty.
     assert callable(opts.can_use_tool)
+
     assert opts.model == "claude-sonnet-4-5-20250929"
-    assert opts.temperature == 0.1
     assert opts.thinking is not None
     assert opts.thinking["type"] == "disabled"
-    manifest_allowlist = frozenset(
-        get_default_registry().get("fixer").tools.argv_allowlist
-    )
-    assert manifest_allowlist == frozenset(
-        {"mvn", "gradle", "./gradlew", "git", "cat", "ls"}
-    )
 
-    for event in ("PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop"):
+    # Schema-driven output: structured_output points the SDK at the
+    # hand-edited JSON Schema so the Fixer emits via the synthetic
+    # StructuredOutput tool, not free-form JSON in text.
+    assert opts.output_format is not None
+    assert opts.output_format["type"] == "json_schema"
+
+    # Prompt is rendered as the user message (prompt_as_user_message: true).
+    assert opts.system_prompt == ""
+
+    manifest_tools = get_default_registry().get("fixer").tools
+    assert manifest_tools.argv_allowlist == []
+    assert tuple(manifest_tools.argv_denylist) == FIXER_DENYLIST
+
+    # PreToolUse / PostToolUse / Stop are populated; UserPromptSubmit is
+    # intentionally absent (goal_pin was unreachable for this single-turn
+    # role and was removed from the manifest).
+    for event in ("PreToolUse", "PostToolUse", "Stop"):
         assert event in opts.hooks, event
         assert isinstance(opts.hooks[event][0], HookMatcher)
+    assert "UserPromptSubmit" not in opts.hooks
 
     pre_hook_names = [
         hook.__name__
@@ -244,8 +266,7 @@ def test_fixer_client_options_are_tool_using_and_hermetic() -> None:
     ]
     # ``path_guard`` is prepended onto the first matcher by ``build_options``
     # regardless of how the rest of the PreToolUse hooks are packed across
-    # matchers (compose emits one matcher per attachment; the imperative path
-    # bundled them into one).
+    # matchers (compose emits one matcher per attachment).
     assert opts.hooks["PreToolUse"][0].hooks[0].__name__ == "path_guard_hook"
     assert "loop_breaker_hook" in pre_hook_names
     assert "call_cap_hook" in pre_hook_names
@@ -256,8 +277,10 @@ def test_fixer_client_options_are_tool_using_and_hermetic() -> None:
         for matcher in opts.hooks["PostToolUse"] or []
         for hook in matcher.hooks or []
     ]
-    assert "diff_capture_hook" in post_hook_names
+    # PR C: diff_capture_hook removed; patches come from `git diff`.
+    assert "diff_capture_hook" not in post_hook_names
     assert "prompt_injection_guard_hook" in post_hook_names
+    assert "structured_output_hint_hook" in post_hook_names
     assert "heartbeat_hook" in post_hook_names
 
 
@@ -266,8 +289,8 @@ def test_fixer_permission_gate_allows_focused_maven_command() -> None:
 
     async def call() -> Any:
         return await gate(
-            "sandbox_bash",
-            {"argv": ["mvn", "-q", "test"]},
+            "Bash",
+            {"command": "mvn -q test"},
             ToolPermissionContext(),
         )
 
@@ -279,8 +302,8 @@ def test_fixer_permission_gate_denies_merge_command() -> None:
 
     async def call() -> Any:
         return await gate(
-            "sandbox_bash",
-            {"argv": ["gh", "pr", "merge", "42"]},
+            "Bash",
+            {"command": "gh pr merge 42"},
             ToolPermissionContext(),
         )
 
@@ -289,37 +312,85 @@ def test_fixer_permission_gate_denies_merge_command() -> None:
     assert "denied for all agent roles" in result.message
 
 
-def test_fixer_prompt_names_decisions_and_diff_capture() -> None:
+def test_fixer_permission_gate_denies_git_push() -> None:
+    """``git push`` is owned by pr_creator; the Fixer must not invoke it."""
+    gate = _fixer_client(_state_slice()).options.can_use_tool
+
+    async def call() -> Any:
+        return await gate(
+            "Bash",
+            {"command": "git push origin agent/wf-1"},
+            ToolPermissionContext(),
+        )
+
+    result = asyncio.run(call())
+    assert isinstance(result, PermissionResultDeny)
+
+
+def test_fixer_prompt_references_schema_not_inline_json() -> None:
     prompt = load_prompt("fixer")
+    # Decision names still live in the prompt body so the model has the
+    # full vocabulary even though the schema enforces the enum.
     assert "fixed" in prompt
     assert "needs_brief_change" in prompt
     assert "cannot_fix" in prompt
-    assert 'edit_kind="fixer"' in prompt
-    assert "Do not alter the brief" in prompt
-    assert "No prose, no markdown fences" in prompt
-
-
-def test_fixer_output_validates_decision_values() -> None:
-    out = FixerOutput.model_validate(
-        {
-            "decision": "fixed",
-            "target_wp": "WP-1",
-            "target_predicates": ["GET /customers/{unknown_id} returns 404"],
-            "summary": "Mapped missing customers to 404.",
-            "reason": "The behavior is required by WP-1.",
-        }
+    # Schema-driven output discipline mirrors PO/Architect/Tester.
+    assert "structured-output schema" in prompt
+    assert (
+        'Do not wrap them in an outer object such as\n`{"output": {...}}`'
+        in prompt
     )
-    assert out.decision == "fixed"
-    assert out.patches == []
+    # The prompt now uses $-template slots, not an Inputs section with
+    # JSON examples.
+    assert "$user_request" in prompt
+    assert "$failing_work_package" in prompt
+    assert "$semantic_failures" in prompt
 
-    with pytest.raises(ValidationError):
-        FixerOutput.model_validate(
-            {
-                "decision": "patch_code",
-                "target_wp": "WP-1",
-                "target_predicates": [],
-            }
-        )
+
+def test_fixer_prompt_template_renders_without_unresolved_placeholders() -> None:
+    rendered = render_role_user_message(
+        "fixer",
+        user_request="x",
+        repo_context="(no repo context)",
+        implementation_brief="{}",
+        failing_work_package="{}",
+        mechanical_diagnostics="{}",
+        semantic_failures="[]",
+        tester_findings="[]",
+        reviewer_findings="[]",
+        prior_patches="[]",
+    )
+    # Every $-slot in the prompt template must be substituted; an
+    # unresolved ``$something`` would mean the runtime forgot a slot.
+    assert "$user_request" not in rendered
+    assert "$repo_context" not in rendered
+    assert "$implementation_brief" not in rendered
+    assert "$failing_work_package" not in rendered
+    assert "$mechanical_diagnostics" not in rendered
+    assert "$semantic_failures" not in rendered
+    assert "$tester_findings" not in rendered
+    assert "$reviewer_findings" not in rendered
+    assert "$prior_patches" not in rendered
+
+
+def test_fixer_output_schema_pins_decision_enum_and_required_fields() -> None:
+    schema_path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "darkfactory"
+        / "schemas"
+        / "fixer_output.json"
+    )
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == {"decision", "target_wp", "summary", "reason"}
+    decision = schema["properties"]["decision"]
+    assert decision["type"] == "string"
+    assert set(decision["enum"]) == {"fixed", "needs_brief_change", "cannot_fix"}
+    # ``target_predicates`` is optional but typed as an array of strings.
+    target_predicates = schema["properties"]["target_predicates"]
+    assert target_predicates["type"] == "array"
+    assert target_predicates["items"]["type"] == "string"
 
 
 def test_fixer_budget_counts_by_predicate_and_wp() -> None:
@@ -390,20 +461,6 @@ def test_infeasible_predicate_finding_short_circuits_before_fixer() -> None:
     assert "MockMvc" in escalation["details"][0]
 
 
-def test_infeasible_predicate_ignored_when_resolved() -> None:
-    state: dict[str, Any] = {
-        "tester_findings": [
-            {
-                "kind": "infeasible_predicate",
-                "wp_id": "WP-4",
-                "detail": "stale",
-                "resolved": True,
-            }
-        ],
-    }
-    assert _infeasible_predicate_escalation(state) is None
-
-
 def test_behavior_mismatch_does_not_trigger_infeasible_escalation() -> None:
     state: dict[str, Any] = {
         "tester_findings": [
@@ -436,38 +493,42 @@ def test_fixer_needs_brief_change_escalates_without_budget_retry() -> None:
     }
 
 
-def test_run_fixer_returns_decision_with_captured_patches(
+def test_run_fixer_returns_decision_and_edits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    seeded_patch = {
-        "path": "src/main/java/app/CustomerController.java",
-        "diff": "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n",
-        "author_agent": "fixer",
-        "slice_id": "WP-1",
-        "sha": "deadbeef",
-        "edit_kind": "fixer",
+    """PR C: Fixer declares its decision + edits; patches are computed
+    by the activity from ``git diff``, not by ``run_fixer`` itself.
+    """
+    payload = {
+        "decision": "fixed",
+        "target_wp": "WP-1",
+        "target_predicates": [
+            "GET /customers/{unknown_id} returns 404 and an error body"
+        ],
+        "edits": [
+            {
+                "path": "src/main/java/app/CustomerController.java",
+                "operation": "modify",
+                "intent": "Map missing customers to 404.",
+            }
+        ],
+        "summary": "Mapped missing customers to 404.",
+        "reason": "The failing predicate is within the approved brief.",
     }
-    payload = json.dumps(
-        {
-            "decision": "fixed",
-            "target_wp": "WP-1",
-            "target_predicates": [
-                "GET /customers/{unknown_id} returns 404 and an error body"
-            ],
-            "summary": "Mapped missing customers to 404.",
-            "reason": "The failing predicate is within the approved brief.",
-        }
-    )
-    fake = _FakeClient([[_assistant(payload), _result()]], seeded_sink=[seeded_patch])
+    fake = _FakeClient([[_structured_assistant(payload), _result()]])
     _patch_client(monkeypatch, fake)
 
     out = asyncio.run(run_fixer(_state_slice()))
 
-    assert isinstance(out, FixerOutput)
-    assert out.decision == "fixed"
-    assert out.patches == [seeded_patch]
+    assert isinstance(out, dict)
+    assert out["decision"] == "fixed"
+    assert out["target_wp"] == "WP-1"
+    assert out["edits"] == payload["edits"]
+    assert out["parse_failure"] is False
+    # Patches are computed by the activity, not by run_fixer.
+    assert "patches" not in out
     assert len(fake.queries) == 1
-    assert "Failing Work Package context" in fake.queries[0]
+    assert "Failing Work Package" in fake.queries[0]
     assert "Failed mechanical diagnostics" in fake.queries[0]
     assert "Semantic coverage failures" in fake.queries[0]
     assert "Tester findings" in fake.queries[0]
@@ -478,21 +539,41 @@ def test_run_fixer_returns_decision_with_captured_patches(
 def test_run_fixer_can_return_needs_brief_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    payload = json.dumps(
-        {
-            "decision": "needs_brief_change",
-            "target_wp": "WP-1",
-            "target_predicates": [
-                "GET /customers/{unknown_id} returns 404 and an error body"
-            ],
-            "summary": "The predicate conflicts with the accepted API contract.",
-            "reason": "The approved behavior must change before code repair.",
-        }
-    )
-    fake = _FakeClient([[_assistant(payload), _result()]])
+    payload = {
+        "decision": "needs_brief_change",
+        "target_wp": "WP-1",
+        "target_predicates": [
+            "GET /customers/{unknown_id} returns 404 and an error body"
+        ],
+        "edits": [],
+        "summary": "The predicate conflicts with the accepted API contract.",
+        "reason": "The approved behavior must change before code repair.",
+    }
+    fake = _FakeClient([[_structured_assistant(payload), _result()]])
     _patch_client(monkeypatch, fake)
 
     out = asyncio.run(run_fixer(_state_slice()))
 
-    assert out.decision == "needs_brief_change"
-    assert out.patches == []
+    assert out["decision"] == "needs_brief_change"
+    assert out["edits"] == []
+    assert out["parse_failure"] is False
+
+
+def test_run_fixer_synthesizes_cannot_fix_on_parse_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``_drain`` returns ``structured=None``, the runtime synthesizes
+    a ``cannot_fix`` decision with ``parse_failure=True``. The activity
+    routes that flag through ``reconciliation_findings`` rather than
+    masquerading as a Tester finding.
+    """
+    fake = _FakeClient([[_assistant("free-form text, no tool call"), _result()]])
+    _patch_client(monkeypatch, fake)
+
+    out = asyncio.run(run_fixer(_state_slice()))
+
+    assert out["decision"] == "cannot_fix"
+    assert out["target_wp"] == "WP-1"
+    assert out["reason"] == "no structured output emitted"
+    assert out["parse_failure"] is True
+    assert out["edits"] == []

@@ -1,23 +1,31 @@
-"""Unit tests for stages/verify.py thin verify nodes."""
+"""Unit tests for stages/verify.py (plan-driven topology).
+
+The verifier discovers commands via the verify_planner role, caches the
+plan on PipelineState.verification_plan, and consumes structured report
+files via tools/reports.py. These tests monkeypatch the planner and the
+sandbox; the readers in tools/reports.py have their own coverage in
+tests/test_reports.py.
+"""
 from __future__ import annotations
 
 import asyncio
 import types
+from pathlib import Path
 
 import pytest
 
-from darkfactory.agents.verifier_semantic import SemanticVerifierOutput
+from darkfactory.agents._sdk_common import ParseError
 from darkfactory.stages import verify as verify_mod
 from darkfactory.stages.verify import (
-    run_compile_node,
-    run_happy_path_node,
-    run_linters_node,
+    aggregate,
+    ensure_plan_node,
+    run_plan_node,
     run_semantic_coverage_node,
-    run_tests_node,
+    verify_subgraph,
 )
 
 
-def _runtime(tmp_path, task_id="t-verify") -> types.SimpleNamespace:
+def _runtime(tmp_path: Path, task_id: str = "t-verify") -> types.SimpleNamespace:
     ctx = types.SimpleNamespace(
         repo_path=str(tmp_path),
         task_id=task_id,
@@ -26,7 +34,7 @@ def _runtime(tmp_path, task_id="t-verify") -> types.SimpleNamespace:
 
 
 class FakeSandbox:
-    """Records calls; returns a queued reply per argv prefix."""
+    """Records calls and returns queued replies keyed by argv prefix."""
 
     def __init__(self, replies: dict | None = None, default=None):
         self.replies = replies or {}
@@ -46,362 +54,297 @@ class FakeSandbox:
         return self.default
 
 
-# --- run_tests_node ---
+SUREFIRE_PASS_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.example.OrderControllerTest" tests="9" failures="0" errors="0" skipped="0" time="0.5">
+  <testcase classname="com.example.OrderControllerTest" name="listReturnsFirstPage"/>
+  <testcase classname="com.example.OrderControllerTest" name="listReturnsSecondPage"/>
+  <testcase classname="com.example.OrderControllerTest" name="cursorPaginationReturnsFirstPage"/>
+  <testcase classname="com.example.OrderControllerTest" name="cursorPaginationContinuesWithCursor"/>
+  <testcase classname="com.example.OrderControllerTest" name="cursorPaginationDetectsEndOfResults"/>
+  <testcase classname="com.example.OrderControllerTest" name="cursorPaginationReturnsEmptyWhenNoMoreResults"/>
+  <testcase classname="com.example.OrderControllerTest" name="cursorPaginationHandlesCustomLimit"/>
+  <testcase classname="com.example.OrderControllerTest" name="cursorPaginationHandlesInvalidCursor"/>
+  <testcase classname="com.example.OrderControllerTest" name="cursorPaginationMultiPageScenario"/>
+</testsuite>
+"""
 
-def test_run_tests_node_unknown_project(tmp_path):
-    out = run_tests_node({}, _runtime(tmp_path))
-    assert out["test_results"][0]["runner"] == "unknown"
-    assert out["test_results"][0]["returncode"] == -1
-    assert "cannot detect" in out["test_results"][0]["errors"][0]
-
-
-def test_run_tests_node_maven_pass(tmp_path, monkeypatch):
-    (tmp_path / "pom.xml").write_text("<project/>")
-    sb = FakeSandbox(default={
-        "returncode": 0,
-        "stdout": "Tests run: 5, Failures: 0, Errors: 0, Skipped: 1\n",
-        "stderr": "",
-        "timed_out": False,
-    })
-    monkeypatch.setattr(verify_mod, "get_sandbox", lambda _t: sb)
-    monkeypatch.setattr(verify_mod, "register_sandbox", lambda *a, **k: None)
-
-    out = run_tests_node({}, _runtime(tmp_path))
-    tr = out["test_results"][0]
-    assert tr["runner"] == "maven"
-    assert tr["returncode"] == 0
-    assert tr["passed"] == 4
-    assert tr["failed"] == 0
-    assert tr["errors"] == []
-    assert sb.calls[0] == ["mvn", "-q", "-B", "test"]
+CHECKSTYLE_VIOLATION_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<checkstyle version="10.3.4">
+  <file name="src/main/java/com/example/Order.java">
+    <error line="14" severity="error" message="'50' is a magic number."
+           source="com.puppycrawl.tools.checkstyle.checks.coding.MagicNumberCheck"/>
+  </file>
+</checkstyle>
+"""
 
 
-def test_run_tests_node_maven_fail_surfaces_errors(tmp_path, monkeypatch):
-    (tmp_path / "pom.xml").write_text("<project/>")
-    sb = FakeSandbox(default={
-        "returncode": 1,
-        "stdout": "Tests run: 2, Failures: 1, Errors: 0, Skipped: 0\n",
-        "stderr": "",
-        "timed_out": False,
-    })
-    monkeypatch.setattr(verify_mod, "get_sandbox", lambda _t: sb)
-    monkeypatch.setattr(verify_mod, "register_sandbox", lambda *a, **k: None)
-
-    out = run_tests_node({}, _runtime(tmp_path))
-    tr = out["test_results"][0]
-    assert tr["returncode"] == 1
-    assert tr["failed"] == 1
-    assert tr["passed"] == 1
+# --- ensure_plan_node ---
 
 
-def test_run_tests_node_no_runtime():
-    assert run_tests_node({}, None) == {}
+def test_ensure_plan_node_caches_existing_plan(monkeypatch):
+    """A populated cache short-circuits the planner call."""
 
-
-# --- run_linters_node ---
-
-def test_run_linters_node_emits_findings(tmp_path, monkeypatch):
-    (tmp_path / "pom.xml").write_text("<project/>")
-    cs_stdout = (
-        "[ERROR] /workspace/src/main/java/Foo.java:[12,4] (sizes) "
-        "LineLength: Line is longer than 100 characters."
-    )
-    sb = FakeSandbox(replies={
-        ("mvn", "-q", "-B", "checkstyle:check"): {
-            "returncode": 1, "stdout": cs_stdout, "stderr": "", "timed_out": False,
-        },
-        ("mvn", "-q", "-B", "spotless:check"): {
-            "returncode": 0, "stdout": "", "stderr": "", "timed_out": False,
-        },
-    })
-    monkeypatch.setattr(verify_mod, "get_sandbox", lambda _t: sb)
-    monkeypatch.setattr(verify_mod, "register_sandbox", lambda *a, **k: None)
-
-    out = run_linters_node({}, _runtime(tmp_path))
-    findings = out["findings"]
-    assert len(findings) == 1
-    assert findings[0]["tool"] == "checkstyle"
-    assert findings[0]["rule"] == "LineLength"
-    assert findings[0]["line"] == 12
-
-
-def test_run_linters_node_unknown_build(tmp_path):
-    assert run_linters_node({}, _runtime(tmp_path)) == {}
-
-
-# --- run_compile_node ---
-
-def test_run_compile_node_parses_javac_errors(tmp_path, monkeypatch):
-    (tmp_path / "pom.xml").write_text("<project/>")
-    compile_out = (
-        "[ERROR] /workspace/src/main/java/Bar.java:[7,15] cannot find symbol\n"
-    )
-    sb = FakeSandbox(default={
-        "returncode": 1, "stdout": compile_out, "stderr": "", "timed_out": False,
-    })
-    monkeypatch.setattr(verify_mod, "get_sandbox", lambda _t: sb)
-    monkeypatch.setattr(verify_mod, "register_sandbox", lambda *a, **k: None)
-
-    out = run_compile_node({}, _runtime(tmp_path))
-    findings = out["findings"]
-    assert len(findings) == 1
-    assert findings[0]["tool"] == "javac"
-    assert findings[0]["severity"] == "error"
-    assert findings[0]["line"] == 7
-
-
-def test_run_compile_node_synthesises_finding_on_unparseable_failure(tmp_path, monkeypatch):
-    (tmp_path / "pom.xml").write_text("<project/>")
-    sb = FakeSandbox(default={
-        "returncode": 2, "stdout": "boom\n", "stderr": "", "timed_out": False,
-    })
-    monkeypatch.setattr(verify_mod, "get_sandbox", lambda _t: sb)
-    monkeypatch.setattr(verify_mod, "register_sandbox", lambda *a, **k: None)
-
-    out = run_compile_node({}, _runtime(tmp_path))
-    assert len(out["findings"]) == 1
-    assert out["findings"][0]["rule"] == "compile"
-
-
-def test_run_compile_node_clean_returns_no_findings(tmp_path, monkeypatch):
-    (tmp_path / "pom.xml").write_text("<project/>")
-    sb = FakeSandbox(default={
-        "returncode": 0, "stdout": "", "stderr": "", "timed_out": False,
-    })
-    monkeypatch.setattr(verify_mod, "get_sandbox", lambda _t: sb)
-    monkeypatch.setattr(verify_mod, "register_sandbox", lambda *a, **k: None)
-
-    out = run_compile_node({}, _runtime(tmp_path))
-    assert out["findings"] == []
-
-
-# --- run_happy_path_node ---
-
-def test_run_happy_path_node_is_noop_stub(tmp_path):
-    assert run_happy_path_node({}, _runtime(tmp_path)) == {}
-
-
-# --- run_semantic_coverage_node ---
-
-def test_run_semantic_coverage_node_skips_without_predicates(monkeypatch):
     async def _unexpected(_state):
-        raise AssertionError("semantic verifier should not run without predicates")
+        raise AssertionError("verify_planner should not run when a plan is cached")
 
-    monkeypatch.setattr(verify_mod, "run_verifier_semantic", _unexpected)
+    monkeypatch.setattr(verify_mod, "run_verify_planner", _unexpected)
+    state = {
+        "verification_plan": {
+            "test": {"name": "test", "argv": ["pytest"]},
+        },
+        "verification_plan_rev": 1,
+    }
 
-    out = asyncio.run(
-        run_semantic_coverage_node(
-            {"verify_summary": {"passed": True, "failed_tests": 0, "hard_findings": 0}}
-        )
-    )
+    out = asyncio.run(ensure_plan_node(state))
 
     assert out == {}
 
 
-def test_run_semantic_coverage_node_merges_predicate_coverage(monkeypatch):
-    seen: dict[str, dict] = {}
-
-    async def _fake_semantic(state):
-        seen["state"] = state
-        return SemanticVerifierOutput.model_validate(
-            {
-                "predicate_coverage": [
-                    {
-                        "wp_id": "WP-1",
-                        "predicate": "GET /customers/{unknown_id} returns 404",
-                        "status": "covered",
-                        "evidence": "CustomerControllerTest.missingCustomerReturns404",
-                    }
-                ]
+def test_ensure_plan_node_persists_planner_output(monkeypatch):
+    async def _planner(_state):
+        return {
+            "test": {
+                "name": "test",
+                "argv": ["mvn", "-B", "test"],
+                "report_paths": ["target/surefire-reports/TEST-*.xml"],
+                "report_kind": "junit-xml",
             }
-        )
-
-    monkeypatch.setattr(verify_mod, "run_verifier_semantic", _fake_semantic)
-
-    state = {
-        "implementation_brief": {
-            "work_packages": [
-                {
-                    "id": "WP-1",
-                    "verification": ["GET /customers/{unknown_id} returns 404"],
-                }
-            ]
-        },
-        "coverage_entries": [
-            {
-                "wp_id": "WP-1",
-                "predicate": "GET /customers/{unknown_id} returns 404",
-                "test_names": ["CustomerControllerTest.missingCustomerReturns404"],
-            }
-        ],
-        "test_results": [
-            {
-                "runner": "maven",
-                "returncode": 0,
-                "passed": 1,
-                "failed": 0,
-                "errors": [],
-                "duration_s": 0.1,
-            }
-        ],
-        "findings": [],
-        "verify_summary": {"passed": True, "failed_tests": 0, "hard_findings": 0},
-    }
-
-    out = asyncio.run(run_semantic_coverage_node(state))
-
-    assert seen["state"]["test_results"][0]["passed"] == 1
-    assert out["verify_summary"]["passed"] is True
-    assert out["verify_summary"]["failed_tests"] == 0
-    assert out["verify_summary"]["predicate_coverage"] == [
-        {
-            "wp_id": "WP-1",
-            "predicate": "GET /customers/{unknown_id} returns 404",
-            "status": "covered",
-            "evidence": "CustomerControllerTest.missingCustomerReturns404",
         }
-    ]
+
+    monkeypatch.setattr(verify_mod, "run_verify_planner", _planner)
+
+    out = asyncio.run(ensure_plan_node({}))
+
+    assert out["verification_plan"]["test"]["argv"] == ["mvn", "-B", "test"]
+    assert out["verification_plan_rev"] == 1
 
 
-def test_run_semantic_coverage_node_fails_on_uncovered_predicate(monkeypatch):
-    async def _fake_semantic(_state):
-        return SemanticVerifierOutput.model_validate(
-            {
-                "predicate_coverage": [
-                    {
-                        "wp_id": "WP-1",
-                        "predicate": "GET /customers/{unknown_id} returns 404",
-                        "status": "uncovered",
-                        "evidence": "",
-                    }
-                ]
-            }
-        )
+def test_ensure_plan_node_flags_empty_plan_as_discovery_failure(monkeypatch):
+    async def _planner(_state):
+        return {"notes": "no test command available"}
 
-    monkeypatch.setattr(verify_mod, "run_verifier_semantic", _fake_semantic)
+    monkeypatch.setattr(verify_mod, "run_verify_planner", _planner)
 
-    state = {
-        "implementation_brief": {
-            "work_packages": [
-                {
-                    "id": "WP-1",
-                    "verification": ["GET /customers/{unknown_id} returns 404"],
-                }
-            ]
-        },
-        "test_results": [
-            {
-                "runner": "maven",
-                "returncode": 0,
-                "passed": 1,
-                "failed": 0,
-                "errors": [],
-                "duration_s": 0.1,
-            }
-        ],
-        "findings": [],
-        "verify_summary": {"passed": True, "failed_tests": 0, "hard_findings": 0},
-        "verify_retries": 0,
-    }
+    out = asyncio.run(ensure_plan_node({}))
 
-    out = asyncio.run(run_semantic_coverage_node(state))
-
-    assert out["verify_summary"]["passed"] is False
-    assert out["verify_summary"]["uncovered_predicates"] == 1
-    assert out["verify_retries"] == 1
+    assert out["verification_plan"] == {"notes": "no test command available"}
+    findings = out["findings"]
+    assert len(findings) == 1
+    assert findings[0]["tool"] == "verify_planner"
+    assert findings[0]["rule"] == "empty_plan"
+    assert findings[0]["severity"] == "error"
+    assert "no test command available" in findings[0]["message"]
 
 
-def test_run_semantic_coverage_node_fails_on_missing_predicate_coverage(monkeypatch):
-    async def _fake_semantic(_state):
-        return SemanticVerifierOutput.model_validate({"predicate_coverage": []})
+def test_ensure_plan_node_handles_parse_error(monkeypatch):
+    async def _planner(_state):
+        raise ParseError("verify_planner emitted no structured output")
 
-    monkeypatch.setattr(verify_mod, "run_verifier_semantic", _fake_semantic)
+    monkeypatch.setattr(verify_mod, "run_verify_planner", _planner)
+
+    out = asyncio.run(ensure_plan_node({}))
+
+    assert "verification_plan" not in out
+    findings = out["findings"]
+    assert len(findings) == 1
+    assert findings[0]["rule"] == "discovery_failed"
+
+
+# --- run_plan_node ---
+
+
+def test_run_plan_node_test_step_with_junit_xml(tmp_path, monkeypatch):
+    report_path = tmp_path / "target/surefire-reports/TEST-OrderControllerTest.xml"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(SUREFIRE_PASS_XML, encoding="utf-8")
+
+    sandbox = FakeSandbox()
+    monkeypatch.setattr(verify_mod, "get_sandbox", lambda _t: sandbox)
+    monkeypatch.setattr(verify_mod, "register_sandbox", lambda *a, **k: None)
 
     state = {
-        "implementation_brief": {
-            "work_packages": [
-                {
-                    "id": "WP-1",
-                    "verification": ["response body contains nextCursor"],
-                }
-            ]
-        },
-        "test_results": [
-            {
-                "runner": "maven",
-                "returncode": 0,
-                "passed": 1,
-                "failed": 0,
-                "errors": [],
-                "duration_s": 0.1,
+        "verification_plan": {
+            "test": {
+                "name": "test",
+                "argv": ["mvn", "-B", "test"],
+                "report_paths": ["target/surefire-reports/TEST-*.xml"],
+                "report_kind": "junit-xml",
             }
-        ],
-        "findings": [],
-        "verify_summary": {"passed": True, "failed_tests": 0, "hard_findings": 0},
-        "verify_retries": 0,
+        }
     }
 
-    out = asyncio.run(run_semantic_coverage_node(state))
+    out = asyncio.run(run_plan_node(state, _runtime(tmp_path)))
 
-    assert out["verify_summary"]["passed"] is False
-    assert out["verify_summary"]["uncovered_predicates"] == 1
-    assert out["verify_retries"] == 1
+    assert sandbox.calls == [["mvn", "-B", "test"]]
+    tr = out["test_results"][0]
+    assert tr["runner"] == "test"
+    assert tr["passed"] == 9
+    assert tr["failed"] == 0
+    assert tr["returncode"] == 0
+    assert len(tr["executed_tests"]) == 9
+    assert tr["errors"] == []
 
 
-def test_run_semantic_coverage_node_keeps_mechanical_failure(monkeypatch):
-    async def _fake_semantic(_state):
-        return SemanticVerifierOutput.model_validate(
-            {
-                "predicate_coverage": [
-                    {
-                        "wp_id": "WP-1",
-                        "predicate": "response body contains nextCursor",
-                        "status": "covered",
-                        "evidence": "PaginationTest.assertsNextCursor",
-                    }
-                ]
-            }
-        )
-
-    monkeypatch.setattr(verify_mod, "run_verifier_semantic", _fake_semantic)
+def test_run_plan_node_test_step_without_report_falls_back_to_exit_code(tmp_path, monkeypatch):
+    sandbox = FakeSandbox(default={
+        "returncode": 0,
+        "stdout": "ok",
+        "stderr": "",
+        "timed_out": False,
+    })
+    monkeypatch.setattr(verify_mod, "get_sandbox", lambda _t: sandbox)
+    monkeypatch.setattr(verify_mod, "register_sandbox", lambda *a, **k: None)
 
     state = {
-        "implementation_brief": {
-            "work_packages": [
-                {
-                    "id": "WP-1",
-                    "verification": ["response body contains nextCursor"],
-                }
-            ]
-        },
-        "test_results": [
-            {
-                "runner": "maven",
-                "returncode": 1,
-                "passed": 0,
-                "failed": 1,
-                "errors": [],
-                "duration_s": 0.1,
+        "verification_plan": {
+            "test": {
+                "name": "test",
+                "argv": ["pytest"],
             }
-        ],
-        "findings": [],
-        "verify_summary": {"passed": False, "failed_tests": 1, "hard_findings": 0},
-        "verify_retries": 1,
+        }
     }
 
-    out = asyncio.run(run_semantic_coverage_node(state))
+    out = asyncio.run(run_plan_node(state, _runtime(tmp_path)))
 
-    assert out["verify_summary"]["passed"] is False
-    assert out["verify_summary"]["failed_tests"] == 1
-    assert out["verify_summary"]["uncovered_predicates"] == 0
-    assert "verify_retries" not in out
+    tr = out["test_results"][0]
+    assert tr["passed"] == 0
+    assert tr["failed"] == 0
+    assert tr["returncode"] == 0
+    assert tr["errors"] == []
+
+
+def test_run_plan_node_test_step_failing_exit_code_records_errors(tmp_path, monkeypatch):
+    sandbox = FakeSandbox(default={
+        "returncode": 1,
+        "stdout": "",
+        "stderr": "AssertionError: nope\n",
+        "timed_out": False,
+    })
+    monkeypatch.setattr(verify_mod, "get_sandbox", lambda _t: sandbox)
+    monkeypatch.setattr(verify_mod, "register_sandbox", lambda *a, **k: None)
+
+    state = {
+        "verification_plan": {
+            "test": {"name": "test", "argv": ["pytest"]}
+        }
+    }
+
+    out = asyncio.run(run_plan_node(state, _runtime(tmp_path)))
+
+    tr = out["test_results"][0]
+    assert tr["returncode"] == 1
+    assert "AssertionError" in "\n".join(tr["errors"])
+
+
+def test_run_plan_node_lint_step_with_checkstyle_xml(tmp_path, monkeypatch):
+    report_path = tmp_path / "target/checkstyle-result.xml"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(CHECKSTYLE_VIOLATION_XML, encoding="utf-8")
+
+    sandbox = FakeSandbox(default={
+        "returncode": 1,
+        "stdout": "",
+        "stderr": "",
+        "timed_out": False,
+    })
+    monkeypatch.setattr(verify_mod, "get_sandbox", lambda _t: sandbox)
+    monkeypatch.setattr(verify_mod, "register_sandbox", lambda *a, **k: None)
+
+    state = {
+        "verification_plan": {
+            "lint": [
+                {
+                    "name": "checkstyle",
+                    "argv": ["mvn", "-B", "checkstyle:checkstyle"],
+                    "report_paths": ["target/checkstyle-result.xml"],
+                    "report_kind": "checkstyle-xml",
+                }
+            ]
+        }
+    }
+
+    out = asyncio.run(run_plan_node(state, _runtime(tmp_path)))
+
+    findings = out["findings"]
+    assert len(findings) == 1
+    assert findings[0]["tool"] == "checkstyle"
+    assert findings[0]["severity"] == "error"
+    assert findings[0]["rule"] == "MagicNumberCheck"
+    assert findings[0]["line"] == 14
+
+
+def test_run_plan_node_compile_step_exit_code_fallback(tmp_path, monkeypatch):
+    sandbox = FakeSandbox(default={
+        "returncode": 2,
+        "stdout": "",
+        "stderr": "Boom\nERROR: type error in Foo.java:14\n",
+        "timed_out": False,
+    })
+    monkeypatch.setattr(verify_mod, "get_sandbox", lambda _t: sandbox)
+    monkeypatch.setattr(verify_mod, "register_sandbox", lambda *a, **k: None)
+
+    state = {
+        "verification_plan": {
+            "compile": {"name": "compile", "argv": ["mvn", "-B", "compile"]}
+        }
+    }
+
+    out = asyncio.run(run_plan_node(state, _runtime(tmp_path)))
+
+    findings = out["findings"]
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "error"
+    assert findings[0]["rule"] == "compile"
+    assert "type error in Foo.java" in findings[0]["message"]
+
+
+def test_run_plan_node_advisory_lint_emits_warn_finding(tmp_path, monkeypatch):
+    sandbox = FakeSandbox(default={
+        "returncode": 1,
+        "stdout": "",
+        "stderr": "style nag\n",
+        "timed_out": False,
+    })
+    monkeypatch.setattr(verify_mod, "get_sandbox", lambda _t: sandbox)
+    monkeypatch.setattr(verify_mod, "register_sandbox", lambda *a, **k: None)
+
+    state = {
+        "verification_plan": {
+            "lint": [
+                {
+                    "name": "spotless",
+                    "argv": ["mvn", "-B", "spotless:check"],
+                    "required": False,
+                }
+            ]
+        }
+    }
+
+    out = asyncio.run(run_plan_node(state, _runtime(tmp_path)))
+
+    findings = out["findings"]
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "warn"
+
+
+def test_run_plan_node_empty_plan_returns_no_writes(tmp_path):
+    out = asyncio.run(run_plan_node({"verification_plan": {}}, _runtime(tmp_path)))
+    assert out == {}
+
+
+def test_run_plan_node_no_runtime_returns_no_writes():
+    out = asyncio.run(run_plan_node({"verification_plan": {"test": {"argv": ["x"]}}}, None))
+    assert out == {}
+
+
+# --- aggregate (preserved from the old subgraph) ---
 
 
 def test_aggregate_fails_on_blocking_tester_finding():
     state = {
         "test_results": [
             {
-                "runner": "maven",
+                "runner": "test",
                 "returncode": 0,
                 "passed": 1,
                 "failed": 0,
@@ -420,108 +363,168 @@ def test_aggregate_fails_on_blocking_tester_finding():
         "verify_retries": 0,
     }
 
-    out = verify_mod.aggregate(state)
+    out = aggregate(state)
 
     assert out["verify_summary"]["passed"] is False
-    assert out["verify_summary"]["blocking_tester_findings"] == 1
+    assert out["verify_summary"]["blocking_failures"] == 1
     assert out["verify_retries"] == 1
 
 
-# --- verify_fanout / verify_subgraph ---
-
-def test_verify_fanout_emits_one_send_per_target():
-    from langgraph.types import Send
-
-    from darkfactory.stages.verify import VERIFY_TARGETS, verify_fanout
-
-    sends = verify_fanout({"user_request": "x"})
-    assert len(sends) == len(VERIFY_TARGETS)
-    assert all(isinstance(s, Send) for s in sends)
-    assert {s.node for s in sends} == set(VERIFY_TARGETS)
+# --- run_semantic_coverage_node (preserved) ---
 
 
-def test_verify_subgraph_defers_aggregate_until_all_fanout_nodes_finish(monkeypatch):
-    """The deferred aggregate node should see all branch writes before it runs."""
-    from darkfactory.stages import verify as verify_mod
-    from darkfactory.stages.verify import verify_subgraph
+def test_run_semantic_coverage_node_skips_without_predicates(monkeypatch):
+    async def _unexpected(_state):
+        raise AssertionError("semantic verifier should not run without predicates")
 
-    calls: list[str] = []
+    monkeypatch.setattr(verify_mod, "run_verifier_semantic", _unexpected)
 
-    def _stub(name):
-        def node(state, runtime=None):  # noqa: ARG001
-            calls.append(name)
-            return {}
-        return node
+    out = asyncio.run(
+        run_semantic_coverage_node(
+            {"verify_summary": {"passed": True, "failed_tests": 0, "hard_findings": 0}}
+        )
+    )
 
-    def _tests(state, runtime=None):  # noqa: ARG001
-        calls.append("tests")
+    assert out == {}
+
+
+def test_run_semantic_coverage_node_merges_predicate_coverage(monkeypatch):
+    async def _fake_semantic(_state):
         return {
-            "test_results": [{
-                "runner": "maven",
+            "predicate_coverage": [
+                {
+                    "wp_id": "WP-1",
+                    "predicate": "GET /customers/{unknown_id} returns 404",
+                    "status": "covered",
+                    "evidence": "CustomerControllerTest.missingCustomerReturns404",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(verify_mod, "run_verifier_semantic", _fake_semantic)
+
+    state = {
+        "implementation_brief": {
+            "work_packages": [
+                {
+                    "id": "WP-1",
+                    "verification": ["GET /customers/{unknown_id} returns 404"],
+                }
+            ]
+        },
+        "test_results": [
+            {
+                "runner": "test",
                 "returncode": 0,
-                "passed": 3,
+                "passed": 1,
                 "failed": 0,
                 "errors": [],
                 "duration_s": 0.1,
-            }]
-        }
+            }
+        ],
+        "findings": [],
+        "verify_summary": {"passed": True, "failed_tests": 0, "hard_findings": 0},
+    }
 
-    def _linters(state, runtime=None):  # noqa: ARG001
-        calls.append("linters")
+    out = asyncio.run(run_semantic_coverage_node(state))
+
+    assert out["verify_summary"]["passed"] is True
+    assert out["verify_summary"]["uncovered_predicates"] == 0
+
+
+def test_run_semantic_coverage_node_fails_on_uncovered_predicate(monkeypatch):
+    async def _fake_semantic(_state):
         return {
-            "findings": [{
-                "tool": "checkstyle",
-                "severity": "warn",
-                "file": "src/main/java/Foo.java",
-                "line": 12,
-                "rule": "LineLength",
-                "message": "line too long",
-            }]
+            "predicate_coverage": [
+                {
+                    "wp_id": "WP-1",
+                    "predicate": "GET /customers/{unknown_id} returns 404",
+                    "status": "uncovered",
+                    "evidence": "",
+                }
+            ]
         }
 
-    def _compile(state, runtime=None):  # noqa: ARG001
-        calls.append("compile")
+    monkeypatch.setattr(verify_mod, "run_verifier_semantic", _fake_semantic)
+
+    state = {
+        "implementation_brief": {
+            "work_packages": [
+                {
+                    "id": "WP-1",
+                    "verification": ["GET /customers/{unknown_id} returns 404"],
+                }
+            ]
+        },
+        "test_results": [
+            {
+                "runner": "test",
+                "returncode": 0,
+                "passed": 1,
+                "failed": 0,
+                "errors": [],
+                "duration_s": 0.1,
+            }
+        ],
+        "findings": [],
+        "verify_summary": {"passed": True, "failed_tests": 0, "hard_findings": 0},
+        "verify_retries": 0,
+    }
+
+    out = asyncio.run(run_semantic_coverage_node(state))
+
+    assert out["verify_summary"]["passed"] is False
+    assert out["verify_summary"]["uncovered_predicates"] == 1
+    assert out["verify_retries"] == 1
+
+
+# --- verify_subgraph topology ---
+
+
+def test_verify_subgraph_runs_ensure_plan_then_run_plan_then_aggregate(monkeypatch):
+    """ensure_plan → run_plan → aggregate → run_semantic_coverage."""
+    calls: list[str] = []
+
+    async def _ensure(state, runtime=None):  # noqa: ARG001
+        calls.append("ensure_plan")
         return {
-            "findings": [{
-                "tool": "javac",
-                "severity": "info",
-                "file": "src/main/java/Foo.java",
-                "line": 7,
-                "rule": "compile",
-                "message": "clean compile",
-            }]
+            "verification_plan": {"test": {"name": "test", "argv": ["x"]}},
+            "verification_plan_rev": 1,
         }
 
-    seen: dict[str, int] = {}
-    real_aggregate = verify_mod.aggregate
+    async def _run_plan(state, runtime=None):  # noqa: ARG001
+        calls.append("run_plan")
+        assert state["verification_plan"]["test"]["argv"] == ["x"]
+        return {
+            "test_results": [
+                {
+                    "runner": "test",
+                    "returncode": 0,
+                    "passed": 3,
+                    "failed": 0,
+                    "errors": [],
+                    "duration_s": 0.1,
+                }
+            ]
+        }
 
-    def _aggregate(state, runtime=None):
+    def _aggregate(state, runtime=None):  # noqa: ARG001
         calls.append("aggregate")
-        seen["test_results"] = len(state.get("test_results", []))
-        seen["findings"] = len(state.get("findings", []))
-        return real_aggregate(state, runtime)
-
-    monkeypatch.setattr(verify_mod, "run_tests_node", _tests)
-    monkeypatch.setattr(verify_mod, "run_linters_node", _linters)
-    monkeypatch.setattr(verify_mod, "run_compile_node", _compile)
-    monkeypatch.setattr(verify_mod, "run_happy_path_node", _stub("happy"))
-    monkeypatch.setattr(verify_mod, "aggregate", _aggregate)
+        return {
+            "verify_summary": {"passed": True, "failed_tests": 0, "hard_findings": 0}
+        }
 
     async def _semantic(state, runtime=None):  # noqa: ARG001
         calls.append("semantic")
-        assert state["verify_summary"]["passed"] is True
         return {}
 
+    monkeypatch.setattr(verify_mod, "ensure_plan_node", _ensure)
+    monkeypatch.setattr(verify_mod, "run_plan_node", _run_plan)
+    monkeypatch.setattr(verify_mod, "aggregate", _aggregate)
     monkeypatch.setattr(verify_mod, "run_semantic_coverage_node", _semantic)
 
     sg = verify_subgraph()
     out = asyncio.run(sg.ainvoke({"user_request": "x"}))
 
-    assert set(calls[:-2]) == {"compile", "happy", "linters", "tests"}
-    assert calls[-2:] == ["aggregate", "semantic"]
-    assert seen == {"test_results": 1, "findings": 2}
-    assert out["verify_summary"] == {
-        "passed": True,
-        "failed_tests": 0,
-        "hard_findings": 0,
-    }
+    assert calls == ["ensure_plan", "run_plan", "aggregate", "semantic"]
+    assert out["verify_summary"]["passed"] is True

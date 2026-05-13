@@ -22,7 +22,6 @@ class ThinkingPolicy(_StrictModel):
 
 class LLMPolicy(_StrictModel):
     model: str
-    temperature: float
     thinking: ThinkingPolicy
     prompt_path: str
     structured_output: str | None = None
@@ -33,6 +32,7 @@ class ToolPolicy(_StrictModel):
     allowed: list[str]
     disallowed: list[str]
     argv_allowlist: list[str]
+    argv_denylist: list[tuple[str, ...]] = Field(default_factory=list)
     role_owned_argv_prefixes: list[tuple[str, ...]]
     edit_path_allowlist: list[str]
 

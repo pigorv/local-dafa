@@ -109,3 +109,41 @@ def test_repo_summary_renders_style_configs() -> None:
 def test_repo_summary_omits_style_section_when_empty() -> None:
     rendered = repo_summary({"agents_md": "Java demo"})
     assert "Style / lint configs" not in rendered
+
+
+def test_repo_summary_include_trims_to_selected_sections() -> None:
+    rendered = repo_summary(
+        {
+            "agents_md": "Java demo repo.",
+            "repo_map": "Foo.java\n  class Foo",
+            "git_log": ["abc1234 init"],
+            "style_configs": [
+                {"path": "checkstyle.xml", "content": "<module/>"},
+            ],
+        },
+        include=("repo_map", "style_configs"),
+    )
+
+    # Selected sections render.
+    assert "Repo map" in rendered
+    assert "Style / lint configs" in rendered
+    assert "checkstyle.xml" in rendered
+    # Dropped sections do not.
+    assert "AGENTS.md" not in rendered
+    assert "Recent commits" not in rendered
+
+
+def test_repo_summary_default_renders_all_sections_unchanged() -> None:
+    # The ``include`` kwarg is opt-in; existing PO / Architect call
+    # sites keep getting every section.
+    rendered = repo_summary(
+        {
+            "agents_md": "Java demo repo.",
+            "repo_map": "Foo.java\n  class Foo",
+            "git_log": ["abc1234 init"],
+            "style_configs": [],
+        },
+    )
+    assert "AGENTS.md" in rendered
+    assert "Repo map" in rendered
+    assert "Recent commits" in rendered

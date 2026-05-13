@@ -1,7 +1,7 @@
 {
   "type": "object",
-  "title": "PlanCriticOutput",
-  "description": "Plan Critic decision: approve the brief or return targeted per-WorkPackage edits.",
+  "title": "PlanCriticDecision",
+  "description": "Plan-critic decision: the approved, reason, edits, and notes fields below. Place these fields directly as the tool input — no outer wrapper.",
   "additionalProperties": false,
   "required": ["approved", "reason", "edits", "notes"],
   "properties": {

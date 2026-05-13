@@ -1,7 +1,7 @@
 {
   "type": "object",
-  "title": "POOutput",
-  "description": "Product Owner output: brief-intent fields plus user stories.",
+  "title": "ProductRequest",
+  "description": "Product request restatement: the problem, expected_behavior, compatibility_risks, open_assumptions, and stories fields below. Place these fields directly as the tool input — no outer wrapper.",
   "additionalProperties": false,
   "properties": {
     "problem": {

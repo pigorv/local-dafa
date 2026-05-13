@@ -33,6 +33,16 @@ def _patch(slice_id: str, author_agent: str) -> Patch:
     return Patch(path="x", diff="", author_agent=author_agent, slice_id=slice_id)
 
 
+def _builder_output(slice_id: str, status: str = "done") -> dict:
+    return {
+        "wp_id": slice_id,
+        "status": status,
+        "edits": [],
+        "blockers": [],
+        "summary": "",
+    }
+
+
 def test_topo_sort_db_api_test_order():
     spec = [
         _slice("test-1", depends_on=["api-1"]),
@@ -53,7 +63,21 @@ def test_route_slice_assigns_workers_by_paths():
     assert route_slice(frontend) == "frontend"
 
 
+def _tester_output(slice_id: str, *, parse_failure: bool = False) -> dict:
+    return {
+        "wp_id": slice_id,
+        "summary": "",
+        "coverage": [],
+        "findings": [],
+        "parse_failure": parse_failure,
+    }
+
+
 def test_supervisor_dispatches_builder_then_tester_per_slice_in_dependency_order():
+    """PR C: Builder and Tester completion are keyed on
+    ``builder_outputs`` / ``tester_outputs`` entries rather than on
+    sentinel patches. Frontend keeps the legacy patch-sentinel path.
+    """
     spec = [
         _slice(
             "test-1",
@@ -67,7 +91,12 @@ def test_supervisor_dispatches_builder_then_tester_per_slice_in_dependency_order
         ),
         _slice("db-1", new_files=["src/main/resources/db/migration/V3__add_cursor.sql"]),
     ]
-    state: dict = {"spec": spec, "patches": []}
+    state: dict = {
+        "spec": spec,
+        "patches": [],
+        "builder_outputs": [],
+        "tester_outputs": [],
+    }
 
     cmd1 = builder_supervisor_node(state)
     assert cmd1.goto == "builder"
@@ -75,37 +104,37 @@ def test_supervisor_dispatches_builder_then_tester_per_slice_in_dependency_order
     assert cmd1.update["build_order"] == ["db-1", "api-1", "test-1"]
 
     state.update(cmd1.update)
-    state["patches"] = [_patch("db-1", "builder")]
+    state["builder_outputs"].append(_builder_output("db-1"))
     cmd2 = builder_supervisor_node(state)
     assert cmd2.goto == "tester"
     assert cmd2.update["current_slice"] == "db-1"
 
     state.update(cmd2.update)
-    state["patches"].append(_patch("db-1", "tester"))
+    state["tester_outputs"].append(_tester_output("db-1"))
     cmd3 = builder_supervisor_node(state)
     assert cmd3.goto == "builder"
     assert cmd3.update["current_slice"] == "api-1"
 
     state.update(cmd3.update)
-    state["patches"].append(_patch("api-1", "builder"))
+    state["builder_outputs"].append(_builder_output("api-1"))
     cmd4 = builder_supervisor_node(state)
     assert cmd4.goto == "tester"
     assert cmd4.update["current_slice"] == "api-1"
 
     state.update(cmd4.update)
-    state["patches"].append(_patch("api-1", "tester"))
+    state["tester_outputs"].append(_tester_output("api-1"))
     cmd5 = builder_supervisor_node(state)
     assert cmd5.goto == "builder"
     assert cmd5.update["current_slice"] == "test-1"
 
     state.update(cmd5.update)
-    state["patches"].append(_patch("test-1", "builder"))
+    state["builder_outputs"].append(_builder_output("test-1"))
     cmd6 = builder_supervisor_node(state)
     assert cmd6.goto == "tester"
     assert cmd6.update["current_slice"] == "test-1"
 
     state.update(cmd6.update)
-    state["patches"].append(_patch("test-1", "tester"))
+    state["tester_outputs"].append(_tester_output("test-1"))
     cmd7 = builder_supervisor_node(state)
     assert cmd7.goto == END
 

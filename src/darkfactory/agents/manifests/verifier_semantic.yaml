@@ -13,10 +13,11 @@ identity:
 
 llm:
   model: claude-sonnet-4-5-20250929
-  temperature: 0.0
   thinking:
     enabled: false
   prompt_path: prompts/verifier_semantic.md
+  prompt_as_user_message: true
+  structured_output: schemas/verifier_semantic_output.json
 
 tools:
   allowed: []
@@ -28,15 +29,13 @@ tools:
 mcp: []
 
 hooks:
-  - event: PreToolUse
-    name: loop_breaker
+  - event: PostToolUse
+    name: structured_output_hint
     parameters: {}
-  - event: PreToolUse
-    name: call_cap
-    parameters: {}
-  - event: UserPromptSubmit
-    name: goal_pin
-    parameters: {}
+  - event: Stop
+    name: heartbeat
+    parameters:
+      detail: "verifier_semantic: turn boundary"
 
 budgets:
   retry_caps: {}

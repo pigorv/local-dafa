@@ -119,7 +119,6 @@ def test_reviewer_client_options_are_hermetic_and_no_tool() -> None:
     assert opts.mcp_servers == {}
     assert opts.setting_sources == []
     assert opts.model == "claude-haiku-4-5-20251001"
-    assert opts.temperature == 0.2
     assert opts.thinking is not None
     assert opts.thinking["type"] == "disabled"
     assert "PreToolUse" in opts.hooks

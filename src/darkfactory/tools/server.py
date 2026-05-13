@@ -2,12 +2,12 @@
 
 The only custom MCP tool that survives the SDK migration is ``sandbox_bash``.
 Every other file/search/edit/git concern is handled by SDK built-ins
-(``Read``/``Write``/``Edit``/``Grep``/``Glob``); the built-in ``Bash`` is
-disabled for every role and replaced by this tool so that all process
-execution routes through the per-task ``RepoSandbox`` — which gives us a
-single chokepoint for the argv allowlist + deny-list + timeout + stdout
-truncation. The worker container itself is the isolation boundary; there
-is no second inner container.
+(``Read``/``Write``/``Edit``/``Grep``/``Glob``). Roles that need shell
+access either allow the built-in ``Bash`` (e.g. builder) or route through
+this tool when they want the per-task ``RepoSandbox``'s argv allowlist +
+deny-list + timeout + stdout truncation chokepoint (e.g. tester, fixer,
+pr_creator). The worker container itself is the isolation boundary;
+there is no second inner container.
 
 The tool body itself does *not* enforce the per-role argv allowlist or the
 ``FORBIDDEN_TOKENS`` deny-list — those checks live in

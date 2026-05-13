@@ -11,7 +11,6 @@ identity:
 
 llm:
   model: claude-sonnet-4-5-20250929
-  temperature: 0.3
   thinking:
     enabled: false
   prompt_path: prompts/plan_critic.md
@@ -27,7 +26,14 @@ tools:
 
 mcp: []
 
-hooks: []
+hooks:
+  - event: PostToolUse
+    name: structured_output_hint
+    parameters: {}
+  - event: Stop
+    name: heartbeat
+    parameters:
+      detail: "plan_critic: turn boundary"
 
 budgets:
   retry_caps: {}

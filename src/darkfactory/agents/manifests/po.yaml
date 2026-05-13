@@ -12,7 +12,6 @@ identity:
 
 llm:
   model: claude-haiku-4-5-20251001
-  temperature: 0.3
   thinking:
     enabled: false
   prompt_path: prompts/po.md
@@ -41,12 +40,27 @@ hooks:
   - event: PreToolUse
     name: call_cap
     parameters: {}
+  - event: PreToolUse
+    name: heartbeat
+    parameters:
+      detail: "po: pre tool"
   - event: UserPromptSubmit
     name: goal_pin
     parameters: {}
   - event: PostToolUse
     name: prompt_injection_guard
     parameters: {}
+  - event: PostToolUse
+    name: structured_output_hint
+    parameters: {}
+  - event: PostToolUse
+    name: heartbeat
+    parameters:
+      detail: "po: post tool"
+  - event: Stop
+    name: heartbeat
+    parameters:
+      detail: "po: turn boundary"
 
 budgets:
   retry_caps: {}

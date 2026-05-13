@@ -11,7 +11,6 @@ identity:
 
 llm:
   model: claude-haiku-4-5-20251001
-  temperature: 0.2
   thinking:
     enabled: false
   prompt_path: prompts/triage.md
@@ -19,15 +18,45 @@ llm:
   structured_output: schemas/triage_output.json
 
 tools:
-  allowed: []
-  disallowed: []
+  allowed:
+    - Read
+    - Grep
+    - Glob
+  disallowed:
+    - Bash
+    - Edit
+    - Write
   argv_allowlist: []
   role_owned_argv_prefixes: []
   edit_path_allowlist: []
 
 mcp: []
 
-hooks: []
+hooks:
+  - event: PreToolUse
+    name: loop_breaker
+    parameters: {}
+  - event: PreToolUse
+    name: call_cap
+    parameters: {}
+  - event: PreToolUse
+    name: heartbeat
+    parameters:
+      detail: "triage: pre tool"
+  - event: PostToolUse
+    name: prompt_injection_guard
+    parameters: {}
+  - event: PostToolUse
+    name: structured_output_hint
+    parameters: {}
+  - event: PostToolUse
+    name: heartbeat
+    parameters:
+      detail: "triage: post tool"
+  - event: Stop
+    name: heartbeat
+    parameters:
+      detail: "triage: turn boundary"
 
 budgets:
   retry_caps: {}

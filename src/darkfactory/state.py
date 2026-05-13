@@ -199,13 +199,50 @@ class Patch(TypedDict):
     edit_kind: NotRequired[str]
     justification: NotRequired[str]
 
-class TestResult(TypedDict):
-    runner: str                           # pytest|npm|cargo|go
+class TestResult(TypedDict, total=False):
+    runner: str                           # plan step name, e.g. "test" / "compile" / "checkstyle"
     returncode: int
     passed: int
     failed: int
     errors: list[str]
     duration_s: float
+    executed_tests: list[str]             # populated when a JUnit-XML report was parsed
+
+
+class CommandStep(TypedDict, total=False):
+    """One step in the agent-discovered VerificationPlan.
+
+    ``argv`` is executed verbatim by ``RepoSandbox.exec`` — the verifier
+    never edits it. ``report_paths`` are globs relative to the repo root;
+    when present, the matching files are parsed via ``tools/reports.py``
+    and become the ground truth for counts/findings, with the command's
+    exit code as the fallback signal. ``required=True`` (the default)
+    means a non-zero exit code with no parsed report files surfaces a
+    synthetic finding; ``required=False`` lets advisory steps run without
+    blocking the gate.
+    """
+
+    name: str
+    argv: list[str]
+    report_paths: list[str]
+    report_kind: Literal["junit-xml", "checkstyle-xml", "sarif"]
+    required: bool
+    timeout_s: int
+
+
+class VerificationPlan(TypedDict, total=False):
+    """Agent-discovered, cached recipe for verifying a target repo.
+
+    Produced once per workflow by the ``verify_planner`` role and cached
+    on ``PipelineState.verification_plan``. The verify subgraph consumes
+    it on every iteration; nothing else in the system knows the names of
+    specific build systems.
+    """
+
+    test: CommandStep
+    compile: CommandStep
+    lint: list[CommandStep]
+    notes: str
 
 class Finding(TypedDict):
     tool: str                             # ruff|mypy|semgrep|bandit
@@ -230,6 +267,70 @@ class TesterFinding(TypedDict):
     wp_id: str
     detail: str
 
+
+class BuilderEditRecord(TypedDict):
+    """One file edit the Builder declared in its structured output."""
+
+    path: str
+    operation: Literal["create", "modify", "delete"]
+    intent: str
+
+
+class BuilderOutputRecord(TypedDict):
+    """One Builder turn's structured output, recorded for downstream reads.
+
+    Multiple records may share a ``wp_id`` when the Builder is re-run after a
+    Fixer turn. Consumers that need a single per-WP record filter to the latest
+    entry at read time.
+    """
+
+    wp_id: str
+    status: Literal["done", "no_changes_needed", "blocked"]
+    edits: list[BuilderEditRecord]
+    blockers: list[str]
+    summary: str
+
+
+class TesterOutputRecord(TypedDict):
+    """One Tester turn's structured output, recorded for downstream reads.
+
+    ``parse_failure`` flags turns where the Tester emitted no structured
+    output — those are surfaced separately on ``reconciliation_findings``
+    rather than the Tester's own ``findings`` channel.
+    """
+
+    wp_id: str
+    summary: str
+    coverage: list[CoverageEntry]
+    findings: list[TesterFinding]
+    parse_failure: bool
+
+
+class ReconciliationFinding(TypedDict, total=False):
+    """Build-stage discrepancy between an agent's declaration and ground truth.
+
+    Routed through its own channel (not ``tester_findings``) so the Verifier
+    and humans reading logs can attribute findings to the producer that
+    emitted them. The ``producer`` field records which build-subgraph step
+    synthesised the entry. ``detail`` always present; the rest are optional
+    so each kind can attach the evidence that matters.
+    """
+
+    kind: Literal[
+        "builder_blocked",
+        "builder_no_action",
+        "claimed_edits_not_applied",
+        "undeclared_edits",
+        "tester_parse_failure",
+        "fixer_blocked",
+    ]
+    wp_id: str
+    producer: str
+    detail: str
+    claimed_paths: list[str]
+    actual_paths: list[str]
+    blockers: list[str]
+
 class PredicateCoverage(TypedDict):
     wp_id: str
     predicate: str
@@ -253,7 +354,7 @@ class VerifySummary(TypedDict):
     hard_findings: int
     predicate_coverage: NotRequired[list[PredicateCoverage]]
     uncovered_predicates: NotRequired[int]
-    blocking_tester_findings: NotRequired[int]
+    blocking_failures: NotRequired[int]
 
 # ---------- Reducers ----------
 
@@ -349,15 +450,22 @@ class PipelineState(TypedDict, total=False):
     work_packages: Annotated[list[dict], overwrite]        # v2 WorkPackage dumps; consumed by Plan Critic
     build_order: Annotated[list[str], overwrite]           # topo-sorted slice ids
     current_slice: Annotated[str, overwrite]
+    builder_summary: Annotated[str, overwrite]
     patches: Annotated[list[Patch], add]
     coverage_entries: Annotated[list[CoverageEntry], add]
     tester_findings: Annotated[list[TesterFinding], add]
+    builder_outputs: Annotated[list[BuilderOutputRecord], add]
+    tester_outputs: Annotated[list[TesterOutputRecord], add]
+    reconciliation_findings: Annotated[list[ReconciliationFinding], add]
     test_results: Annotated[list[TestResult], add]
     findings: Annotated[list[Finding], add]
+    verification_plan: Annotated[Optional[VerificationPlan], overwrite]
+    verification_plan_rev: Annotated[int, overwrite]
     verify_summary: Annotated[Optional[VerifySummary], overwrite]
     verify_retries: Annotated[int, overwrite]
     fixer_attempts_by_predicate: Annotated[dict[str, int], overwrite]
     fixer_attempts_by_wp: Annotated[dict[str, int], overwrite]
+    fixer_decision: Annotated[Optional[dict[str, Any]], overwrite]
     attempt_log: Annotated[list[dict[str, Any]], _bounded_add("DARKFACTORY_ATTEMPT_LOG_MAX", 50)]
     planning_attempts: Annotated[int, overwrite]
     planning_feedback: Annotated[list[str], overwrite]

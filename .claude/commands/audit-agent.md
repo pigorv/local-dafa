@@ -138,10 +138,8 @@ For every channel in the manifest's writes contract:
 ### D7. LLM policy sanity
 - Model choice vs role workload (cheap model on a heavy-reasoning role, or
   a flagship on a trivial extraction, is a smell).
-- Temperature vs output shape (structured-JSON roles typically want low
-  temperature).
 - Thinking enabled vs reasoning complexity.
-- Note that env-var overrides for model / temperature / thinking exist —
+- Note that env-var overrides for model / thinking exist —
   the manifest is the default, not the floor.
 
 ### D8. Output extraction path

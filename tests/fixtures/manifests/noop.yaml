@@ -4,7 +4,6 @@ identity:
   when_to_use: Use only as a composer fixture.
 llm:
   model: claude-sonnet-4-5-20250929
-  temperature: 0.0
   thinking:
     enabled: false
   prompt_path: tests/fixtures/prompts/noop.md

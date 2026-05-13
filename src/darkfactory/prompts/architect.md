@@ -83,6 +83,10 @@ The structured-output schema enforces field shapes; rely on the schema's
 field descriptions for what each field means. The rules below cover the
 non-obvious stuff.
 
+When you emit the structured response, place the schema's fields directly
+as the tool input. Do not wrap them in an outer object such as
+`{"output": {...}}`.
+
 ### Work Packages
 
 - Produce **at least one WP per story**. Each WP names exactly one

@@ -9,7 +9,6 @@ from darkfactory.llm_factory import build_options
 
 _BASE_KWARGS = dict(
     model="claude-sonnet-4-5-20250929",
-    temperature=0.2,
     thinking=False,
     system_prompt="you are a test agent",
     allowed_tools=["Read"],
@@ -23,7 +22,6 @@ def test_build_options_passes_through_caller_supplied_defaults() -> None:
     opts = build_options("po", **_BASE_KWARGS)
     assert isinstance(opts, ClaudeAgentOptions)
     assert opts.model == "claude-sonnet-4-5-20250929"
-    assert opts.temperature == 0.2
     assert opts.setting_sources == []
     assert opts.thinking is not None and opts.thinking["type"] == "disabled"
 
@@ -40,11 +38,9 @@ def test_build_options_thinking_enabled_writes_budget() -> None:
 
 def test_build_options_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LLM_BUILDER_MODEL", "claude-haiku-4-5-20251001")
-    monkeypatch.setenv("LLM_BUILDER_TEMPERATURE", "0.7")
     monkeypatch.setenv("LLM_BUILDER_THINKING", "on")
     opts = build_options("builder", **_BASE_KWARGS)
     assert opts.model == "claude-haiku-4-5-20251001"
-    assert opts.temperature == 0.7
     assert opts.thinking is not None and opts.thinking["type"] == "enabled"
 
 

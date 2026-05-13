@@ -21,7 +21,7 @@ def test_triage_client_returns_sdk_client_with_triage_prompt():
     client = _triage_client()
     assert isinstance(client, ClaudeSDKClient)
     options = client.options
-    assert options.allowed_tools == []
+    assert options.allowed_tools == ["Read", "Grep", "Glob"]
     assert options.mcp_servers == {}
     # The prompt is rendered as the user message; the SDK enforces the
     # output shape via the StructuredOutput synthetic tool.

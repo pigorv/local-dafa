@@ -15,7 +15,6 @@ def _manifest_payload() -> dict:
         },
         "llm": {
             "model": "claude-sonnet-4-5-20250929",
-            "temperature": 0.0,
             "thinking": {"enabled": False},
             "prompt_path": "src/darkfactory/prompts/noop.md",
         },

@@ -12,12 +12,15 @@ legacy ``spec`` channel.
 from __future__ import annotations
 
 import json
-from string import Template
 from typing import Any
 
-from darkfactory.agents._sdk_common import ParseError, _drain, repo_summary
+from darkfactory.agents._sdk_common import (
+    ParseError,
+    _drain,
+    render_role_user_message,
+    repo_summary,
+)
 from darkfactory.agents.compose import ComposeState, compose
-from darkfactory.agents.registry import get_default_registry, resolve_prompt_path
 
 
 def _planning_feedback_text(state_slice: dict) -> str:
@@ -32,11 +35,8 @@ def _planning_feedback_text(state_slice: dict) -> str:
 
 
 def _render_user_prompt(state_slice: dict) -> str:
-    manifest = get_default_registry().get("architect")
-    template_text = resolve_prompt_path(manifest.llm.prompt_path).read_text(
-        encoding="utf-8"
-    )
-    return Template(template_text).safe_substitute(
+    return render_role_user_message(
+        "architect",
         user_request=state_slice.get("user_request", "") or "",
         repo_context=repo_summary(state_slice.get("repo_context")),
         stories=json.dumps(state_slice.get("stories") or [], indent=2),

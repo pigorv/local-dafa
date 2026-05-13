@@ -225,7 +225,6 @@ def _write_minimal_manifest(
         },
         "llm": {
             "model": "claude-sonnet-4-5-20250929",
-            "temperature": 0.0,
             "thinking": {"enabled": False},
             "prompt_path": str(prompt),
         },

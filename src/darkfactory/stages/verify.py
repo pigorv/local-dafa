@@ -1,27 +1,41 @@
-"""Verify-stage nodes: thin wrappers that run tests, linters, and compile.
+"""Verify-stage nodes: language-agnostic, plan-driven.
 
-Each node is a plain graph node (not a `create_agent`). They reuse the
-helpers in `tools/tests.py` and `tools/linters.py` directly, sidestepping
-the `@tool` runtime so they can be invoked deterministically as part of
-the parallel `verify_fanout` (Phase 3 task 3.3) and aggregated by a
-`deferred=True` collector (task 3.4).
+The verifier no longer knows about Maven, Gradle, npm, or any specific
+toolchain. On the first iteration of a workflow it asks the
+``verify_planner`` role to discover the target repo's canonical
+test / compile / lint commands; the resulting ``VerificationPlan`` is
+cached on ``PipelineState.verification_plan`` and reused for every
+subsequent verify iteration.
+
+Each step in the plan is executed once via ``RepoSandbox.exec``. When the
+plan declares ``report_paths`` and a ``report_kind``, the corresponding
+structured-report reader in ``tools/reports.py`` produces the ground
+truth (test counts or Findings). When it doesn't, the verifier falls
+back to exit-code gating: rc=0 is a pass, rc≠0 surfaces a synthetic
+Finding so the aggregator can see it. Stdout regex parsing was removed
+in this refactor — it broke whenever a build added a log-suppression
+flag (e.g. ``mvn -q``).
 
 State deltas:
-- `run_tests_node`             → appends one TestResult to `test_results`.
-- `run_linters_node`           → appends Findings (Checkstyle + Spotless) to `findings`.
-- `run_compile_node`           → appends Findings (javac errors) to `findings`.
-- `run_happy_path_node`        → optional smoke test; currently a no-op stub.
-- `run_semantic_coverage_node` → adds predicate coverage and final pass/fail to
-  `verify_summary`.
+- ``ensure_plan_node`` → sets ``verification_plan`` / ``verification_plan_rev`` /
+  ``findings`` (a discovery-failure finding when the planner emits an
+  empty plan).
+- ``run_plan_node``    → appends one TestResult per ``test`` step plus
+  Findings for compile / lint steps.
+- ``run_semantic_coverage_node`` → adds predicate coverage and final
+  pass/fail to ``verify_summary``.
 """
 from __future__ import annotations
 
 import time
-from typing import Any
+from pathlib import Path
+from typing import Any, Mapping
 
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Send
 
+from darkfactory.agents._sdk_common import ParseError
+from darkfactory.agents.verifier_semantic import run_verifier_semantic
+from darkfactory.agents.verify_planner import run_verify_planner
 from darkfactory.state import (
     Finding,
     PipelineState,
@@ -29,16 +43,13 @@ from darkfactory.state import (
     TestResult,
     VerifySummary,
 )
-from darkfactory.agents.verifier_semantic import run_verifier_semantic
-from darkfactory.tools.linters import (
-    detect_build,
-    parse_checkstyle,
-    parse_compile,
-    parse_spotless,
+from darkfactory.tools.reports import (
+    read_checkstyle_xml,
+    read_junit_xml,
+    read_sarif,
 )
 from darkfactory.tools.sandbox import RepoSandbox
 from darkfactory.tools.shell import get_sandbox, register_sandbox
-from darkfactory.tools.tests import detect_project, parse_gradle, parse_maven
 
 
 def _ensure_sandbox(ctx: Any):
@@ -49,142 +60,311 @@ def _ensure_sandbox(ctx: Any):
     return sb
 
 
-def run_tests_node(state: PipelineState, runtime=None) -> dict:
-    """Run the project's test suite once and append a TestResult."""
-    ctx = getattr(runtime, "context", None) if runtime is not None else None
-    if ctx is None:
+# --- plan discovery -------------------------------------------------------
+
+
+def _plan_is_empty(plan: Mapping[str, Any] | None) -> bool:
+    """A plan with no executable steps is treated as a discovery failure."""
+    if not plan:
+        return True
+    test = plan.get("test")
+    compile_step = plan.get("compile")
+    lint = plan.get("lint") or []
+    has_test = isinstance(test, Mapping) and test.get("argv")
+    has_compile = isinstance(compile_step, Mapping) and compile_step.get("argv")
+    has_lint = any(
+        isinstance(item, Mapping) and item.get("argv") for item in lint
+    )
+    return not (has_test or has_compile or has_lint)
+
+
+async def ensure_plan_node(state: PipelineState, runtime=None) -> dict:
+    """Populate ``verification_plan`` on first verify; no-op when cached.
+
+    On planner failure (no structured output, empty plan) we emit a
+    single ``error`` Finding so the aggregator's hard-findings count
+    fails the gate and the workflow escalates without burning Fixer
+    budget on a problem the Fixer cannot solve.
+    """
+    cached = state.get("verification_plan")
+    if cached and not _plan_is_empty(cached):
         return {}
 
-    detected = detect_project(ctx.repo_path)
-    if "error" in detected:
+    try:
+        plan = await run_verify_planner(dict(state))
+    except ParseError as exc:
         return {
-            "test_results": [
-                TestResult(
-                    runner="unknown",
-                    returncode=-1,
-                    passed=0,
-                    failed=0,
-                    errors=[detected["error"]],
-                    duration_s=0.0,
+            "findings": [
+                Finding(
+                    tool="verify_planner",
+                    severity="error",
+                    file="(verify_planner)",
+                    line=0,
+                    rule="discovery_failed",
+                    message=str(exc),
                 )
-            ]
+            ],
         }
 
-    sb = _ensure_sandbox(ctx)
-    if sb is None:
-        return {}
-
-    started = time.monotonic()
-    result = sb.exec(detected["cmd"], timeout=600)
-    duration = time.monotonic() - started
-
-    out = result.get("stdout", "")
-    err = result.get("stderr", "")
-    kind = detected["kind"]
-    summary: dict[str, int] | None = None
-    if kind == "maven":
-        summary = parse_maven(out, err)
-    elif kind in ("gradle", "gradle-wrapper"):
-        summary = parse_gradle(out, err)
-
-    rc = int(result.get("returncode", -1))
-    passed = (summary or {}).get("passed", 0)
-    failed = (summary or {}).get("failed", 0)
-    errors: list[str] = []
-    if result.get("timed_out"):
-        errors.append("timed_out")
-    if rc != 0 and summary is None:
-        # No parseable summary — surface a tail of stderr so the aggregator/
-        # spec-adjustment agent has something to chew on.
-        tail = (err or out).strip().splitlines()[-20:]
-        if tail:
-            errors.append("\n".join(tail))
+    if _plan_is_empty(plan):
+        notes = ""
+        if isinstance(plan, Mapping):
+            notes = str(plan.get("notes") or "").strip()
+        message = (
+            "verify_planner emitted no executable steps"
+            + (f"; notes: {notes}" if notes else "")
+        )
+        return {
+            "verification_plan": plan,
+            "verification_plan_rev": int(state.get("verification_plan_rev") or 0) + 1,
+            "findings": [
+                Finding(
+                    tool="verify_planner",
+                    severity="error",
+                    file="(verify_planner)",
+                    line=0,
+                    rule="empty_plan",
+                    message=message,
+                )
+            ],
+        }
 
     return {
-        "test_results": [
-            TestResult(
-                runner=kind,
-                returncode=rc,
-                passed=passed,
-                failed=failed,
-                errors=errors,
-                duration_s=duration,
-            )
-        ]
+        "verification_plan": plan,
+        "verification_plan_rev": int(state.get("verification_plan_rev") or 0) + 1,
     }
 
 
-def _run_linter(sb, argv: list[str], parser) -> tuple[int, list[Finding]]:
-    result = sb.exec(argv, timeout=600)
-    findings = parser(result.get("stdout", ""), result.get("stderr", ""))
-    return int(result.get("returncode", -1)), findings
+# --- plan execution -------------------------------------------------------
 
 
-def run_linters_node(state: PipelineState, runtime=None) -> dict:
-    """Run Checkstyle + Spotless and append parsed Findings."""
-    ctx = getattr(runtime, "context", None) if runtime is not None else None
-    if ctx is None:
-        return {}
-
-    detected = detect_build(ctx.repo_path)
-    if "error" in detected:
-        return {}
-
-    sb = _ensure_sandbox(ctx)
-    if sb is None:
-        return {}
-
-    findings: list[Finding] = []
-    _, cs = _run_linter(sb, detected["checkstyle"], parse_checkstyle)
-    findings.extend(cs)
-    _, sp = _run_linter(sb, detected["spotless"], parse_spotless)
-    findings.extend(sp)
-    return {"findings": findings}
+def _stderr_tail(result: Mapping[str, Any], limit: int = 20) -> str:
+    err = str(result.get("stderr") or "")
+    out = str(result.get("stdout") or "")
+    tail_source = err.strip() or out.strip()
+    lines = tail_source.splitlines()[-limit:]
+    return "\n".join(lines)
 
 
-def run_compile_node(state: PipelineState, runtime=None) -> dict:
-    """Compile main + test sources; emit javac errors as Findings.
+def _parse_step_findings(
+    step: Mapping[str, Any],
+    repo_root: Path,
+) -> tuple[list[Finding], bool]:
+    """Parse declared report files for one step.
 
-    Compile errors are the Java analogue of mypy/tsc failures, so they
-    show up in the same `findings` channel as linter output.
+    Returns ``(findings, parsed_any)`` — ``parsed_any`` is True when
+    ``report_paths`` was declared and resolved to at least one file, so
+    the verifier knows whether to trust the report or fall back to
+    exit-code gating.
     """
-    ctx = getattr(runtime, "context", None) if runtime is not None else None
-    if ctx is None:
-        return {}
+    report_paths = list(step.get("report_paths") or [])
+    if not report_paths:
+        return [], False
+    kind = step.get("report_kind")
+    if not kind:
+        return [], False
+    tool = str(step.get("name") or kind)
+    if kind == "checkstyle-xml":
+        findings = read_checkstyle_xml(report_paths, repo_root, tool=tool)
+        # ``read_checkstyle_xml`` only inspects file presence implicitly;
+        # treat any matched file as "parsed" so a clean run with zero
+        # findings still suppresses the exit-code fallback.
+        return findings, _any_report_file_exists(report_paths, repo_root)
+    if kind == "sarif":
+        findings = read_sarif(report_paths, repo_root, tool=tool)
+        return findings, _any_report_file_exists(report_paths, repo_root)
+    # JUnit-XML is parsed by the test branch; treat as no findings here.
+    return [], _any_report_file_exists(report_paths, repo_root)
 
-    detected = detect_build(ctx.repo_path)
-    if "error" in detected:
-        return {}
 
-    sb = _ensure_sandbox(ctx)
-    if sb is None:
-        return {}
+def _any_report_file_exists(report_paths: list[str], repo_root: Path) -> bool:
+    import glob as _glob
 
-    rc, findings = _run_linter(sb, detected["compile"], parse_compile)
-    if rc != 0 and not findings:
-        # Compile failed but the parser found nothing recognisable. Emit a
-        # synthetic finding so the aggregator still sees a failure signal.
-        findings.append(
-            Finding(
-                tool="javac",
-                severity="error",
-                file="(unknown)",
-                line=0,
-                rule="compile",
-                message=f"compile returned non-zero ({rc}) with no parseable diagnostics",
+    for pattern in report_paths:
+        if not pattern:
+            continue
+        base = Path(pattern)
+        if base.is_absolute():
+            matches = _glob.glob(str(base), recursive=True)
+        else:
+            matches = _glob.glob(str(repo_root / pattern), recursive=True)
+        if any(Path(m).is_file() for m in matches):
+            return True
+    return False
+
+
+def _execute_step(
+    sandbox: Any,
+    step: Mapping[str, Any],
+    repo_root: Path,
+) -> tuple[dict[str, Any], float]:
+    argv = list(step.get("argv") or [])
+    timeout = int(step.get("timeout_s") or 600)
+    started = time.monotonic()
+    result = sandbox.exec(argv, timeout=timeout)
+    duration = time.monotonic() - started
+    return dict(result), duration
+
+
+def _run_test_step(
+    sandbox: Any,
+    step: Mapping[str, Any],
+    repo_root: Path,
+) -> TestResult:
+    """Execute a ``test`` step and return one ``TestResult``.
+
+    Counts come from the declared JUnit-XML report when present;
+    otherwise they fall back to ``(0, 0)`` with exit-code-derived
+    errors. The synthetic error tail lets the aggregator count the step
+    as a failure without inventing fake passed/failed numbers.
+    """
+    result, duration = _execute_step(sandbox, step, repo_root)
+    rc = int(result.get("returncode", -1))
+    errors: list[str] = []
+    if result.get("timed_out"):
+        errors.append("timed_out")
+
+    report_kind = step.get("report_kind")
+    report_paths = list(step.get("report_paths") or [])
+    name = str(step.get("name") or "test")
+
+    if report_kind == "junit-xml" and report_paths:
+        summary = read_junit_xml(report_paths, repo_root)
+        executed = summary.executed_tests
+        if not summary.parsed_files and rc != 0:
+            tail = _stderr_tail(result)
+            if tail:
+                errors.append(tail)
+            errors.append(
+                "junit-xml report files declared but none were emitted by the test step"
             )
+        if summary.parse_errors:
+            errors.extend(summary.parse_errors)
+        return TestResult(
+            runner=name,
+            returncode=rc,
+            passed=summary.passed,
+            failed=summary.failed,
+            errors=errors,
+            duration_s=duration,
+            executed_tests=executed,
         )
-    return {"findings": findings}
+
+    # No report — exit-code fallback. We don't fabricate test counts.
+    if rc != 0:
+        tail = _stderr_tail(result)
+        if tail:
+            errors.append(tail)
+        else:
+            errors.append(f"test step exited non-zero ({rc})")
+    return TestResult(
+        runner=name,
+        returncode=rc,
+        passed=0,
+        failed=0,
+        errors=errors,
+        duration_s=duration,
+    )
 
 
-def run_happy_path_node(state: PipelineState, runtime=None) -> dict:
-    """Optional smoke test: boot the app, hit a health endpoint, kill it.
+def _run_finding_step(
+    sandbox: Any,
+    step: Mapping[str, Any],
+    repo_root: Path,
+    *,
+    default_rule: str,
+) -> list[Finding]:
+    """Execute a compile / lint step and return parsed Findings.
 
-    Stubbed for now (per PLAN.md §6 Phase 3 task 2: skip if over budget).
-    Wired so the verify fan-out has a fourth slot ready when we implement
-    it; currently a no-op that records nothing.
+    Behaviour:
+    - Reports declared and parsed → emit those Findings verbatim. A
+      clean run (zero entries in the report) emits zero Findings, even
+      if rc≠0 — the report is the source of truth.
+    - No reports declared, rc=0 → emit nothing. Step passed.
+    - No reports declared, rc≠0, ``required=True`` → emit one synthetic
+      error Finding so the aggregator sees a hard failure.
+    - No reports declared, rc≠0, ``required=False`` → emit one warn
+      Finding so the trace surfaces it but the gate doesn't block.
     """
-    return {}
+    result, _ = _execute_step(sandbox, step, repo_root)
+    rc = int(result.get("returncode", -1))
+    name = str(step.get("name") or default_rule)
+    required = bool(step.get("required", True))
+
+    findings, parsed_any = _parse_step_findings(step, repo_root)
+    if parsed_any:
+        return findings
+
+    if rc == 0 and not result.get("timed_out"):
+        return []
+
+    tail = _stderr_tail(result)
+    message = tail or f"{name} exited non-zero ({rc})"
+    if result.get("timed_out"):
+        message = f"{name}: timed_out\n{message}".rstrip()
+    severity = "error" if required else "warn"
+    return [
+        Finding(
+            tool=name,
+            severity=severity,  # type: ignore[arg-type]
+            file=f"({name})",
+            line=0,
+            rule=default_rule,
+            message=message,
+        )
+    ]
+
+
+async def run_plan_node(state: PipelineState, runtime=None) -> dict:
+    """Execute every step in the cached VerificationPlan.
+
+    The plan is required to be present (set by ``ensure_plan_node``). If
+    it's empty for any reason — e.g. the planner failed and emitted a
+    discovery-failure Finding — we still return cleanly so the aggregate
+    node can compute a summary based on existing state.
+    """
+    ctx = getattr(runtime, "context", None) if runtime is not None else None
+    if ctx is None:
+        return {}
+
+    plan = state.get("verification_plan") or {}
+    if _plan_is_empty(plan):
+        return {}
+
+    sandbox = _ensure_sandbox(ctx)
+    if sandbox is None:
+        return {}
+
+    repo_root = Path(ctx.repo_path)
+    test_results: list[TestResult] = []
+    findings: list[Finding] = []
+
+    test_step = plan.get("test")
+    if isinstance(test_step, Mapping) and test_step.get("argv"):
+        test_results.append(_run_test_step(sandbox, test_step, repo_root))
+
+    compile_step = plan.get("compile")
+    if isinstance(compile_step, Mapping) and compile_step.get("argv"):
+        findings.extend(
+            _run_finding_step(sandbox, compile_step, repo_root, default_rule="compile")
+        )
+
+    for lint_step in plan.get("lint") or []:
+        if not (isinstance(lint_step, Mapping) and lint_step.get("argv")):
+            continue
+        findings.extend(
+            _run_finding_step(sandbox, lint_step, repo_root, default_rule="lint")
+        )
+
+    delta: dict[str, Any] = {}
+    if test_results:
+        delta["test_results"] = test_results
+    if findings:
+        delta["findings"] = findings
+    return delta
+
+
+# --- helpers preserved from the old subgraph -----------------------------
 
 
 def _text_present(value: Any) -> bool:
@@ -279,19 +459,14 @@ def _coverage_to_dict(item: Any) -> dict[str, Any]:
 
 
 async def run_semantic_coverage_node(state: PipelineState, runtime=None) -> dict:
-    """Ask the Semantic Verifier to map WP predicates to evidence.
-
-    The first aggregate node owns mechanical pass/fail. This node attaches the
-    semantic coverage map and then recomputes the final verifier verdict across
-    mechanical checks, predicate coverage, and blocking Tester findings.
-    """
+    """Ask the Semantic Verifier to map WP predicates to evidence."""
     if not _has_verification_predicates(state):
         return {}
 
     result = await run_verifier_semantic(dict(state))
     predicate_coverage = [
         _coverage_to_dict(item)
-        for item in (getattr(result, "predicate_coverage", None) or [])
+        for item in (result.get("predicate_coverage") or [])
     ]
     summary = _aggregate_verify_summary(
         state,
@@ -305,28 +480,28 @@ async def run_semantic_coverage_node(state: PipelineState, runtime=None) -> dict
     return delta
 
 
-VERIFY_TARGETS = ("run_tests", "run_linters", "run_compile", "run_happy_path")
+_BLOCKING_RECONCILIATION_KINDS = frozenset(
+    {
+        "builder_blocked",
+        "builder_no_action",
+        "claimed_edits_not_applied",
+        "tester_parse_failure",
+        "fixer_blocked",
+    }
+)
 
 
-def verify_fanout(state: PipelineState) -> list[Send]:
-    """Conditional-edge router: emit one `Send` per verify node.
-
-    Returning a list of `Send` from a conditional edge is the LangGraph
-    pattern that makes the four verify nodes execute in the same superstep
-    — Studio renders them pulsing simultaneously (R11). The deferred
-    aggregator that consumes their writes lands in task 3.4.
-    """
-    return [Send(target, state) for target in VERIFY_TARGETS]
-
-
-def _blocking_tester_findings(state: PipelineState) -> int:
-    count = 0
-    for finding in state.get("tester_findings") or []:
-        if _read_field(finding, "resolved", False):
-            continue
-        if _read_field(finding, "blocking", True):
-            count += 1
-    return count
+def _blocking_failures(state: PipelineState) -> int:
+    tester = len(state.get("tester_findings") or [])
+    recon = sum(
+        1
+        for finding in (state.get("reconciliation_findings") or [])
+        if (
+            isinstance(finding, dict)
+            and finding.get("kind") in _BLOCKING_RECONCILIATION_KINDS
+        )
+    )
+    return tester + recon
 
 
 def _uncovered_predicates(
@@ -374,19 +549,19 @@ def _aggregate_verify_summary(
         for finding in (state.get("findings") or [])
         if finding.get("severity") in ("error", "critical")
     )
-    blocking_tester_findings = _blocking_tester_findings(state)
+    blocking_failures = _blocking_failures(state)
     passed = (
         failed_tests == 0
         and hard_findings == 0
-        and blocking_tester_findings == 0
+        and blocking_failures == 0
     )
     summary = VerifySummary(
         passed=passed,
         failed_tests=failed_tests,
         hard_findings=hard_findings,
     )
-    if blocking_tester_findings:
-        summary["blocking_tester_findings"] = blocking_tester_findings
+    if blocking_failures:
+        summary["blocking_failures"] = blocking_failures
 
     if include_semantic:
         coverage = predicate_coverage or []
@@ -402,13 +577,7 @@ def _aggregate_verify_summary(
 
 
 def aggregate(state: PipelineState, runtime=None) -> dict:
-    """Join point for the four parallel verify branches.
-
-    Collapses the fan-out outputs into one structured verdict and bumps
-    `verify_retries` whenever the verdict is *not* a pass. The retry-cap
-    routing (task 3.6) lives in the top-level graph and reads this counter
-    to decide between another Build pass or a hard stop.
-    """
+    """Reduce mechanical evidence (tests + findings) to a verdict."""
     summary = _aggregate_verify_summary(state)
     delta: dict[str, Any] = {"verify_summary": summary}
     if not summary["passed"]:
@@ -417,22 +586,24 @@ def aggregate(state: PipelineState, runtime=None) -> dict:
 
 
 def verify_subgraph() -> Any:
-    """Verify subgraph: fan out mechanical checks, aggregate, then cover predicates.
+    """Verify subgraph: discover plan → run plan → aggregate → semantic.
 
-    Compiled with `RunContext` so the inner nodes see `runtime.context`
-    (sandbox, repo_path) when invoked from the top-level graph.
+    The four-way fan-out from the previous design is gone; the plan
+    discovery + execution path is sequential because each downstream
+    node depends on the prior node's writes (the planner populates
+    ``verification_plan``, ``run_plan_node`` populates ``test_results``
+    and ``findings``, and only then can the aggregator and semantic
+    coverage step compute a summary).
     """
     g = StateGraph(PipelineState, context_schema=RunContext)
-    g.add_node("run_tests", run_tests_node)
-    g.add_node("run_linters", run_linters_node)
-    g.add_node("run_compile", run_compile_node)
-    g.add_node("run_happy_path", run_happy_path_node)
-    g.add_node("aggregate", aggregate, defer=True)
+    g.add_node("ensure_plan", ensure_plan_node)
+    g.add_node("run_plan", run_plan_node)
+    g.add_node("aggregate", aggregate)
     g.add_node("run_semantic_coverage", run_semantic_coverage_node)
 
-    g.add_conditional_edges(START, verify_fanout, list(VERIFY_TARGETS))
-    for target in VERIFY_TARGETS:
-        g.add_edge(target, "aggregate")
+    g.add_edge(START, "ensure_plan")
+    g.add_edge("ensure_plan", "run_plan")
+    g.add_edge("run_plan", "aggregate")
     g.add_edge("aggregate", "run_semantic_coverage")
     g.add_edge("run_semantic_coverage", END)
     return g.compile()

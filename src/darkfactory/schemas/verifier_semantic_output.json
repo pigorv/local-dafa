@@ -1,0 +1,37 @@
+{
+  "type": "object",
+  "title": "PredicateCoverageReport",
+  "description": "Predicate-coverage report: the predicate_coverage field below, with one entry per Work Package verification predicate. Place these fields directly as the tool input — no outer wrapper.",
+  "additionalProperties": false,
+  "required": ["predicate_coverage"],
+  "properties": {
+    "predicate_coverage": {
+      "type": "array",
+      "description": "One entry per Work Package verification predicate. Empty only when no predicates were in scope.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["wp_id", "predicate", "status", "evidence"],
+        "properties": {
+          "wp_id": {
+            "type": "string",
+            "description": "Work Package id (e.g. 'WP-1') the predicate belongs to."
+          },
+          "predicate": {
+            "type": "string",
+            "description": "Verbatim verification predicate text copied from the Work Package."
+          },
+          "status": {
+            "type": "string",
+            "enum": ["covered", "uncovered", "weakly_covered"],
+            "description": "covered: Tester evidence names a concrete test and that test plausibly proves the predicate. uncovered: no relevant evidence, the named test did not run, or mechanical failures prevent trusting the result. weakly_covered: evidence is tautological, checks only that code runs, asserts only non-null/no-exception behaviour, or does not verify the predicate's meaningful outcome."
+          },
+          "evidence": {
+            "type": "string",
+            "description": "Concise pointer to the test method/file or failure signal that drove the decision. Must not be empty."
+          }
+        }
+      }
+    }
+  }
+}

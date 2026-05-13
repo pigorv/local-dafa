@@ -13,7 +13,11 @@ from claude_agent_sdk.types import (
 )
 from pydantic import BaseModel
 
-from darkfactory.agents._sdk_common import ParseError, run_to_completion
+from darkfactory.agents._sdk_common import (
+    ParseError,
+    _unwrap_singleton,
+    run_to_completion,
+)
 
 
 class Greeting(BaseModel):
@@ -201,3 +205,57 @@ def test_run_to_completion_without_schema_returns_text_and_result() -> None:
     assert isinstance(out, dict)
     assert out["text"] == "free-form answer"
     assert isinstance(out["result"], ResultMessage)
+
+
+# ---------- _unwrap_singleton ----------
+
+
+def test_unwrap_singleton_drops_outer_key() -> None:
+    wrapped = {"output": {"hello": "world", "n": 1}}
+    assert _unwrap_singleton(wrapped) == {"hello": "world", "n": 1}
+
+
+def test_unwrap_singleton_drops_arbitrary_single_outer_key() -> None:
+    wrapped = {"payload": {"approved": True, "reason": ""}}
+    assert _unwrap_singleton(wrapped) == {"approved": True, "reason": ""}
+
+
+def test_unwrap_singleton_preserves_multi_key_dict() -> None:
+    direct = {"hello": "world", "n": 1}
+    assert _unwrap_singleton(direct) == direct
+
+
+def test_unwrap_singleton_preserves_singleton_with_scalar_value() -> None:
+    # Real schemas can have one-required-field shapes (e.g. predicate_coverage);
+    # only unwrap when the inner value is itself a dict.
+    direct = {"predicate_coverage": [{"id": "p1"}]}
+    assert _unwrap_singleton(direct) == direct
+
+
+def test_unwrap_singleton_handles_none_and_empty() -> None:
+    assert _unwrap_singleton(None) is None
+    assert _unwrap_singleton({}) == {}
+
+
+def test_drain_unwraps_wrapped_structured_output() -> None:
+    from darkfactory.agents._sdk_common import _drain
+
+    wrapped_input = {"output": {"hello": "world", "n": 1}}
+    tool_use = ToolUseBlock(
+        id="t1", name="StructuredOutput", input=wrapped_input
+    )
+    msg = AssistantMessage(
+        content=[tool_use],
+        model="fake-model",
+        usage=None,
+        message_id="msg-1",
+        session_id="session-1",
+        stop_reason="end_turn",
+    )
+    client = FakeClient([[msg, _result()]])
+
+    text, structured, result = asyncio.run(_drain(client))  # type: ignore[arg-type]
+
+    assert structured == {"hello": "world", "n": 1}
+    assert isinstance(result, ResultMessage)
+    assert text == ""

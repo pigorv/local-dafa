@@ -3,60 +3,47 @@
 Owns test code; reads the Builder's diff for shapes only and derives
 assertions from the WP's ``verification`` predicate (the diff-blindness rule).
 
-Production-code edits are restricted to the ``tester_mechanical``
-category — rename / import / signature alignment. Anything semantic
-returns a structured finding instead of touching production code; the
-strict Fixer handles those.
+The output shape is defined by ``schemas/tester_output.json`` and enforced
+by the SDK's ``output_format``; this module does not declare a Pydantic
+schema (matches the PO/Architect pattern). The Tester does not declare
+test patches — the build subgraph computes them from ``git diff`` after
+the Tester's turn, exactly like it does for Builder (PR C).
+
+Production-code edits are restricted to mechanical rename / import /
+signature alignment. Anything semantic returns a ``behavior_mismatch``
+finding; the strict Fixer handles those.
 """
 from __future__ import annotations
 
 import json
-from typing import Any, Literal
+import logging
+from typing import Any
 
-from pydantic import BaseModel, Field
-
-from darkfactory.agents._sdk_common import run_to_completion
+from darkfactory.agents._sdk_common import (
+    _drain,
+    render_role_user_message,
+    repo_summary,
+)
 from darkfactory.agents.compose import ComposeState, compose
-from darkfactory.state import Patch
+
+log = logging.getLogger(__name__)
 
 ROLE = "tester"
 
 
-class CoverageEntryModel(BaseModel):
-    wp_id: str
-    predicate: str
-    test_names: list[str] = Field(default_factory=list)
-
-
-class TesterFinding(BaseModel):
-    kind: Literal[
-        "behavior_mismatch",
-        "naming_mismatch",
-        "unclear_predicate",
-        "infeasible_predicate",
-    ]
-    wp_id: str
-    detail: str = ""
-
-
-class TesterOutput(BaseModel):
-    """Tester structured output: tests + coverage map + findings."""
-
-    # `Test*`-named classes are otherwise picked up by pytest's default class
-    # collection rule and emit a noisy PytestCollectionWarning.
-    __test__ = False
-
-    summary: str = ""
-    coverage: list[CoverageEntryModel] = Field(default_factory=list)
-    findings: list[TesterFinding] = Field(default_factory=list)
-    patches: list[dict[str, Any]] = Field(default_factory=list)
+def _resolve_work_package(state_slice: dict) -> dict:
+    slice_id = state_slice.get("current_slice") or ""
+    for s in state_slice.get("spec") or []:
+        if isinstance(s, dict) and s.get("story_id") == slice_id:
+            return s
+    return {}
 
 
 def _builder_signal(state_slice: dict) -> str:
-    """Pluck the Builder's patches and summary for *this* WP into a Tester briefing.
+    """Render the Builder's patches and summary for *this* WP as a JSON block.
 
-    The Tester is told to use these to learn shapes only — it must not
-    derive assertions from this content.
+    The Tester reads this to learn shapes only — it must not derive
+    assertions from the content.
     """
     slice_id = state_slice.get("current_slice") or ""
     builder_patches = [
@@ -73,41 +60,50 @@ def _builder_signal(state_slice: dict) -> str:
     )
 
 
-def _user_message(state_slice: dict) -> str:
-    slice_id = state_slice.get("current_slice") or ""
-    slice_obj: dict = {}
-    for s in state_slice.get("spec") or []:
-        if isinstance(s, dict) and s.get("story_id") == slice_id:
-            slice_obj = s
-            break
-    return (
-        f"Work Package (JSON):\n{json.dumps(slice_obj, indent=2)}\n\n"
-        f"Builder output for this WP (read for shape, NOT for assertions):\n"
-        f"{_builder_signal(state_slice)}\n\n"
-        "Write tests against the WP's `verification` predicate. End with a "
-        "TesterOutput tool call carrying the coverage map and any findings."
+def _render_user_prompt(state_slice: dict) -> str:
+    return render_role_user_message(
+        ROLE,
+        user_request=state_slice.get("user_request", "") or "",
+        repo_context=repo_summary(state_slice.get("repo_context")),
+        implementation_brief=json.dumps(
+            state_slice.get("implementation_brief") or {}, indent=2
+        ),
+        work_package=json.dumps(_resolve_work_package(state_slice), indent=2),
+        builder_signal=_builder_signal(state_slice),
     )
 
 
-async def run_tester(state_slice: dict) -> TesterOutput:
-    sink: list[Patch] = []
-    compose_state = ComposeState.from_mapping(state_slice, patches_sink=sink)
+async def run_tester(state_slice: dict) -> dict[str, Any]:
+    """Run the Tester for the active Work Package and return a result dict.
+
+    Returns ``{summary, coverage, findings, parse_failure}``. The
+    ``parse_failure`` flag is ``True`` when the SDK loop emitted no
+    structured output (the agent did not respond through the
+    ``StructuredOutput`` tool) — the build subgraph translates that into
+    a ``reconciliation_findings`` entry of kind ``tester_parse_failure``
+    so the channel attribution stays clean (the Tester's ``findings``
+    array only ever holds Tester-declared findings).
+    """
+    compose_state = ComposeState.from_mapping(state_slice)
+    rendered = _render_user_prompt(state_slice)
     async with compose(
         ROLE,
         compose_state,
         task_id=compose_state.task_id,
     ) as client:
-        await client.query(_user_message(state_slice))
-        try:
-            result = await run_to_completion(client, expect=TesterOutput)
-        except Exception:
-            # Fall back to an empty TesterOutput so the build subgraph keeps
-            # progressing; the Verifier semantic pass will mark predicates
-            # uncovered and the build will fail into Fixer with a clear
-            # signal rather than crashing the workflow.
-            return TesterOutput(patches=[dict(p) for p in sink])
-    assert isinstance(result, TesterOutput)
-    # Merge captured test patches into the structured output so callers see
-    # both the diff-capture sink and the Tester's self-reported coverage.
-    result.patches = [dict(p) for p in sink]
-    return result
+        await client.query(rendered)
+        _text, structured, _result = await _drain(client)
+
+    if structured is None:
+        return {
+            "summary": "",
+            "coverage": [],
+            "findings": [],
+            "parse_failure": True,
+        }
+    return {
+        "summary": structured.get("summary", "") or "",
+        "coverage": list(structured.get("coverage") or []),
+        "findings": list(structured.get("findings") or []),
+        "parse_failure": False,
+    }

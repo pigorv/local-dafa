@@ -37,7 +37,6 @@ def _manifest_payload(prompt_path: Path, *, role: str = "hooked") -> dict[str, A
         },
         "llm": {
             "model": "claude-sonnet-4-5-20250929",
-            "temperature": 0.2,
             "thinking": {"enabled": True, "budget_tokens": 1234},
             "prompt_path": str(prompt_path),
         },
@@ -53,12 +52,12 @@ def _manifest_payload(prompt_path: Path, *, role: str = "hooked") -> dict[str, A
             {
                 "event": "PreToolUse",
                 "name": "call_cap",
-                "parameters": {"cap": 3},
+                "parameters": {"max_turns": 3},
             },
             {
                 "event": "PostToolUse",
-                "name": "diff_capture",
-                "parameters": {"edit_kind": "fixture", "justification": "test"},
+                "name": "prompt_injection_guard",
+                "parameters": {},
             },
             {
                 "event": "UserPromptSubmit",
@@ -93,7 +92,6 @@ def test_compose_noop_options_mirror_manifest() -> None:
     opts = client.options
 
     assert opts.model == manifest.llm.model
-    assert opts.temperature == manifest.llm.temperature
     assert opts.system_prompt == prompt
     assert list(opts.allowed_tools or []) == list(manifest.tools.allowed)
     assert list(opts.disallowed_tools or []) == list(manifest.tools.disallowed)
@@ -113,14 +111,12 @@ def test_compose_materializes_hooks_mcp_permission_gate_and_state(
     manifests_dir = tmp_path / "manifests"
     _write_manifest(manifests_dir, _manifest_payload(prompt))
     registry = load_registry(manifests_dir)
-    sink: list[dict[str, Any]] = []
 
     client = compose(
         "hooked",
         ComposeState(
             slice_id="WP-1",
             task_id="task-hooked",
-            patches_sink=sink,
             gate_approved=True,
             dependency_changes_authorized=True,
             user_request="keep the goal pinned",
@@ -132,7 +128,6 @@ def test_compose_materializes_hooks_mcp_permission_gate_and_state(
 
     assert "darkfactory" in opts.mcp_servers
     assert callable(opts.can_use_tool)
-    assert opts.patches_sink is sink
     assert opts.thinking is not None
     assert opts.thinking["type"] == "enabled"
     assert opts.thinking["budget_tokens"] == 1234
@@ -142,7 +137,9 @@ def test_compose_materializes_hooks_mcp_permission_gate_and_state(
     assert pre_hooks[0].__name__ == "path_guard_hook"
     assert pre_hooks[1].__name__ == "call_cap_hook"
     post_hooks = list(opts.hooks["PostToolUse"][0].hooks)
-    assert [hook.__name__ for hook in post_hooks] == ["diff_capture_hook"]
+    assert [hook.__name__ for hook in post_hooks] == [
+        "prompt_injection_guard_hook"
+    ]
     submit_hooks = list(opts.hooks["UserPromptSubmit"][0].hooks)
     assert [hook.__name__ for hook in submit_hooks] == ["goal_pin_hook"]
 
@@ -157,7 +154,6 @@ def test_compose_applies_env_then_in_process_overrides(
     _write_manifest(manifests_dir, _manifest_payload(prompt))
     registry = load_registry(manifests_dir)
     monkeypatch.setenv("LLM_HOOKED_MODEL", "env-model")
-    monkeypatch.setenv("LLM_HOOKED_TEMPERATURE", "0.7")
     monkeypatch.setenv("LLM_HOOKED_THINKING", "off")
 
     client = compose(
@@ -167,7 +163,6 @@ def test_compose_applies_env_then_in_process_overrides(
         overrides=ComposeOverrides(
             registry=registry,
             model="process-model",
-            temperature=0.4,
             thinking=True,
             thinking_budget_tokens=2222,
         ),
@@ -175,7 +170,6 @@ def test_compose_applies_env_then_in_process_overrides(
     opts = client.options
 
     assert opts.model == "process-model"
-    assert opts.temperature == 0.4
     assert opts.thinking is not None
     assert opts.thinking["type"] == "enabled"
     assert opts.thinking["budget_tokens"] == 2222

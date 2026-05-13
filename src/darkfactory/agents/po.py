@@ -15,16 +15,19 @@ Two transforms are applied to the structured output:
   from ``stories[].acceptance_criteria`` when the model left it empty.
 
 ``_ensure_defaults`` backfills optional fields so downstream consumers
-always see the full POOutput shape.
+always see the full ProductRequest shape.
 """
 from __future__ import annotations
 
-from string import Template
 from typing import Any
 
-from darkfactory.agents._sdk_common import ParseError, _drain, repo_summary
+from darkfactory.agents._sdk_common import (
+    ParseError,
+    _drain,
+    render_role_user_message,
+    repo_summary,
+)
 from darkfactory.agents.compose import ComposeState, compose
-from darkfactory.agents.registry import get_default_registry, resolve_prompt_path
 
 _LEGACY_ALIASES: dict[str, str] = {
     "acceptance_criteria": "expected_behavior",
@@ -86,11 +89,8 @@ def _planning_feedback_text(state_slice: dict) -> str:
 
 
 def _render_user_prompt(state_slice: dict) -> str:
-    manifest = get_default_registry().get("po")
-    template_text = resolve_prompt_path(manifest.llm.prompt_path).read_text(
-        encoding="utf-8"
-    )
-    return Template(template_text).safe_substitute(
+    return render_role_user_message(
+        "po",
         user_request=state_slice.get("user_request", "") or "",
         repo_context=repo_summary(state_slice.get("repo_context")),
         planning_feedback=_planning_feedback_text(state_slice),

@@ -1,7 +1,7 @@
 {
   "type": "object",
-  "title": "ArchitectOutput",
-  "description": "Architect output: brief design fields plus a topo-sortable list of Work Packages.",
+  "title": "ImplementationBrief",
+  "description": "Implementation brief: the current_understanding, proposed_design, contract_changes, test_strategy, and topo-sortable work_packages fields below. Place these fields directly as the tool input — no outer wrapper.",
   "additionalProperties": false,
   "required": [
     "current_understanding",

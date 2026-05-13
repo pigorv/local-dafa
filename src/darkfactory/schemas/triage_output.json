@@ -1,7 +1,7 @@
 {
   "type": "object",
-  "title": "TriageOutput",
-  "description": "Triage decision: whether a GitHub issue is ready for Dark Factory to build, or which clarification questions to post back.",
+  "title": "TriageDecision",
+  "description": "Triage decision: the ready_to_build, clarification_questions, derived_user_request, confidence, and rationale fields below. Place these fields directly as the tool input — no outer wrapper.",
   "additionalProperties": false,
   "required": [
     "ready_to_build",

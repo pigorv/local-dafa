@@ -2,23 +2,22 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
 from claude_agent_sdk import HookMatcher
-from claude_agent_sdk.types import AssistantMessage, ResultMessage, TextBlock
-from pydantic import ValidationError
+from claude_agent_sdk.types import (
+    AssistantMessage,
+    ResultMessage,
+    TextBlock,
+    ToolUseBlock,
+)
 
 from darkfactory.agents import verifier_semantic as verifier_semantic_mod
 from darkfactory.agents._sdk_common import load_prompt
 from darkfactory.agents.compose import ComposeState, compose
-from darkfactory.agents.verifier_semantic import (
-    PredicateCoverageModel,
-    SemanticVerifierOutput,
-    run_verifier_semantic,
-)
+from darkfactory.agents.verifier_semantic import run_verifier_semantic
 from darkfactory.state import (
     ContractChanges,
     ImplementationBrief,
@@ -29,6 +28,20 @@ from darkfactory.state import (
 
 def _assistant(text: str) -> AssistantMessage:
     return AssistantMessage(content=[TextBlock(text=text)], model="fake-model")
+
+
+def _structured_assistant(payload: dict) -> AssistantMessage:
+    """An assistant turn that emits the SDK's synthetic StructuredOutput tool."""
+    return AssistantMessage(
+        content=[
+            ToolUseBlock(
+                id="toolu_verifier_1",
+                name="StructuredOutput",
+                input=payload,
+            )
+        ],
+        model="fake-model",
+    )
 
 
 def _result() -> ResultMessage:
@@ -141,8 +154,8 @@ def _state_slice() -> dict:
     }
 
 
-def test_verifier_semantic_client_options_are_hermetic_and_no_tool() -> None:
-    state = ComposeState.from_mapping({"user_request": "x"})
+def test_verifier_semantic_client_options_match_plan_critic_pattern() -> None:
+    state = ComposeState.task_only("task-1")
     client = compose("verifier_semantic", state, task_id=state.task_id)
     opts = client.options
     assert opts is not None
@@ -150,76 +163,84 @@ def test_verifier_semantic_client_options_are_hermetic_and_no_tool() -> None:
     assert opts.mcp_servers == {}
     assert opts.setting_sources == []
     assert opts.model == "claude-sonnet-4-5-20250929"
-    assert opts.temperature == 0.0
     assert opts.thinking is not None
     assert opts.thinking["type"] == "disabled"
-    assert "PreToolUse" in opts.hooks
-    assert "PostToolUse" not in opts.hooks
-    assert "UserPromptSubmit" in opts.hooks
-    assert isinstance(opts.hooks["PreToolUse"][0], HookMatcher)
+    # Stop heartbeat plus the StructuredOutput hint hook — no unreachable
+    # PreToolUse / UserPromptSubmit hooks (zero-tool, single-prompt role).
+    assert "PreToolUse" not in opts.hooks
+    assert "UserPromptSubmit" not in opts.hooks
+    assert "Stop" in opts.hooks
+    assert isinstance(opts.hooks["Stop"][0], HookMatcher)
+    assert "PostToolUse" in opts.hooks
+    post_hook_names = [
+        hook.__name__
+        for matcher in opts.hooks["PostToolUse"]
+        for hook in matcher.hooks
+    ]
+    assert "structured_output_hint_hook" in post_hook_names
+    # SDK output_format is wired from the manifest's structured_output schema.
+    assert opts.output_format is not None
+    assert opts.output_format["type"] == "json_schema"
+    assert opts.output_format["schema"]["title"] == "PredicateCoverageReport"
 
 
-def test_verifier_semantic_prompt_names_predicate_statuses() -> None:
+def test_verifier_semantic_prompt_names_predicate_statuses_and_placeholders() -> None:
     prompt = load_prompt("verifier_semantic")
     assert "predicate_coverage" in prompt
     assert "covered" in prompt
     assert "uncovered" in prompt
     assert "weakly_covered" in prompt
     assert "tautological" in prompt
-    assert "No prose, no markdown fences" in prompt
-
-
-def test_semantic_verifier_output_validates_status_values() -> None:
-    out = SemanticVerifierOutput.model_validate(
-        {
-            "predicate_coverage": [
-                {
-                    "wp_id": "WP-1",
-                    "predicate": "GET /customers/{unknown_id} returns 404",
-                    "status": "covered",
-                    "evidence": "CustomerControllerTest.missingCustomerReturns404",
-                }
-            ]
-        }
-    )
-    assert out.predicate_coverage[0].status == "covered"
-
-    with pytest.raises(ValidationError):
-        PredicateCoverageModel.model_validate(
-            {
-                "wp_id": "WP-1",
-                "predicate": "GET /customers/{unknown_id} returns 404",
-                "status": "maybe",
-                "evidence": "",
-            }
-        )
+    # User-message template placeholders must be present so
+    # render_role_user_message can substitute them.
+    for placeholder in (
+        "$user_request",
+        "$implementation_brief",
+        "$spec",
+        "$coverage_entries",
+        "$test_files",
+        "$test_results",
+        "$findings",
+        "$tester_findings",
+    ):
+        assert placeholder in prompt, placeholder
 
 
 def test_run_verifier_semantic_returns_structured_coverage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    payload = json.dumps(
-        {
-            "predicate_coverage": [
-                {
-                    "wp_id": "WP-1",
-                    "predicate": "GET /customers/{unknown_id} returns 404 and an error body",
-                    "status": "covered",
-                    "evidence": "CustomerControllerTest.missingCustomerReturns404 asserts 404 and body",
-                }
-            ]
-        }
-    )
-    fake = _FakeClient([[_assistant(payload), _result()]])
+    payload = {
+        "predicate_coverage": [
+            {
+                "wp_id": "WP-1",
+                "predicate": "GET /customers/{unknown_id} returns 404 and an error body",
+                "status": "covered",
+                "evidence": "CustomerControllerTest.missingCustomerReturns404 asserts 404 and body",
+            }
+        ]
+    }
+    fake = _FakeClient([[_structured_assistant(payload), _result()]])
     _patch_client(monkeypatch, fake)
 
     out = asyncio.run(run_verifier_semantic(_state_slice()))
 
-    assert isinstance(out, SemanticVerifierOutput)
-    assert len(out.predicate_coverage) == 1
-    assert out.predicate_coverage[0].wp_id == "WP-1"
-    assert out.predicate_coverage[0].status == "covered"
+    assert out == payload
     assert len(fake.queries) == 1
+    # The rendered user message must carry the substituted inputs.
     assert "Implementation Brief" in fake.queries[0]
     assert "Tester coverage entries" in fake.queries[0]
     assert "CustomerControllerTest.java" in fake.queries[0]
+
+
+def test_run_verifier_semantic_falls_back_on_missing_structured_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No StructuredOutput tool-use block → _drain returns structured=None;
+    # runtime returns an empty predicate_coverage list so the verify
+    # subgraph still produces a verdict (every predicate ends up uncovered).
+    fake = _FakeClient([[_assistant("free-form text, no tool call"), _result()]])
+    _patch_client(monkeypatch, fake)
+
+    out = asyncio.run(run_verifier_semantic(_state_slice()))
+
+    assert out == {"predicate_coverage": []}

@@ -1,0 +1,66 @@
+{
+  "type": "object",
+  "title": "TesterReport",
+  "description": "Tester report: the summary, coverage, and findings fields below. Test patches are computed by the build subgraph from `git diff` after this turn — you do not declare them. Place these fields directly as the tool input — no outer wrapper.",
+  "additionalProperties": false,
+  "required": ["summary", "coverage", "findings"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "Up to four sentences describing what was tested and which test files were written or touched."
+    },
+    "coverage": {
+      "type": "array",
+      "description": "One entry per (Work Package, verification predicate) pair you wrote tests for. Empty when no tests were written.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["wp_id", "predicate", "test_names"],
+        "properties": {
+          "wp_id": {
+            "type": "string",
+            "description": "The Work Package's story_id (the same id used in the input Work Package JSON)."
+          },
+          "predicate": {
+            "type": "string",
+            "description": "Verbatim verification predicate text copied from the Work Package."
+          },
+          "test_names": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Fully-qualified test method names whose assertions correspond to this predicate, e.g. 'OrderControllerTest.rejectsNegativeOffset'."
+          }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "description": "Structured Tester findings. Empty list when nothing is amiss. Pick the most specific kind.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "wp_id", "detail"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "behavior_mismatch",
+              "naming_mismatch",
+              "unclear_predicate",
+              "infeasible_predicate"
+            ],
+            "description": "behavior_mismatch: production code behaviour drifts from the predicate (Fixer can patch). naming_mismatch: classes/methods named differently from expectation; mechanical rename is the fix. unclear_predicate: the predicate is ambiguous or missing. infeasible_predicate: the predicate cannot be satisfied within the brief's stated constraints; short-circuits the Fixer loop and routes to a human gate, so reserve it for genuine planning errors."
+          },
+          "wp_id": {
+            "type": "string",
+            "description": "The Work Package's story_id this finding belongs to."
+          },
+          "detail": {
+            "type": "string",
+            "description": "Up to two sentences describing the finding."
+          }
+        }
+      }
+    }
+  }
+}

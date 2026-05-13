@@ -23,7 +23,6 @@ from darkfactory.agents.registry import (
 )
 from darkfactory.hooks.permission_gate import make_permission_gate
 from darkfactory.llm_factory import build_options
-from darkfactory.state import Patch
 from darkfactory.tools.server import build_mcp_server
 
 
@@ -31,52 +30,41 @@ from darkfactory.tools.server import build_mcp_server
 class ComposeState:
     """Runtime seams that cannot live in a static role manifest.
 
-    ``slice_id`` tags diff-capture patches with the active Work Package.
+    ``slice_id`` tags the active Work Package for compose-time use (some
+    roles override it, e.g. Fixer pins it to the failing WP).
     ``task_id`` selects the per-task RepoSandbox and MCP server instance.
-    ``patches_sink`` is the mutable list populated by diff_capture.
     ``gate_approved`` closes over the human gate state for PR publication.
     ``dependency_changes_authorized`` feeds path_guard's lockfile allowance.
     ``user_request`` and ``spec_summary`` feed goal_pin reminders.
-    ``slice_intent`` is the active Work Package's intent string, used by
-    diff_capture's ``justification_template`` so per-edit justifications
-    remain WP-scoped without each role re-implementing the lookup.
-    ``patch_justification`` is a caller-precomputed seam for roles whose
-    justification text cannot be expressed as a static ``{slice_id}/
-    {slice_intent}`` template (e.g. Fixer derives WP ids + predicates from
-    ``verify_summary``). Manifests opt in via
-    ``justification_template: "{patch_justification}"``.
+
+    PR C removed the ``patches_sink``, ``slice_intent``, and
+    ``patch_justification`` seams that fed the legacy ``diff_capture``
+    hook — patches are now computed deterministically from ``git diff``
+    by the build subgraph and the Fixer activity.
     """
 
     slice_id: str = ""
     task_id: str = ""
-    patches_sink: list[Patch] = field(default_factory=list)
     gate_approved: bool = False
     dependency_changes_authorized: bool = False
     user_request: str = ""
     spec_summary: str = ""
-    slice_intent: str = ""
-    patch_justification: str = ""
 
     @classmethod
     def task_only(cls, task_id: str) -> "ComposeState":
         """Minimal ``ComposeState`` for roles with no compose-time seams.
 
-        Use when the role consumes no patch sink, gate flag, ``user_request``
-        / ``spec_summary`` reminders, or slice intent. Triage is the
-        canonical example: zero tools, one query per run, so every seam
-        but ``task_id`` is dead. Going through ``from_mapping`` for such a
-        role would pull keys that are guaranteed not to matter and obscure
-        the actual contract.
+        Use when the role consumes no gate flag or ``user_request`` /
+        ``spec_summary`` reminders. Triage is the canonical example:
+        zero tools, one query per run, so every seam but ``task_id`` is
+        dead. Going through ``from_mapping`` for such a role would pull
+        keys that are guaranteed not to matter and obscure the actual
+        contract.
         """
         return cls(task_id=str(task_id or ""))
 
     @classmethod
-    def from_mapping(
-        cls,
-        state: Mapping[str, Any],
-        *,
-        patches_sink: list[Patch] | None = None,
-    ) -> "ComposeState":
+    def from_mapping(cls, state: Mapping[str, Any]) -> "ComposeState":
         slice_id = str(state.get("slice_id") or state.get("current_slice") or "")
         return cls(
             slice_id=slice_id,
@@ -86,7 +74,6 @@ class ComposeState:
                 or state.get("workflow_id")
                 or ""
             ),
-            patches_sink=patches_sink if patches_sink is not None else [],
             gate_approved=bool(state.get("gate_approved", False)),
             dependency_changes_authorized=bool(
                 state.get("dependency_changes_authorized", False)
@@ -94,18 +81,7 @@ class ComposeState:
             ),
             user_request=str(state.get("user_request") or ""),
             spec_summary=str(state.get("spec_summary") or ""),
-            slice_intent=_lookup_slice_intent(state.get("spec"), slice_id),
-            patch_justification=str(state.get("patch_justification") or ""),
         )
-
-
-def _lookup_slice_intent(spec: Any, slice_id: str) -> str:
-    if not slice_id or not isinstance(spec, list):
-        return ""
-    for entry in spec:
-        if isinstance(entry, Mapping) and entry.get("story_id") == slice_id:
-            return str(entry.get("intent") or "")
-    return ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,7 +90,6 @@ class ComposeOverrides:
 
     registry: Registry | None = None
     model: str | None = None
-    temperature: float | None = None
     thinking: bool | None = None
     thinking_budget_tokens: int | None = None
     cwd: str | None = None
@@ -146,7 +121,6 @@ def compose(
     options = build_options(
         role,
         model=manifest.llm.model,
-        temperature=manifest.llm.temperature,
         thinking=manifest.llm.thinking.enabled,
         thinking_budget_tokens=manifest.llm.thinking.budget_tokens or 4096,
         system_prompt=system_prompt,
@@ -160,7 +134,6 @@ def compose(
     )
 
     options.disallowed_tools = list(manifest.tools.disallowed)
-    options.patches_sink = state_slice.patches_sink
     _apply_in_process_overrides(options, manifest, overrides)
     _stamp_manifest_attrs(registry, role, manifest, prompt_path)
     return ClaudeSDKClient(options=options)
@@ -186,8 +159,16 @@ def _materialize_permission_gate(
     state_slice: ComposeState,
     registry: Registry,
 ):
+    # The gate is installed whenever the role can reach a shell — either
+    # the built-in ``Bash`` tool, the ``sandbox_bash`` MCP tool, or any
+    # MCP server (since they all expose tool surfaces that can route
+    # through ``can_use_tool``). A non-empty ``argv_allowlist`` or
+    # ``argv_denylist`` also forces installation. Reasoning-only roles
+    # (PO, Architect) with none of these short-circuit to ``None``.
     if not (
         manifest.tools.argv_allowlist
+        or manifest.tools.argv_denylist
+        or "Bash" in manifest.tools.allowed
         or "sandbox_bash" in manifest.tools.allowed
         or manifest.mcp
     ):
@@ -195,6 +176,7 @@ def _materialize_permission_gate(
     return make_permission_gate(
         role,
         manifest.tools.argv_allowlist,
+        argv_denylist=manifest.tools.argv_denylist,
         gate_approved=state_slice.gate_approved,
         role_owned_argv_prefixes=registry.role_owned_argv_table(),
     )
@@ -237,17 +219,6 @@ def _materialize_hook(
 
     factory = hook_exports.MANIFEST_HOOKS[attachment.name]
     params = dict(attachment.parameters)
-    if attachment.name == "diff_capture":
-        template = params.pop("justification_template", None)
-        if template and "justification" not in params:
-            params["justification"] = _format_justification(template, state_slice)
-        return factory(
-            params.pop("role", role),
-            params.pop("slice_id", state_slice.slice_id),
-            params.pop("task_id", task_id),
-            state_slice.patches_sink,
-            **params,
-        )
     if attachment.name == "goal_pin":
         return factory(
             params.pop("user_request", state_slice.user_request),
@@ -257,26 +228,6 @@ def _materialize_hook(
     return factory(**params)
 
 
-def _format_justification(template: str, state_slice: ComposeState) -> str:
-    """Render a diff_capture ``justification_template`` from a ComposeState.
-
-    Mirrors the imperative builder/tester pattern:
-    ``f"<prefix> {slice_intent}" if slice_intent else "<prefix>"``. When the
-    Work Package has no recorded intent, any trailing colon left after
-    substituting an empty ``{slice_intent}`` is stripped so reviewers don't
-    see dangling punctuation. Other placeholders go through ``str.format``
-    untouched.
-    """
-    rendered = template.format(
-        slice_id=state_slice.slice_id,
-        slice_intent=state_slice.slice_intent,
-        patch_justification=state_slice.patch_justification,
-    ).rstrip()
-    if not state_slice.slice_intent and rendered.endswith(":"):
-        rendered = rendered[:-1].rstrip()
-    return rendered
-
-
 def _apply_in_process_overrides(
     options: Any,
     manifest: RoleManifest,
@@ -284,8 +235,6 @@ def _apply_in_process_overrides(
 ) -> None:
     if overrides.model is not None:
         options.model = overrides.model
-    if overrides.temperature is not None:
-        options.temperature = overrides.temperature
 
     thinking_enabled = overrides.thinking
     if thinking_enabled is None:

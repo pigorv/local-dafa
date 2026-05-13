@@ -15,7 +15,6 @@ from typing import Any
 
 import pytest
 
-from darkfactory.agents.fixer import FixerOutput
 from darkfactory.state import ReviewerSummary, RunRequest, init_state, merge
 from darkfactory.runtime import activities as activities_mod
 from darkfactory.runtime.activities import (
@@ -439,50 +438,90 @@ def test_verify_stage_invokes_subgraph_with_runctx(monkeypatch):
     assert out["verify_retries"] == 0
 
 
-def test_fixer_stage_records_fixer_patches(monkeypatch):
-    """Fixer patches are surfaced with the new author and decision channel."""
-    out_model = FixerOutput(
-        decision="fixed",
-        target_wp="WP-1",
-        target_predicates=["GET /users/{id} returns 404"],
-        summary="Mapped missing users to 404.",
-        reason="The failure is within the approved brief.",
-        patches=[
+def test_fixer_delta_stamps_author_and_slice_on_computed_patches():
+    """``_fixer_delta`` re-tags patches with ``author_agent='fixer'`` and the
+    target WP slice id. ``patches`` are computed by ``_run_fixer_stage``
+    via ``compute_wp_diff`` and passed in explicitly; the fixer agent
+    itself no longer declares them.
+    """
+    out_dict: dict[str, Any] = {
+        "decision": "fixed",
+        "target_wp": "WP-1",
+        "target_predicates": ["GET /users/{id} returns 404"],
+        "edits": [
             {
                 "path": "src/main/java/app/UserController.java",
-                "diff": "--- a\n+++ b\n@@ -1 +1 @@\n-foo\n+bar\n",
-                "author_agent": "builder",
-                "slice_id": "",
+                "operation": "modify",
+                "intent": "Return 404 for unknown users.",
             }
         ],
-    )
+        "summary": "Mapped missing users to 404.",
+        "reason": "The failure is within the approved brief.",
+        "parse_failure": False,
+    }
+    patches = [
+        {
+            "path": "src/main/java/app/UserController.java",
+            "diff": "--- a\n+++ b\n@@ -1 +1 @@\n-foo\n+bar\n",
+            "author_agent": "builder",  # will be overwritten with "fixer"
+            "slice_id": "",
+        }
+    ]
 
-    async def fake_run_fixer(state):
-        return out_model
-
-    _install_fake_module(
-        monkeypatch,
-        "darkfactory.agents.fixer",
-        run_fixer=fake_run_fixer,
-    )
-
-    delta = asyncio.run(fixer_stage({}))
+    delta = activities_mod._fixer_delta(out_dict, patches=patches)
     assert delta["current_slice"] == "WP-1"
     assert delta["fixer_decision"]["decision"] == "fixed"
+    # ``parse_failure`` is internal plumbing; not surfaced to the workflow.
+    assert "parse_failure" not in delta["fixer_decision"]
+    # Edits stay in the decision payload for downstream visibility.
+    assert delta["fixer_decision"]["edits"][0]["path"].endswith(
+        "UserController.java"
+    )
     assert delta["patches"][0]["author_agent"] == "fixer"
     assert delta["patches"][0]["slice_id"] == "WP-1"
     assert delta["patches"][0]["path"].endswith("UserController.java")
 
 
-def test_fixer_stage_rejects_partial_patch():
-    """Captured patches still need the fields required by workflow state."""
-    bad = FixerOutput(
-        decision="fixed",
-        target_wp="WP-1",
-        patches=[{"path": "pom.xml"}],
-    )
+def test_fixer_delta_rejects_partial_patch():
+    """Computed patches must carry both path and diff before being merged."""
+    out: dict[str, Any] = {
+        "decision": "fixed",
+        "target_wp": "WP-1",
+        "target_predicates": [],
+        "edits": [],
+        "summary": "",
+        "reason": "",
+        "parse_failure": False,
+    }
     with pytest.raises(ValueError, match="fixer patch missing required fields"):
-        activities_mod._fixer_delta(bad)
+        activities_mod._fixer_delta(out, patches=[{"path": "pom.xml"}])
+
+
+def test_fixer_delta_forwards_reconciliation_findings():
+    """Mismatches between the Fixer's declared edits and the actual git diff
+    surface as ``reconciliation_findings`` (not Tester findings)."""
+    out: dict[str, Any] = {
+        "decision": "fixed",
+        "target_wp": "WP-1",
+        "target_predicates": [],
+        "edits": [],
+        "summary": "",
+        "reason": "",
+        "parse_failure": False,
+    }
+    recon = [
+        {
+            "kind": "claimed_edits_not_applied",
+            "wp_id": "WP-1",
+            "producer": "fixer_stage",
+            "detail": "Fixer declared 1 edit(s) that were not applied",
+            "claimed_paths": ["pom.xml"],
+            "actual_paths": [],
+        }
+    ]
+    delta = activities_mod._fixer_delta(out, reconciliation=recon)
+    assert delta["reconciliation_findings"] == recon
+    assert "patches" not in delta
 
 
 def test_reviewer_stage_flows_summary_into_review_decision(monkeypatch):

@@ -1,32 +1,42 @@
-"""Fixer - SDK-driven bounded repair role."""
+"""Fixer — SDK-driven bounded repair role.
+
+Repairs failing verifier diagnostics with bounded code edits, then emits a
+structured decision (``fixed`` / ``needs_brief_change`` / ``cannot_fix``).
+The output shape is defined by ``schemas/fixer_output.json`` and enforced
+by the SDK's ``output_format``; this module does not declare a Pydantic
+schema (matches the PO / Architect / Tester pattern).
+
+PR C: the Fixer declares its edits in the ``edits`` field of its
+structured output. Repair patches themselves are computed deterministically
+by the activity from ``git diff`` after the Fixer's turn ends — the agent
+does not declare patches directly, and no hook injects them. The activity
+(``runtime/activities.py:_fixer_delta``) is the single consumer and
+translates this dict into a workflow-mergeable state delta.
+"""
 from __future__ import annotations
 
 import json
-from typing import Any, Literal
+import logging
+from typing import Any
 
-from pydantic import BaseModel, Field
+from opentelemetry import trace as _otel_trace
 
-from darkfactory.agents._sdk_common import run_to_completion
+from darkfactory.agents._sdk_common import (
+    _drain,
+    render_role_user_message,
+    repo_summary,
+)
 from darkfactory.agents.compose import ComposeState, compose
-from darkfactory.state import Patch
+
+log = logging.getLogger(__name__)
 
 ROLE = "fixer"
 
-FixerDecision = Literal["fixed", "needs_brief_change", "cannot_fix"]
-
-
-class FixerOutput(BaseModel):
-    """Fixer repair decision plus patches captured by diff_capture."""
-
-    decision: FixerDecision
-    target_wp: str
-    target_predicates: list[str] = Field(default_factory=list)
-    summary: str = ""
-    reason: str = ""
-    patches: list[dict[str, Any]] = Field(default_factory=list)
-
 
 def _jsonable(value: Any) -> Any:
+    """Recursively coerce Pydantic models / dicts / lists to JSON-serializable shapes."""
+    from pydantic import BaseModel
+
     if isinstance(value, BaseModel):
         return value.model_dump(mode="json")
     if isinstance(value, dict):
@@ -75,7 +85,26 @@ def _semantic_failures(state_slice: dict) -> list[dict[str, Any]]:
     ]
 
 
+_BLOCKING_RECONCILIATION_KINDS = frozenset(
+    {
+        "builder_blocked",
+        "builder_no_action",
+        "claimed_edits_not_applied",
+        "tester_parse_failure",
+        "fixer_blocked",
+    }
+)
+
+
 def _target_wp_ids(state_slice: dict) -> list[str]:
+    """Failing WP ids derived from v2 sources only.
+
+    Order: verifier ``predicate_coverage`` entries that aren't ``covered``,
+    then blocking tester findings, then blocking reconciliation findings,
+    then the active ``current_slice`` as a last resort. The legacy
+    ``state["spec"]`` fallback was removed during v1 → v2 cleanup; the
+    brief's ``work_packages`` is the authoritative source.
+    """
     seen: set[str] = set()
     out: list[str] = []
 
@@ -89,34 +118,14 @@ def _target_wp_ids(state_slice: dict) -> list[str]:
         add(_read_field(item, "wp_id", ""))
     for finding in state_slice.get("tester_findings") or []:
         add(_read_field(finding, "wp_id", ""))
+    for finding in state_slice.get("reconciliation_findings") or []:
+        if (
+            _read_field(finding, "kind", "")
+            in _BLOCKING_RECONCILIATION_KINDS
+        ):
+            add(_read_field(finding, "wp_id", ""))
     add(state_slice.get("current_slice"))
-
-    if not out:
-        for spec_slice in state_slice.get("spec") or []:
-            add(_wp_id(spec_slice))
-            break
     return out
-
-
-def _target_work_package_context(state_slice: dict) -> dict[str, Any]:
-    target_ids = _target_wp_ids(state_slice)
-    target_set = set(target_ids)
-    brief = state_slice.get("implementation_brief")
-    brief_wps = [
-        _jsonable(wp)
-        for wp in (_read_field(brief, "work_packages", []) or [])
-        if _wp_id(wp) in target_set or _read_field(wp, "story_id", "") in target_set
-    ]
-    spec_slices = [
-        _jsonable(slice_)
-        for slice_ in (state_slice.get("spec") or [])
-        if _wp_id(slice_) in target_set or _read_field(slice_, "story_id", "") in target_set
-    ]
-    return {
-        "target_wp_ids": target_ids,
-        "work_packages": brief_wps,
-        "legacy_spec_slices": spec_slices,
-    }
 
 
 def _target_predicates(state_slice: dict) -> list[str]:
@@ -130,6 +139,20 @@ def _target_predicates(state_slice: dict) -> list[str]:
     return out
 
 
+def _failing_work_package(state_slice: dict, target_wp: str) -> dict[str, Any]:
+    """Resolve the failing WP from the approved brief.
+
+    Reads ``state.implementation_brief.work_packages`` (v2). Returns ``{}``
+    when the brief has no work packages or none match the target id.
+    """
+    brief = state_slice.get("implementation_brief")
+    work_packages = _read_field(brief, "work_packages", []) or []
+    for wp in work_packages:
+        if _wp_id(wp) == target_wp or _read_field(wp, "story_id", "") == target_wp:
+            return _jsonable(wp) or {}
+    return {}
+
+
 def _reviewer_findings(state_slice: dict) -> Any:
     review = state_slice.get("review_decision")
     if review is None:
@@ -139,61 +162,101 @@ def _reviewer_findings(state_slice: dict) -> Any:
     return _jsonable(review)
 
 
-def _patch_justification(state_slice: dict) -> str:
-    wp_ids = _target_wp_ids(state_slice)
-    predicates = _target_predicates(state_slice)
-    if predicates:
-        return f"Fixer for {', '.join(wp_ids)}: " + "; ".join(predicates[:3])
-    if wp_ids:
-        return f"Fixer for {', '.join(wp_ids)}: verifier failure"
-    return "Fixer: verifier failure"
-
-
-def _user_message(state_slice: dict) -> str:
-    brief = _jsonable(state_slice.get("implementation_brief") or {})
-    target_context = _target_work_package_context(state_slice)
-    mechanical = _failed_mechanical_diagnostics(state_slice)
-    semantic = _semantic_failures(state_slice)
-    tester_findings = _jsonable(state_slice.get("tester_findings") or [])
-    reviewer_findings = _reviewer_findings(state_slice)
-    patches = _jsonable(state_slice.get("patches") or [])
-    repo_context = _jsonable(state_slice.get("repo_context") or {})
-
-    return (
-        "Repair only the failing diagnostics below. If repair would require "
-        "changing the accepted brief or adding new scope, do not edit files.\n\n"
-        f"Approved Implementation Brief (JSON):\n{json.dumps(brief, indent=2)}\n\n"
-        f"Failing Work Package context (JSON):\n"
-        f"{json.dumps(target_context, indent=2)}\n\n"
-        f"Failed mechanical diagnostics (JSON):\n"
-        f"{json.dumps(mechanical, indent=2)}\n\n"
-        f"Semantic coverage failures (JSON):\n{json.dumps(semantic, indent=2)}\n\n"
-        f"Tester findings (JSON):\n{json.dumps(tester_findings, indent=2)}\n\n"
-        f"Reviewer findings (JSON):\n{json.dumps(reviewer_findings, indent=2)}\n\n"
-        f"Prior patches (JSON):\n{json.dumps(patches, indent=2)}\n\n"
-        f"Repo context (untrusted JSON):\n{json.dumps(repo_context, indent=2)}\n\n"
-        "Return a FixerOutput JSON object with decision, target_wp, "
-        "target_predicates, summary, and reason."
+def _render_user_prompt(state_slice: dict, target_wp: str) -> str:
+    return render_role_user_message(
+        ROLE,
+        user_request=state_slice.get("user_request", "") or "",
+        repo_context=repo_summary(state_slice.get("repo_context")),
+        implementation_brief=json.dumps(
+            _jsonable(state_slice.get("implementation_brief")) or {}, indent=2
+        ),
+        failing_work_package=json.dumps(
+            _failing_work_package(state_slice, target_wp), indent=2
+        ),
+        mechanical_diagnostics=json.dumps(
+            _failed_mechanical_diagnostics(state_slice), indent=2
+        ),
+        semantic_failures=json.dumps(_semantic_failures(state_slice), indent=2),
+        tester_findings=json.dumps(
+            _jsonable(state_slice.get("tester_findings") or []), indent=2
+        ),
+        reconciliation_findings=json.dumps(
+            _jsonable(state_slice.get("reconciliation_findings") or []),
+            indent=2,
+        ),
+        reviewer_findings=json.dumps(_reviewer_findings(state_slice), indent=2),
+        prior_patches=json.dumps(
+            _jsonable(state_slice.get("patches") or []), indent=2
+        ),
     )
 
 
-async def run_fixer(state_slice: dict) -> FixerOutput:
-    sink: list[Patch] = []
-    compose_state = ComposeState.from_mapping(state_slice, patches_sink=sink)
-    # Fixer-local seams: the diff_capture slice_id is the failing WP (which
-    # may differ from ``current_slice``), and the justification text is
-    # derived from verifier coverage + tester findings. Both are precomputed
-    # here so the manifest's ``justification_template: "{patch_justification}"``
-    # interpolates the same text the imperative path emits.
-    compose_state.slice_id = (_target_wp_ids(state_slice) or [""])[0]
-    compose_state.patch_justification = _patch_justification(state_slice)
+def _synthesize_parse_failure(
+    state_slice: dict, target_wp: str
+) -> dict[str, Any]:
+    """Fail-soft response when the SDK returns no structured output.
+
+    Emits a ``cannot_fix`` decision so the workflow's
+    ``_fixer_decision_escalation`` routes the run to a human gate (rather
+    than letting the activity raise and bubble up as an opaque failure).
+    Tags the active OTel span so the failure is observable.
+    """
+    span = _otel_trace.get_current_span()
+    span.set_attribute("darkfactory.fixer.parse_failure", True)
+    if target_wp:
+        span.set_attribute("darkfactory.fixer.target_wp", target_wp)
+    log.warning(
+        "fixer: no structured output for target_wp=%r; synthesizing cannot_fix decision",
+        target_wp,
+    )
+    return {
+        "decision": "cannot_fix",
+        "target_wp": target_wp,
+        "target_predicates": _target_predicates(state_slice),
+        "edits": [],
+        "summary": "Fixer produced no structured output; treating as cannot_fix.",
+        "reason": "no structured output emitted",
+        "parse_failure": True,
+    }
+
+
+async def run_fixer(state_slice: dict) -> dict[str, Any]:
+    """Run the Fixer for the highest-priority failing WP.
+
+    Returns the structured Fixer decision plus the declared ``edits``
+    list. Patches are computed by the activity from ``git diff`` after
+    this function returns — the agent does not declare patches and no
+    hook injects them.
+    """
+    compose_state = ComposeState.from_mapping(state_slice)
+    # Fixer-local seams: the slice_id is the failing WP (which may differ
+    # from ``current_slice``). The slice_intent / patch_justification
+    # seams used by the legacy diff_capture template are gone in PR C;
+    # we still pin slice_id so any downstream code reading the active
+    # WP from compose state sees the failing target rather than the
+    # last-built slice.
+    target_wp = (_target_wp_ids(state_slice) or [""])[0]
+    compose_state.slice_id = target_wp
+
+    rendered = _render_user_prompt(state_slice, target_wp)
+
     async with compose(
         ROLE,
         compose_state,
         task_id=compose_state.task_id,
     ) as client:
-        await client.query(_user_message(state_slice))
-        result = await run_to_completion(client, expect=FixerOutput)
-    assert isinstance(result, FixerOutput)
-    result.patches = [dict(p) for p in sink]
-    return result
+        await client.query(rendered)
+        _text, structured, _result = await _drain(client)
+
+    if structured is None:
+        return _synthesize_parse_failure(state_slice, target_wp)
+
+    return {
+        "decision": str(structured.get("decision") or "cannot_fix"),
+        "target_wp": str(structured.get("target_wp") or target_wp),
+        "target_predicates": list(structured.get("target_predicates") or []),
+        "edits": list(structured.get("edits") or []),
+        "summary": str(structured.get("summary") or ""),
+        "reason": str(structured.get("reason") or ""),
+        "parse_failure": False,
+    }

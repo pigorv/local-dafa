@@ -53,6 +53,9 @@ DF_AWAITING_APPROVAL_LABEL = "df:awaiting-approval"
 DF_APPROVED_LABEL = "df:approved"
 DF_BUILDING_LABEL = "df:building"
 DF_VERIFYING_LABEL = "df:verifying"
+DF_REVIEWING_LABEL = "df:reviewing"
+DF_AWAITING_MERGE_LABEL = "df:awaiting-merge"
+DF_FIXING_LABEL = "df:fixing"
 DF_IN_PROGRESS_LABEL = "df:in-progress"
 DF_DONE_LABEL = "df:done"
 DF_NEEDS_HUMAN_LABEL = "df:needs-human"
@@ -76,6 +79,9 @@ DF_POLL_LABELS = (
     DF_APPROVED_LABEL,
     DF_BUILDING_LABEL,
     DF_VERIFYING_LABEL,
+    DF_REVIEWING_LABEL,
+    DF_AWAITING_MERGE_LABEL,
+    DF_FIXING_LABEL,
     DF_IN_PROGRESS_LABEL,
     DF_CANCEL_LABEL,
 )
@@ -87,6 +93,9 @@ DF_STATE_LABELS = (
     DF_AWAITING_APPROVAL_LABEL,
     DF_BUILDING_LABEL,
     DF_VERIFYING_LABEL,
+    DF_REVIEWING_LABEL,
+    DF_AWAITING_MERGE_LABEL,
+    DF_FIXING_LABEL,
     DF_IN_PROGRESS_LABEL,
     DF_DONE_LABEL,
     DF_NEEDS_HUMAN_LABEL,
@@ -2002,15 +2011,18 @@ async def build_stage(state: dict) -> dict:
 @activity.defn
 @with_repo_state("agent/{wf_id}")
 async def verify_stage(state: dict) -> dict:
-    """Run the Verify subgraph (parallel tests + linters + compile via Send fan-out).
+    """Run the plan-driven Verify subgraph.
 
-    The subgraph itself runs `mvn test` / linters / compile through
-    `RepoSandbox.exec` and parses with `tools/tests.py` + `tools/linters.py`;
-    no LangChain agent wraps the verify stage. The deferred aggregator
-    inside the subgraph collapses the fan-out into a single `VerifySummary`.
+    The subgraph asks ``verify_planner`` to discover the target repo's
+    canonical test / compile / lint commands (cached after the first
+    iteration), executes each step via ``RepoSandbox.exec``, and parses
+    JUnit-XML / Checkstyle-XML / SARIF report files declared by the plan
+    via ``tools/reports.py``. Steps without declared reports fall back to
+    exit-code gating. No language-specific code lives in the verifier
+    itself.
     """
     _stamp_temporal_activity_attrs()
-    _heartbeat("verify: starting subgraph (Send fan-out)")
+    _heartbeat("verify: starting plan-driven subgraph")
     from darkfactory.stages.verify import verify_subgraph
 
     ctx = _runctx_from_state(state)
@@ -2021,6 +2033,10 @@ async def verify_stage(state: dict) -> dict:
         "findings": result.get("findings", []),
         "verify_summary": result.get("verify_summary"),
     }
+    if "verification_plan" in result:
+        delta["verification_plan"] = result["verification_plan"]
+    if "verification_plan_rev" in result:
+        delta["verification_plan_rev"] = result["verification_plan_rev"]
     if "verify_retries" in result:
         delta["verify_retries"] = result["verify_retries"]
     return delta
@@ -2036,31 +2052,129 @@ async def fixer_stage(state: dict) -> dict:
 
 
 async def _run_fixer_stage(state: dict) -> dict:
+    """Snapshot HEAD, run the Fixer, compute ground-truth patches, reconcile.
+
+    PR C: the Fixer no longer collects patches through a ``diff_capture``
+    hook. The activity captures the pre-Fixer ``HEAD`` sha, runs the
+    Fixer (which declares its intended edits in the structured output),
+    and asks ``git diff`` what actually changed. Discrepancies between
+    the declared ``edits`` and the observed paths surface as
+    ``reconciliation_findings`` entries the same way they do for
+    Builder.
+    """
     from darkfactory.agents.fixer import run_fixer
+    from darkfactory.tools.git_diff import (
+        compute_wp_diff,
+        reconcile_paths,
+        snapshot_head,
+    )
+
+    sandbox = _ensure_repo_sandbox(state)
+    pre_sha = snapshot_head(sandbox) if sandbox is not None else ""
 
     out = await run_fixer(state)
-    return _fixer_delta(out)
+    target_wp = str(out.get("target_wp") or "")
+
+    patches: list[Any] = []
+    reconciliation: list[dict] = []
+    if sandbox is not None and pre_sha:
+        patches = compute_wp_diff(
+            sandbox, pre_sha, role="fixer", slice_id=target_wp
+        )
+        edits = list(out.get("edits") or [])
+        claimed = [
+            str(edit.get("path") or "")
+            for edit in edits
+            if isinstance(edit, dict) and edit.get("path")
+        ]
+        actual = [
+            str(p.get("path") or "")
+            for p in patches
+            if p.get("path")
+        ]
+        recon = reconcile_paths(claimed, actual)
+        if out.get("parse_failure"):
+            reconciliation.append(
+                {
+                    "kind": "fixer_blocked",
+                    "wp_id": target_wp,
+                    "producer": "fixer_stage",
+                    "detail": (
+                        "Fixer produced no structured output; treating "
+                        "as cannot_fix."
+                    ),
+                }
+            )
+        if recon["claimed_not_applied"]:
+            reconciliation.append(
+                {
+                    "kind": "claimed_edits_not_applied",
+                    "wp_id": target_wp,
+                    "producer": "fixer_stage",
+                    "detail": (
+                        f"Fixer declared "
+                        f"{len(recon['claimed_not_applied'])} edit(s) "
+                        "that were not applied to the working tree"
+                    ),
+                    "claimed_paths": recon["claimed_not_applied"],
+                    "actual_paths": actual,
+                }
+            )
+        if recon["undeclared"]:
+            reconciliation.append(
+                {
+                    "kind": "undeclared_edits",
+                    "wp_id": target_wp,
+                    "producer": "fixer_stage",
+                    "detail": (
+                        f"Fixer applied {len(recon['undeclared'])} "
+                        "edit(s) it did not declare in its structured output"
+                    ),
+                    "claimed_paths": claimed,
+                    "actual_paths": recon["undeclared"],
+                }
+            )
+
+    return _fixer_delta(out, patches, reconciliation)
 
 
-def _fixer_delta(out: Any) -> dict:
-    """Translate a `FixerOutput` into a workflow-mergeable state delta."""
+def _fixer_delta(
+    out: dict[str, Any],
+    patches: list[Any] | None = None,
+    reconciliation: list[dict[str, Any]] | None = None,
+) -> dict:
+    """Translate a Fixer output dict into a workflow-mergeable state delta.
+
+    ``out`` is the plain dict produced by ``agents.fixer.run_fixer``:
+    ``{decision, target_wp, target_predicates, edits, summary, reason}``.
+    ``patches`` and ``reconciliation`` come from ``_run_fixer_stage`` and
+    carry the ground-truth diff plus any agent-vs-disk discrepancies.
+    """
     from darkfactory.state import Patch
 
-    patches = []
-    for raw_patch in out.patches or []:
+    target_wp = str(out.get("target_wp") or "")
+    decision_payload = {
+        k: v
+        for k, v in out.items()
+        if k not in ("parse_failure",)
+    }
+    delta: dict[str, Any] = {
+        "fixer_decision": decision_payload,
+        "current_slice": target_wp,
+    }
+
+    coerced: list[Patch] = []
+    for raw_patch in patches or []:
         patch = dict(raw_patch)
         if not (patch.get("path") and patch.get("diff")):
             raise ValueError("fixer patch missing required fields (path, diff)")
         patch["author_agent"] = "fixer"
-        patch["slice_id"] = str(patch.get("slice_id") or out.target_wp)
-        patches.append(Patch(**patch))
-
-    delta: dict[str, Any] = {
-        "fixer_decision": out.model_dump(exclude={"patches"}, mode="json"),
-        "current_slice": out.target_wp,
-    }
-    if patches:
-        delta["patches"] = patches
+        patch["slice_id"] = str(patch.get("slice_id") or target_wp)
+        coerced.append(Patch(**patch))
+    if coerced:
+        delta["patches"] = coerced
+    if reconciliation:
+        delta["reconciliation_findings"] = list(reconciliation)
     return delta
 
 
@@ -2092,10 +2206,30 @@ async def pr_creator_stage(state: dict) -> dict:
     return {"pr_url": await run_pr_creator(state)}
 
 
+def _gh_pr_state(sb: Any, pr_url: str) -> str:
+    """Return the GitHub state of a PR (e.g. ``MERGED``/``OPEN``/``CLOSED``).
+
+    Returns an empty string when `gh pr view` itself fails — callers treat that
+    as "unknown" and fall back to the original error path.
+    """
+    result = sb.exec(["gh", "pr", "view", pr_url, "--json", "state", "--jq", ".state"])
+    if int(result.get("returncode", 1)) != 0:
+        return ""
+    return str(result.get("stdout", "") or "").strip().upper()
+
+
 @activity.defn
 @with_repo_state("agent/{wf_id}")
 async def merge_branch(state: dict) -> dict:
-    """Merge the approved pull request without involving an LLM."""
+    """Merge the approved pull request without involving an LLM.
+
+    Idempotent: if the PR is already MERGED on GitHub, returns success without
+    re-invoking `gh pr merge`. If the merge command itself fails but the PR
+    ends up MERGED (e.g. GitHub-side merge succeeded but `--delete-branch`
+    tripped on a dirty local working tree), the failure is treated as success
+    — the worker container is torn down in the workflow's `finally` block, so
+    local branch cleanup is not load-bearing.
+    """
     _stamp_temporal_activity_attrs()
     _heartbeat("merge_branch: starting")
     pr_url = state.get("pr_url")
@@ -2106,8 +2240,21 @@ async def merge_branch(state: dict) -> dict:
     if sb is None:
         raise ValueError("merge_branch requires state['task_id'] or state['wf_id']")
 
+    if _gh_pr_state(sb, pr_url) == "MERGED":
+        log.info("merge_branch: PR %s already merged, skipping gh pr merge", pr_url)
+        return {"merged": True}
+
     result = sb.exec(["gh", "pr", "merge", pr_url, "--squash", "--delete-branch"])
     if int(result.get("returncode", 1)) != 0:
+        if _gh_pr_state(sb, pr_url) == "MERGED":
+            log.warning(
+                "merge_branch: gh pr merge returned rc=%s but PR %s is MERGED; "
+                "treating as success (stderr=%r)",
+                result.get("returncode"),
+                pr_url,
+                result.get("stderr", ""),
+            )
+            return {"merged": True}
         raise RuntimeError(
             "gh pr merge failed "
             f"(rc={result.get('returncode')}, "

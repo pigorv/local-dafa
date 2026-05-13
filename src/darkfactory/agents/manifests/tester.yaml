@@ -4,9 +4,9 @@ identity:
     Single-generalist test-writing role. Owns ``src/test/...`` and derives
     assertions from each Work Package's ``verification`` predicate (the
     diff-blindness rule: it reads the Builder's diff for shapes only, not
-    for assertions). Production-code edits are restricted to the
-    ``tester_mechanical`` category — rename / import / signature alignment;
-    anything semantic returns a structured finding for the Fixer to handle.
+    for assertions). Production-code edits are restricted to mechanical
+    rename / import / signature alignment; anything semantic returns a
+    structured finding for the Fixer to handle.
   when_to_use: >-
     Inside the build subgraph, after Builder finishes a Work Package, to
     write tests against that WP's verification predicate before the verify
@@ -14,10 +14,11 @@ identity:
 
 llm:
   model: claude-sonnet-4-5-20250929
-  temperature: 0.1
   thinking:
     enabled: false
   prompt_path: prompts/tester.md
+  prompt_as_user_message: true
+  structured_output: schemas/tester_output.json
 
 tools:
   allowed:
@@ -27,20 +28,19 @@ tools:
     - Grep
     - Glob
     - Bash
-    - sandbox_bash
   disallowed: []
-  argv_allowlist:
-    - mvn
-    - gradle
-    - ./gradlew
-    - git
-    - cat
-    - ls
+  # Pure denylist policy: the worker container is the isolation boundary,
+  # so the gate runs only the global denies (FORBIDDEN_TOKENS, gh-pr-merge
+  # prefix, role-owned prefixes such as ``git push`` owned by pr_creator)
+  # plus this manifest's argv_denylist. An empty argv_allowlist disables
+  # the per-role allowlist check. Mirrors the Builder pattern.
+  argv_allowlist: []
+  argv_denylist:
+    - [git, push]
   role_owned_argv_prefixes: []
   edit_path_allowlist: []
 
-mcp:
-  - darkfactory
+mcp: []
 
 hooks:
   - event: PreToolUse
@@ -54,20 +54,15 @@ hooks:
     parameters:
       detail: "tester: pre tool"
   - event: PostToolUse
-    name: diff_capture
-    parameters:
-      edit_kind: tester_mechanical
-      justification_template: "WP {slice_id} tests: {slice_intent}"
-  - event: PostToolUse
     name: prompt_injection_guard
+    parameters: {}
+  - event: PostToolUse
+    name: structured_output_hint
     parameters: {}
   - event: PostToolUse
     name: heartbeat
     parameters:
       detail: "tester: post tool"
-  - event: UserPromptSubmit
-    name: goal_pin
-    parameters: {}
   - event: Stop
     name: heartbeat
     parameters:

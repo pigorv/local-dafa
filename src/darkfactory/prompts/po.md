@@ -58,3 +58,7 @@ Keep total tool calls to a handful. Long search loops are a smell.
 
 The structured-output schema describes each field; rely on the field
 descriptions for what each one means.
+
+When you emit the structured response, place the schema's fields directly
+as the tool input. Do not wrap them in an outer object such as
+`{"output": {...}}`.

@@ -25,6 +25,30 @@ VERIFY_RETRY_CAP = FIXER_MAX_ATTEMPTS + 1
 SUPERVISOR_TASK_QUEUE = "supervisor-tq"
 UNKNOWN_FIXER_TARGET = "__unknown__"
 
+# Build-stage activity scales its start_to_close_timeout by Work Package
+# count: 5 min base + 4 min per WP, capped at 60 min. A flat 15 min was
+# tight on multi-WP briefs.
+BUILD_STAGE_BASE_MINUTES = 5
+BUILD_STAGE_PER_WP_MINUTES = 4
+BUILD_STAGE_MAX_MINUTES = 60
+
+
+def _build_stage_timeout(state: Any) -> timedelta:
+    """Compute start_to_close timeout for the build stage from WP count.
+
+    Reads ``build_order`` first (populated by the supervisor when set) and
+    falls back to ``spec`` length. Guarantees at least one WP's worth of
+    budget so a missing/empty channel never collapses to the base alone.
+    """
+    build_order = _state_value(state, "build_order", None) or []
+    spec = _state_value(state, "spec", None) or []
+    wp_count = max(1, len(build_order) or len(spec))
+    minutes = min(
+        BUILD_STAGE_MAX_MINUTES,
+        BUILD_STAGE_BASE_MINUTES + BUILD_STAGE_PER_WP_MINUTES * wp_count,
+    )
+    return timedelta(minutes=minutes)
+
 
 def _state_value(obj: object, key: str, default: object = None) -> object:
     if isinstance(obj, dict):
@@ -135,11 +159,22 @@ def _fixer_failure_targets(state: dict) -> dict[str, list[str]]:
         _append_unique(target_predicates, _state_value(item, "predicate", ""))
 
     for finding in state.get("tester_findings") or []:
-        if _state_value(finding, "resolved", False):
-            continue
-        if not _state_value(finding, "blocking", True):
-            continue
         _append_unique(target_wps, _state_value(finding, "wp_id", ""))
+
+    # PR C: build-stage discrepancies (Builder blocked, claimed_edits_not_applied,
+    # tester_parse_failure, fixer_blocked) also drive Fixer targeting.
+    for finding in state.get("reconciliation_findings") or []:
+        if (
+            str(_state_value(finding, "kind", ""))
+            in {
+                "builder_blocked",
+                "builder_no_action",
+                "claimed_edits_not_applied",
+                "tester_parse_failure",
+                "fixer_blocked",
+            }
+        ):
+            _append_unique(target_wps, _state_value(finding, "wp_id", ""))
 
     if not target_wps:
         _append_unique(target_wps, state.get("current_slice"))
@@ -218,7 +253,6 @@ def _infeasible_predicate_escalation(state: dict) -> dict[str, Any] | None:
         finding
         for finding in findings
         if str(_state_value(finding, "kind", "")) == "infeasible_predicate"
-        and not _state_value(finding, "resolved", False)
     ]
     if not infeasible:
         return None
@@ -276,6 +310,35 @@ def _fixer_escalation_delta(escalation: dict[str, Any]) -> dict[str, Any]:
             }
         ]
     }
+
+
+def _snapshot_findings_counts(state: dict) -> tuple[int, int]:
+    """Return (tester, reconciliation) finding counts prior to a producer call."""
+    return (
+        len(state.get("tester_findings") or []),
+        len(state.get("reconciliation_findings") or []),
+    )
+
+
+def _drop_stale_findings(state: dict, pre: tuple[int, int]) -> None:
+    """Drop pre-existing tester/reconciliation findings after a producer activity.
+
+    `tester_findings` and `reconciliation_findings` use the `add` reducer
+    (state.py), so entries produced before the activity persist after merge.
+    Once build_stage/fixer_stage has run to address them, those old entries
+    are stale by definition — keeping them would re-trigger
+    `_blocking_failures` in the next verify cycle (root cause of the
+    "verify keeps failing after a successful fixer pass" bug). Slice off
+    the pre-existing portion while preserving anything the producer itself
+    emitted (e.g., fixer's `undeclared_edits` / `fixer_blocked`,
+    build_stage tester reruns). Direct assignment bypasses merge() and is
+    replay-deterministic.
+    """
+    pre_tester, pre_recon = pre
+    state["tester_findings"] = (state.get("tester_findings") or [])[pre_tester:]
+    state["reconciliation_findings"] = (
+        state.get("reconciliation_findings") or []
+    )[pre_recon:]
 
 
 def _human_revise_feedback(decision: Any) -> str:
@@ -448,7 +511,7 @@ class DarkFactoryWorkflow:
                     "build_stage",
                     self._state,
                     task_queue=agent_tq,
-                    start_to_close_timeout=timedelta(minutes=15),
+                    start_to_close_timeout=_build_stage_timeout(self._state),
                     heartbeat_timeout=timedelta(minutes=5),
                     retry_policy=RetryPolicy(
                         maximum_attempts=2,
@@ -457,6 +520,19 @@ class DarkFactoryWorkflow:
                 ),
             )
             while True:
+                # Each verify cycle must evaluate fresh evidence. The
+                # `test_results` / `findings` channels use the `add` reducer
+                # (state.py), so leaving prior cycles in place would let one
+                # stale failure keep `summary.passed=False` forever and feed
+                # the verifier_semantic prompt a growing pile of contradictory
+                # history. Direct assignment bypasses merge() and is
+                # replay-deterministic. `tester_findings` and
+                # `reconciliation_findings` are NOT cleared here — they're
+                # produced by build/fixer and the FIRST verify must see them.
+                # The stale-entry hazard is handled by post-fixer/post-build
+                # slicing below.
+                self._state["test_results"] = []
+                self._state["findings"] = []
                 self._state = merge(
                     self._state,
                     await workflow.execute_activity(
@@ -503,6 +579,7 @@ class DarkFactoryWorkflow:
                     self._state,
                     _record_fixer_attempt_delta(self._state),
                 )
+                _pre = _snapshot_findings_counts(self._state)
                 self._state = merge(
                     self._state,
                     await workflow.execute_activity(
@@ -510,12 +587,14 @@ class DarkFactoryWorkflow:
                         self._state,
                         task_queue=agent_tq,
                         start_to_close_timeout=timedelta(minutes=5),
+                        heartbeat_timeout=timedelta(minutes=5),
                         retry_policy=RetryPolicy(
                             maximum_attempts=2,
                             non_retryable_error_types=["ParseError"],
                         ),
                     ),
                 )
+                _drop_stale_findings(self._state, _pre)
                 escalation = _fixer_decision_escalation(self._state)
                 if escalation is not None:
                     self._state = merge(
@@ -573,6 +652,7 @@ class DarkFactoryWorkflow:
                         self._state,
                         _record_fixer_attempt_delta(self._state),
                     )
+                    _pre = _snapshot_findings_counts(self._state)
                     self._state = merge(
                         self._state,
                         await workflow.execute_activity(
@@ -580,12 +660,16 @@ class DarkFactoryWorkflow:
                             self._state,
                             task_queue=agent_tq,
                             start_to_close_timeout=timedelta(minutes=5),
+                            heartbeat_timeout=timedelta(minutes=5),
                             retry_policy=RetryPolicy(
                                 maximum_attempts=2,
                                 non_retryable_error_types=["ParseError"],
                             ),
                         ),
                     )
+                    _drop_stale_findings(self._state, _pre)
+                    self._state["test_results"] = []
+                    self._state["findings"] = []
                     self._state = merge(
                         self._state,
                         await workflow.execute_activity(
@@ -625,13 +709,14 @@ class DarkFactoryWorkflow:
                             "human_rebuild_author": "human",
                         },
                     )
+                    _pre = _snapshot_findings_counts(self._state)
                     self._state = merge(
                         self._state,
                         await workflow.execute_activity(
                             "build_stage",
                             self._state,
                             task_queue=agent_tq,
-                            start_to_close_timeout=timedelta(minutes=15),
+                            start_to_close_timeout=_build_stage_timeout(self._state),
                             heartbeat_timeout=timedelta(minutes=5),
                             retry_policy=RetryPolicy(
                                 maximum_attempts=2,
@@ -639,6 +724,9 @@ class DarkFactoryWorkflow:
                             ),
                         ),
                     )
+                    _drop_stale_findings(self._state, _pre)
+                    self._state["test_results"] = []
+                    self._state["findings"] = []
                     self._state = merge(
                         self._state,
                         await workflow.execute_activity(
@@ -681,6 +769,7 @@ class DarkFactoryWorkflow:
                             self._state,
                             task_queue=agent_tq,
                             start_to_close_timeout=timedelta(minutes=2),
+                            retry_policy=RetryPolicy(maximum_attempts=3),
                         ),
                     )
                     return RunResult(status="merged", state=self._state)

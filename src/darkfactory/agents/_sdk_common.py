@@ -8,18 +8,17 @@ fails it raises `ParseError`.
 
 `load_prompt` reads a system-prompt markdown file from `darkfactory/prompts/`.
 
-`WorkerOutput` is the shared return type of SDK build-stage workers that
-summarize free-form work. The patches list is populated by the `diff_capture`
-PostToolUse hook the role attaches to its SDK client, not by parsing the
-assistant's final message — workers commit code through `Edit` / `Write`, not
-by emitting a structured JSON blob.
+`BuilderOutput` / `BuilderEdit` mirror the JSON schema enforced on the
+Builder's structured output. Patches themselves are computed by the
+build subgraph from `git diff`, not by parsing the assistant's
+response — workers commit code through `Edit` / `Write` / `Bash`.
 """
 from __future__ import annotations
 
 import json
 import re
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -35,17 +34,34 @@ STRUCTURED_OUTPUT_TOOL_NAME = "StructuredOutput"
 T = TypeVar("T", bound=BaseModel)
 
 
-class WorkerOutput(BaseModel):
-    """Result of running a free-form build-stage worker.
+class BuilderEdit(BaseModel):
+    """One file edit declared by the Builder.
 
-    ``patches`` is the list of ``Patch`` TypedDicts captured by the
-    ``diff_capture`` hook over the role's SDK loop. ``summary`` is the final
-    assistant text (typically the worker's one-paragraph summary). The build
-    subgraph node folds ``patches`` straight into the ``patches`` channel of
-    the pipeline state via the ``add`` reducer in ``state.py``.
+    Mirrors a single entry in ``schemas/builder_output.json#/properties/edits``.
+    The Builder reports the path, the kind of edit, and a one-sentence
+    intent so reviewers and the reconciliation step can trace each edit
+    back to the brief or a verification predicate.
     """
 
-    patches: list[dict[str, Any]] = Field(default_factory=list)
+    path: str
+    operation: Literal["create", "modify", "delete"]
+    intent: str
+
+
+class BuilderOutput(BaseModel):
+    """Structured Builder report for one Work Package turn.
+
+    Mirrors ``schemas/builder_output.json``. The Builder agent emits this
+    directly via the SDK's ``output_format``; the build subgraph reads
+    ``status`` to route the turn (done / no_changes_needed / blocked)
+    and reconciles ``edits`` against the ground-truth ``git diff`` to
+    detect claimed-but-not-applied or undeclared changes.
+    """
+
+    wp_id: str
+    status: Literal["done", "no_changes_needed", "blocked"]
+    edits: list[BuilderEdit] = Field(default_factory=list)
+    blockers: list[str] = Field(default_factory=list)
     summary: str = ""
 
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
@@ -59,34 +75,78 @@ def load_prompt(name: str) -> str:
     return (_PROMPTS_DIR / f"{name}.md").read_text(encoding="utf-8")
 
 
-def repo_summary(repo_context: dict | None) -> str:
-    """Summarise hydrator output for inclusion in a discovery role's user prompt."""
+_REPO_SUMMARY_SECTIONS: tuple[str, ...] = (
+    "agents_md",
+    "repo_map",
+    "style_configs",
+    "git_log",
+)
+
+
+def repo_summary(
+    repo_context: dict | None,
+    *,
+    include: tuple[str, ...] | None = None,
+) -> str:
+    """Summarise hydrator output for inclusion in a role's user prompt.
+
+    ``include`` selects which sections to render; defaults to all four
+    (``agents_md``, ``repo_map``, ``style_configs``, ``git_log``). Builder
+    drops ``agents_md`` and ``git_log`` since the model can ``Read`` those
+    on demand and the genuine value lives in the synthesized ``repo_map``
+    plus ``style_configs``.
+    """
     if not repo_context:
         return "(no repo context)"
+    sections = tuple(include) if include is not None else _REPO_SUMMARY_SECTIONS
     parts: list[str] = []
-    agents_md = repo_context.get("agents_md") or ""
-    if agents_md:
-        parts.append(f"AGENTS.md:\n{agents_md[:2000]}")
-    repo_map = repo_context.get("repo_map") or ""
-    if repo_map:
-        parts.append(f"Repo map:\n{repo_map[:2000]}")
-    style_configs = repo_context.get("style_configs") or []
-    if style_configs:
-        rendered: list[str] = ["Style / lint configs (match these rules in new files):"]
-        for entry in style_configs:
-            if not isinstance(entry, dict):
-                continue
-            path = entry.get("path") or ""
-            content = entry.get("content") or ""
-            if path:
-                rendered.append(f"--- {path} ---")
-            if content:
-                rendered.append(content)
-        parts.append("\n".join(rendered))
-    git_log = repo_context.get("git_log") or []
-    if git_log:
-        parts.append("Recent commits:\n" + "\n".join(git_log[:10]))
+    if "agents_md" in sections:
+        agents_md = repo_context.get("agents_md") or ""
+        if agents_md:
+            parts.append(f"AGENTS.md:\n{agents_md[:2000]}")
+    if "repo_map" in sections:
+        repo_map = repo_context.get("repo_map") or ""
+        if repo_map:
+            parts.append(f"Repo map:\n{repo_map[:2000]}")
+    if "style_configs" in sections:
+        style_configs = repo_context.get("style_configs") or []
+        if style_configs:
+            rendered: list[str] = ["Style / lint configs (match these rules in new files):"]
+            for entry in style_configs:
+                if not isinstance(entry, dict):
+                    continue
+                path = entry.get("path") or ""
+                content = entry.get("content") or ""
+                if path:
+                    rendered.append(f"--- {path} ---")
+                if content:
+                    rendered.append(content)
+            parts.append("\n".join(rendered))
+    if "git_log" in sections:
+        git_log = repo_context.get("git_log") or []
+        if git_log:
+            parts.append("Recent commits:\n" + "\n".join(git_log[:10]))
     return "\n\n".join(parts) if parts else "(empty repo)"
+
+
+def render_role_user_message(role: str, **substitutions: object) -> str:
+    """Render a role's prompt file as a ``string.Template`` user message.
+
+    Looks up the role in the default registry, resolves the prompt path,
+    reads the file, and runs ``Template.safe_substitute`` over it. Shared
+    by every role that uses ``prompt_as_user_message: true`` (PO,
+    Architect, Builder) so the contract — and any future changes to it —
+    live in one place.
+    """
+    from darkfactory.agents.registry import get_default_registry, resolve_prompt_path
+
+    manifest = get_default_registry().get(role)
+    template_text = resolve_prompt_path(manifest.llm.prompt_path).read_text(
+        encoding="utf-8"
+    )
+    from string import Template
+
+    return Template(template_text).safe_substitute(**substitutions)
 
 
 _FENCED_JSON_RE = re.compile(r"```(?:json)?\s*\n(.*?)\n\s*```", re.DOTALL)
@@ -130,6 +190,19 @@ def _extract_json(text: str) -> str | None:
     return None
 
 
+def _unwrap_singleton(structured: dict[str, Any] | None) -> dict[str, Any] | None:
+    """If ``structured`` has exactly one key and that value is a dict, return the inner dict.
+
+    Handles the recurring SDK structured-output failure mode where the model
+    wraps the payload in ``{"output": {...}}`` (or any other single outer
+    key). Returns the original value in every other case, including ``None``.
+    """
+    if not isinstance(structured, dict) or len(structured) != 1:
+        return structured
+    only_value = next(iter(structured.values()))
+    return only_value if isinstance(only_value, dict) else structured
+
+
 async def _drain(
     client: ClaudeSDKClient,
 ) -> tuple[str, dict[str, Any] | None, ResultMessage | None]:
@@ -157,7 +230,7 @@ async def _drain(
                     and block.name == STRUCTURED_OUTPUT_TOOL_NAME
                     and isinstance(block.input, dict)
                 ):
-                    structured = block.input
+                    structured = _unwrap_singleton(block.input)
             if text_chunks:
                 last_text_chunks = text_chunks
         elif isinstance(msg, ResultMessage):
@@ -220,35 +293,3 @@ async def run_to_completion(
         raise ParseError(
             f"Could not validate {expect.__name__} after one retry: {exc}"
         ) from exc
-
-
-def _resolve_slice(state_slice: dict) -> dict:
-    """Return the Work Package for ``current_slice`` or an empty dict.
-
-    Build-stage workers expect the activity to thread both the spec list and
-    the active slice id through ``state_slice``. We look up by ``story_id``;
-    if no match is found (e.g. an ad-hoc test with only ``current_slice``),
-    return an empty dict so the user message is well-formed.
-    """
-    slice_id = state_slice.get("current_slice") or ""
-    for s in state_slice.get("spec") or []:
-        if isinstance(s, dict) and s.get("story_id") == slice_id:
-            return s
-    return {}
-
-
-def worker_user_message(state_slice: dict) -> str:
-    """Format the per-turn user message for a build-stage worker.
-
-    The role-specific instructions live in the system prompt; the user
-    message just hands the worker the Work Package it should execute and a
-    short reminder of what "done" looks like.
-    """
-    slice_ = _resolve_slice(state_slice)
-    return (
-        f"Work Package (JSON):\n{json.dumps(slice_, indent=2)}\n\n"
-        "Execute this slice end-to-end. Read the affected files first, make "
-        "the minimal change, run the relevant build / test command via "
-        "sandbox_bash to verify, then commit via sandbox_bash. Stay inside "
-        "the listed paths."
-    )

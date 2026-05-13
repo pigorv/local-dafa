@@ -105,9 +105,29 @@ def _phase_key(
     return phase
 
 
+_SENTINEL_PATCH_PATHS = frozenset({"(worker-completion)", "(worker-error)"})
+
+
+def _real_patches(patches: Any) -> list[Any]:
+    """Filter out the build-subgraph synthetic completion/error sentinels.
+
+    Tester / Frontend still emit ``(worker-completion)`` when they make
+    no edits (the supervisor uses it to advance ``build_order``);
+    Builder stopped emitting it in PR B in favour of ``builder_outputs``.
+    For phase metrics we only care about real file changes.
+    """
+    out: list[Any] = []
+    for patch in patches or []:
+        path = str(_state_value(patch, "path", "") or "")
+        if path in _SENTINEL_PATCH_PATHS:
+            continue
+        out.append(patch)
+    return out
+
+
 def _patch_paths(patches: Any) -> list[str]:
     paths: list[str] = []
-    for patch in patches or []:
+    for patch in _real_patches(patches):
         path = str(_state_value(patch, "path", "") or "")
         if path and path not in paths:
             paths.append(path)
@@ -656,7 +676,9 @@ class DarkFactoryIssueWorkflow:
             "build",
             "done",
             {
-                "commit_count": len(self._state.get("patches") or []),
+                "commit_count": len(
+                    _real_patches(self._state.get("patches"))
+                ),
                 "files_changed": len(paths),
                 "branch": self._state.get("feature_branch"),
                 "attempts": build_attempts,
@@ -675,6 +697,11 @@ class DarkFactoryIssueWorkflow:
                 {"attempts": verify_attempts},
                 attempt=attempt_number,
             )
+            # See workflow.py: clear verify-owned channels so each cycle is
+            # evaluated against fresh test/lint evidence rather than the
+            # accumulated history that `add` reducers would otherwise keep.
+            self._state["test_results"] = []
+            self._state["findings"] = []
             self._state = merge(
                 self._state,
                 await workflow.execute_activity(
@@ -752,6 +779,7 @@ class DarkFactoryIssueWorkflow:
                     self._state,
                     task_queue=agent_tq,
                     start_to_close_timeout=timedelta(minutes=5),
+                    heartbeat_timeout=timedelta(minutes=5),
                     retry_policy=RetryPolicy(
                         maximum_attempts=2,
                         non_retryable_error_types=["ParseError"],
@@ -876,6 +904,7 @@ class DarkFactoryIssueWorkflow:
                         self._state,
                         task_queue=agent_tq,
                         start_to_close_timeout=timedelta(minutes=5),
+                        heartbeat_timeout=timedelta(minutes=5),
                         retry_policy=RetryPolicy(
                             maximum_attempts=2,
                             non_retryable_error_types=["ParseError"],

@@ -28,7 +28,7 @@ def test_default_cap_is_80() -> None:
 
 
 def test_below_cap_allows() -> None:
-    hook = make_call_cap(cap=3)
+    hook = make_call_cap(max_turns=3)
 
     async def drive() -> list[dict[str, Any]]:
         return [await hook(_pre(i), _pre(i)["tool_use_id"], _ctx()) for i in range(3)]
@@ -38,7 +38,7 @@ def test_below_cap_allows() -> None:
 
 
 def test_overflow_denies() -> None:
-    hook = make_call_cap(cap=2)
+    hook = make_call_cap(max_turns=2)
 
     async def drive() -> list[dict[str, Any]]:
         return [await hook(_pre(i), _pre(i)["tool_use_id"], _ctx()) for i in range(4)]
@@ -55,8 +55,8 @@ def test_overflow_denies() -> None:
 
 
 def test_each_factory_has_independent_counter() -> None:
-    h1 = make_call_cap(cap=1)
-    h2 = make_call_cap(cap=1)
+    h1 = make_call_cap(max_turns=1)
+    h2 = make_call_cap(max_turns=1)
 
     async def drive() -> tuple[dict[str, Any], dict[str, Any]]:
         # Burn h1's quota.
