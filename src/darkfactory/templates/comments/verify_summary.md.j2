@@ -1,0 +1,13 @@
+{% if status_line %}
+{{ status_line }}
+{% endif %}
+{% if predicate_coverage_groups %}
+
+Predicate coverage:
+{% for group in predicate_coverage_groups %}
+- **{{ group.wp_id }}**
+{% for item in group.predicates %}
+  - {{ item.status_icon }} {{ item.predicate }}{{ (" — " ~ item.evidence) if item.evidence else "" }}
+{% endfor %}
+{% endfor %}
+{% endif %}

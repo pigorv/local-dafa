@@ -1,0 +1,13 @@
+{{ marker }}
+Dark Factory reached the clarification limit for issue #{{ issue_number }}.
+
+I've added `df:needs-human` so a maintainer can refine the request.
+{% if questions %}
+
+Outstanding questions:
+{% for question in questions %}
+- {{ question }}
+{% endfor %}
+{% endif %}
+
+workflow_id: `{{ workflow_id }}`

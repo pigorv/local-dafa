@@ -17,6 +17,7 @@ from typing import Any
 from darkfactory.agents._sdk_common import (
     ParseError,
     _drain,
+    original_user_request,
     render_role_user_message,
     repo_summary,
 )
@@ -38,6 +39,7 @@ def _render_user_prompt(state_slice: dict) -> str:
     return render_role_user_message(
         "architect",
         user_request=state_slice.get("user_request", "") or "",
+        original_user_request=original_user_request(state_slice),
         repo_context=repo_summary(state_slice.get("repo_context")),
         stories=json.dumps(state_slice.get("stories") or [], indent=2),
         planning_feedback=_planning_feedback_text(state_slice),

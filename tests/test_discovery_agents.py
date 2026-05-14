@@ -6,9 +6,10 @@ tests below replace `ClaudeSDKClient` with a scripted fake so they stay
 hermetic — no Anthropic API calls, no claude CLI, no Ollama.
 
 Each test asserts:
-1. ``compose(role, ...)`` produces options with the expected hermetic
-   shape (model from defaults, `setting_sources=[]`, no allowed tools, no
-   MCP servers, hooks attached for PreToolUse + UserPromptSubmit).
+1. ``compose(role, ...)`` produces options with the expected shape
+   (model from defaults, ``setting_sources=["project"]`` so target-repo
+   CLAUDE.md and ``.claude/`` skills load, read-only tools, no MCP
+   servers, hooks attached for PreToolUse + UserPromptSubmit).
 2. `run_<role>` drives the (faked) client and returns the expected
    structured Pydantic output, identical in shape to what the old
    LangChain factory used to produce.
@@ -121,10 +122,10 @@ def test_po_client_options_allow_read_only_tools() -> None:
     client = compose("po", state, task_id=state.task_id)
     opts = client.options
     assert opts is not None
-    assert set(opts.allowed_tools) == {"Read", "Grep", "Glob"}
+    assert set(opts.allowed_tools) == {"Read", "Grep", "Glob", "Skill"}
     assert set(opts.disallowed_tools) == {"Bash", "Edit", "Write"}
     assert opts.mcp_servers == {}
-    assert opts.setting_sources == []
+    assert opts.setting_sources == ["project"]
     assert opts.model == "claude-haiku-4-5-20251001"  # po default per ARCH §9
     assert opts.system_prompt == ""  # prompt is rendered as the user message
     assert opts.output_format is not None
@@ -147,14 +148,14 @@ def test_architect_client_options_allow_read_only_tools() -> None:
     client = compose("architect", state, task_id=state.task_id)
     opts = client.options
     assert opts is not None
-    assert set(opts.allowed_tools) == {"Read", "Grep", "Glob"}
+    assert set(opts.allowed_tools) == {"Read", "Grep", "Glob", "Skill"}
     assert set(opts.disallowed_tools) == {"Bash", "Edit", "Write"}
     assert opts.mcp_servers == {}
     # No MCP and no sandbox_bash in allowed_tools → no permission gate.
     # The architect's prompt explicitly limits it to Read / Grep / Glob,
     # so exposing a shell channel would be dead surface.
     assert opts.can_use_tool is None
-    assert opts.setting_sources == []
+    assert opts.setting_sources == ["project"]
     assert opts.model == "claude-sonnet-4-5-20250929"  # architect default per ARCH §9
     assert opts.system_prompt == ""  # prompt is rendered as the user message
     assert opts.output_format is not None
@@ -179,7 +180,7 @@ def test_plan_critic_client_options_are_hermetic_and_no_tool() -> None:
     assert opts is not None
     assert opts.allowed_tools == []
     assert opts.mcp_servers == {}
-    assert opts.setting_sources == []
+    assert opts.setting_sources == ["project"]
     assert opts.model == "claude-sonnet-4-5-20250929"  # plan_critic default per ARCH §9
     assert opts.system_prompt == ""  # prompt is rendered as the user message
     assert opts.output_format is not None
@@ -406,6 +407,83 @@ def test_run_plan_critic_returns_review_decision(
     assert "Plan Critic agent" in fake.queries[0]
     assert "Work packages (JSON):" in fake.queries[0]
     assert "Attempt 1 of 5" in fake.queries[0]
+
+
+def test_po_prompt_includes_verbatim_issue_when_present() -> None:
+    """Issue-driven runs surface the raw issue body alongside the derived prompt.
+
+    For issue workflows, ``state["user_request"]`` is overwritten with the
+    triage-derived restatement before discovery runs. ``state["issue"]``
+    still carries the verbatim title + body. The PO prompt must thread
+    both: the original (ground truth) and the derived (cleaner summary).
+    """
+    state = {
+        "user_request": "Add filter bar to Session List",  # triage-derived
+        "issue": {
+            "repo": "owner/name",
+            "number": 1,
+            "url": "https://example.invalid/1",
+            "title": "Refactor session controls into a single filter bar",
+            "body": (
+                "Replace the two-row controls with a single horizontal "
+                "filter bar. Note: must preserve `cm.sessionList.chipFilter` "
+                "localStorage key exactly — do not migrate it."
+            ),
+            "labels": ["df:ready"],
+        },
+        "repo_context": {},
+    }
+
+    rendered = po_mod._render_user_prompt(state)
+
+    assert "Original user request" in rendered
+    assert "Triage-derived request" in rendered
+    # Both halves are present, distinct, and verbatim.
+    assert "Refactor session controls into a single filter bar" in rendered
+    assert "cm.sessionList.chipFilter" in rendered  # detail triage might drop
+    assert "Add filter bar to Session List" in rendered  # derived restatement
+
+
+def test_architect_prompt_includes_verbatim_issue_when_present() -> None:
+    state = {
+        "user_request": "Add filter bar to Session List",
+        "issue": {
+            "repo": "owner/name",
+            "number": 1,
+            "url": "https://example.invalid/1",
+            "title": "Refactor session controls into a single filter bar",
+            "body": (
+                "Constraint: do not introduce new npm dependencies. "
+                "Sort dropdown must exclude `compaction_count`."
+            ),
+            "labels": ["df:ready"],
+        },
+        "repo_context": {},
+        "stories": [{"id": "US-1", "title": "Filter bar"}],
+    }
+
+    rendered = architect_mod._render_user_prompt(state)
+
+    assert "Original user request" in rendered
+    assert "Triage-derived request" in rendered
+    assert "do not introduce new npm dependencies" in rendered
+    assert "compaction_count" in rendered
+    assert "Add filter bar to Session List" in rendered
+
+
+def test_po_prompt_falls_back_to_user_request_without_issue() -> None:
+    """CLI runs have no ``state['issue']``; original falls back to user_request."""
+    state = {
+        "user_request": "Add cursor pagination to /api/users.",
+        "repo_context": {},
+    }
+
+    rendered = po_mod._render_user_prompt(state)
+
+    assert "Original user request" in rendered
+    assert "Triage-derived request" in rendered
+    # Same text under both labels — CLI path has no triage to diverge from.
+    assert rendered.count("Add cursor pagination to /api/users.") == 2
 
 
 def test_normalize_plan_critic_output_enforces_invariants() -> None:

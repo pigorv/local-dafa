@@ -16,6 +16,7 @@ from darkfactory.runtime.phase_comment import (
 from darkfactory.runtime.workflow import (
     PLANNING_MAX_ATTEMPTS,
     SUPERVISOR_TASK_QUEUE,
+    _build_stage_timeout,
     _fixer_budget_exhaustion,
     _fixer_decision_escalation,
     _fixer_escalation_delta,
@@ -207,6 +208,11 @@ class DarkFactoryIssueWorkflow:
                     self._state,
                     task_queue=agent_tq,
                     start_to_close_timeout=timedelta(minutes=5),
+                    heartbeat_timeout=timedelta(minutes=5),
+                    retry_policy=RetryPolicy(
+                        maximum_attempts=2,
+                        non_retryable_error_types=["ParseError"],
+                    ),
                 ),
             )
             await self._phase(
@@ -573,7 +579,7 @@ class DarkFactoryIssueWorkflow:
         spec_markdown = ""
         for attempt in range(PLANNING_MAX_ATTEMPTS):
             attempt_number = attempt + 1
-            visible_feedback = "\n".join(str(item) for item in feedback if item)
+            visible_feedback = "\n\n".join(str(item) for item in feedback if item)
             await self._phase(
                 agent_tq,
                 "design",
@@ -606,7 +612,6 @@ class DarkFactoryIssueWorkflow:
                 ),
             )
             spec_markdown = render_spec_markdown(
-                user_request=str(self._state.get("user_request") or ""),
                 stories=self._state.get("stories") or [],
                 spec=self._state.get("spec") or [],
                 review_decision=self._state.get("review_decision"),
@@ -661,7 +666,7 @@ class DarkFactoryIssueWorkflow:
                 "build_stage",
                 self._state,
                 task_queue=agent_tq,
-                start_to_close_timeout=timedelta(minutes=15),
+                start_to_close_timeout=_build_stage_timeout(self._state),
                 heartbeat_timeout=timedelta(minutes=5),
                 retry_policy=RetryPolicy(
                     maximum_attempts=2,
@@ -682,6 +687,8 @@ class DarkFactoryIssueWorkflow:
                 "files_changed": len(paths),
                 "branch": self._state.get("feature_branch"),
                 "attempts": build_attempts,
+                "builder_outputs": self._state.get("builder_outputs") or [],
+                "tester_outputs": self._state.get("tester_outputs") or [],
                 "next": "verify",
             },
         )
@@ -832,6 +839,10 @@ class DarkFactoryIssueWorkflow:
                     self._state,
                     task_queue=agent_tq,
                     start_to_close_timeout=timedelta(minutes=5),
+                    retry_policy=RetryPolicy(
+                        maximum_attempts=2,
+                        non_retryable_error_types=["ParseError"],
+                    ),
                 ),
             )
             await self._phase(
@@ -911,6 +922,8 @@ class DarkFactoryIssueWorkflow:
                         ),
                     ),
                 )
+                self._state["test_results"] = []
+                self._state["findings"] = []
                 self._state = merge(
                     self._state,
                     await workflow.execute_activity(
@@ -942,7 +955,7 @@ class DarkFactoryIssueWorkflow:
                         "build_stage",
                         self._state,
                         task_queue=agent_tq,
-                        start_to_close_timeout=timedelta(minutes=15),
+                        start_to_close_timeout=_build_stage_timeout(self._state),
                         heartbeat_timeout=timedelta(minutes=5),
                         retry_policy=RetryPolicy(
                             maximum_attempts=2,
@@ -950,6 +963,8 @@ class DarkFactoryIssueWorkflow:
                         ),
                     ),
                 )
+                self._state["test_results"] = []
+                self._state["findings"] = []
                 self._state = merge(
                     self._state,
                     await workflow.execute_activity(

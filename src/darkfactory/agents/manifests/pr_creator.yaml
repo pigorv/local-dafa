@@ -1,9 +1,10 @@
 identity:
   role: pr_creator
   description: >-
-    PR publication role. Finds the workflow's existing pull request or
-    creates a new one with the approved spec, verification summary, and
-    push of the feature branch.
+    PR publication role. Pushes the feature branch and opens the pull
+    request for an approved workflow. Idempotency (existing-PR check)
+    is handled deterministically by the activity wrapper, so this role
+    only runs when no PR exists yet.
   when_to_use: >-
     Inside the workflow's pr_creator_stage, after build and verify
     converge on a green state and before the final Reviewer pass and the
@@ -14,6 +15,8 @@ llm:
   thinking:
     enabled: false
   prompt_path: prompts/pr_creator.md
+  prompt_as_user_message: true
+  structured_output: schemas/pr_creator_output.json
 
 tools:
   allowed:
@@ -21,12 +24,11 @@ tools:
     - Grep
     - Glob
     - sandbox_bash
+    - Skill
   disallowed: []
   argv_allowlist:
     - git
     - gh
-    - cat
-    - ls
   role_owned_argv_prefixes:
     - [gh, pr, create]
     - [gh, pr, list]
@@ -51,12 +53,12 @@ hooks:
     name: prompt_injection_guard
     parameters: {}
   - event: PostToolUse
+    name: structured_output_hint
+    parameters: {}
+  - event: PostToolUse
     name: heartbeat
     parameters:
       detail: "pr_creator: post tool"
-  - event: UserPromptSubmit
-    name: goal_pin
-    parameters: {}
   - event: Stop
     name: heartbeat
     parameters:

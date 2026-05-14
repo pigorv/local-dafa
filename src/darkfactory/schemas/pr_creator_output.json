@@ -1,0 +1,22 @@
+{
+  "type": "object",
+  "title": "PRCreatorReport",
+  "description": "PR Creator report: status, pr_url, and a short summary. Place these fields directly as the tool input — no outer wrapper.",
+  "additionalProperties": false,
+  "required": ["status", "pr_url", "summary"],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["created", "existing"],
+      "description": "created: you pushed the feature branch and opened a new pull request this turn. existing: you discovered an open pull request already exists for the feature branch and reused its URL without pushing or creating anything."
+    },
+    "pr_url": {
+      "type": "string",
+      "description": "Full GitHub pull request URL of the form 'https://github.com/{owner}/{repo}/pull/{number}'."
+    },
+    "summary": {
+      "type": "string",
+      "description": "One short sentence describing what you did (e.g. 'Opened PR for agent/wf-123 with approved spec rev 2.' or 'Reused existing PR #42 for agent/wf-123.')."
+    }
+  }
+}

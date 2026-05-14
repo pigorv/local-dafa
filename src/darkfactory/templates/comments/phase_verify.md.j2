@@ -1,0 +1,22 @@
+{% if verify_block %}
+{{ verify_block }}
+{% endif %}
+{% if tests not in (none, "", []) %}
+Tests: {{ tests|compact }}
+{% endif %}
+{% if lint not in (none, "", []) %}
+Lint: {{ lint|compact }}
+{% endif %}
+{% if types not in (none, "", []) %}
+Types: {{ types|compact }}
+{% endif %}
+{% if quality not in (none, "", []) %}
+Quality: {{ quality|compact }}
+{% endif %}
+{% if attempts %}
+
+Attempts:
+{% for attempt in attempts %}
+- {{ attempt|compact }}
+{% endfor %}
+{% endif %}

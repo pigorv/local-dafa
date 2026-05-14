@@ -1,0 +1,61 @@
+## Approved Contract
+{% if stories %}
+
+### Stories
+{% for story in stories %}
+- **{{ story.id }}**: {{ story.title or "(untitled)" }}
+{% for criterion in story.acceptance_criteria %}
+  - {{ criterion }}
+{% endfor %}
+{% endfor %}
+{% endif %}
+{% if work_packages %}
+
+### Work Packages
+{% for wp in work_packages %}
+- **{{ wp.id }}**{{ (": " ~ wp.title) if wp.title else "" }}
+{% if wp.intent %}
+  - Intent: {{ wp.intent }}
+{% endif %}
+{% if wp.approach %}
+  - Approach: {{ wp.approach|compact }}
+{% endif %}
+{% if wp.repo_areas %}
+  - Repo areas: {{ wp.repo_areas|compact }}
+{% endif %}
+{% if wp.candidate_files %}
+  - Candidate files (hints): {{ wp.candidate_files|compact }}
+{% endif %}
+{% if wp.verification_predicates %}
+  - Verification predicates:
+{% for predicate in wp.verification_predicates %}
+    - {{ predicate }}
+{% endfor %}
+{% endif %}
+{% if wp.test_files %}
+  - Tests: {{ wp.test_files|compact }}
+{% endif %}
+{% if wp.risks %}
+  - Risks: {{ wp.risks|compact }}
+{% endif %}
+{% if wp.dependencies %}
+  - Depends on: {{ wp.dependencies|compact }}
+{% endif %}
+{% endfor %}
+{% endif %}
+{% if deferred_notes %}
+
+### Deferred concerns (approved with notes)
+{% for note in deferred_notes %}
+- {{ note }}
+{% endfor %}
+{% endif %}
+{% if review_decision_compact %}
+
+### Spec Review
+{{ review_decision_compact }}
+{% endif %}
+{% if empty %}
+
+_No spec content was produced._
+{% endif %}

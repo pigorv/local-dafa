@@ -343,10 +343,20 @@ class ReviewDecision(TypedDict):
     edits: dict                           # optional {field: new_value}
     notes: list[str]                      # deferred concerns surfaced on the brief gate
 
+
+class ReviewerFinding(BaseModel):
+    path: str = ""
+    line: Optional[int] = None
+    end_line: Optional[int] = None
+    severity: Literal["low", "medium", "high"]
+    message: str
+
+
 class ReviewerSummary(BaseModel):
     severity: Literal["low", "medium", "high"]
     issues: list[str]
     recommendation: Literal["approve", "request_changes"]
+    findings: list[ReviewerFinding] = Field(default_factory=list)
 
 class VerifySummary(TypedDict):
     passed: bool

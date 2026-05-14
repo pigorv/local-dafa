@@ -1,0 +1,35 @@
+{% if pr_url %}
+PR: {{ pr_url }}
+{% endif %}
+{% if recommendation %}
+Recommendation: {{ recommendation }}
+{% endif %}
+{% if severity %}
+Severity: {{ severity }}
+{% endif %}
+{% if issues %}
+
+Issues:
+{% for issue in issues %}
+- {{ issue|compact }}
+{% endfor %}
+{% endif %}
+{% if findings %}
+
+Findings:
+{% for finding in findings %}
+- {{ finding.severity_badge }} {{ finding.location }}{{ (" — " ~ finding.message) if finding.message else "" }}
+{% endfor %}
+{% endif %}
+{% if verify_summary %}
+
+{{ verify_summary }}
+{% endif %}
+{% if decision_note %}
+
+{{ decision_note }}
+{% endif %}
+{% if merge_block %}
+
+{{ merge_block }}
+{% endif %}

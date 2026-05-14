@@ -23,7 +23,7 @@
     },
     "derived_user_request": {
       "type": "string",
-      "description": "Concise, implementation-ready restatement of the issue, including resolved constraints and acceptance details from comments. Required when ready_to_build is true; empty string otherwise."
+      "description": "Concise, implementation-ready restatement of the issue, including resolved constraints and acceptance details from comments. Required when ready_to_build is true; empty string otherwise. When non-empty, format as compact GitHub-flavored Markdown instead of a single plain sentence: start with a bold label such as `**Request:**`, then add short bullets for acceptance details, constraints, or explicitly unchanged behaviour when those details exist. Preserve the user's meaning; do not invent requirements, implementation steps, headings, or file paths just to make the Markdown fuller."
     },
     "confidence": {
       "type": "string",
@@ -32,7 +32,7 @@
     },
     "rationale": {
       "type": "string",
-      "description": "One or two sentences justifying the decision. Posted to the workflow trace for human reviewers."
+      "description": "Brief justification for the triage decision. Posted to the workflow trace for human reviewers. Format as compact GitHub-flavored Markdown rather than a single plain line: use 2-3 short bullets or bold labels such as `**Decision:**`, `**Evidence:**`, and `**Open risk:**` when helpful. Keep the same reasoning content as a normal rationale; do not add speculation or repeat the full derived request."
     }
   }
 }

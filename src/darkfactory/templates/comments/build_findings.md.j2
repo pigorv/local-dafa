@@ -1,0 +1,37 @@
+<details>
+<summary>Per-WP builder + tester output ({{ wp_outputs|length }})</summary>
+
+{% for wp in wp_outputs %}
+**{{ wp.wp_id }}**
+
+{% if wp.builder %}
+Builder ({{ wp.builder.status }}): {{ wp.builder.summary or "(no summary)" }}
+{% if wp.builder.edits %}
+
+Edits:
+{% for edit in wp.builder.edits %}
+- `{{ edit.operation }}` `{{ edit.path }}`{{ (" — " ~ edit.intent) if edit.intent else "" }}
+{% endfor %}
+{% endif %}
+{% if wp.builder.blockers %}
+
+Blockers:
+{% for blocker in wp.builder.blockers %}
+- {{ blocker }}
+{% endfor %}
+{% endif %}
+{% endif %}
+{% if wp.tester %}
+
+Tester: {{ wp.tester.summary or "(no summary)" }}
+{% if wp.tester.findings %}
+
+Tester findings:
+{% for finding in wp.tester.findings %}
+- [{{ finding.kind }}] {{ finding.detail }}
+{% endfor %}
+{% endif %}
+{% endif %}
+
+{% endfor %}
+</details>

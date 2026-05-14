@@ -1,0 +1,58 @@
+{
+  "type": "object",
+  "title": "ReviewerSummary",
+  "description": "Reviewer summary for the human merge gate. Place these fields directly as the tool input — no outer wrapper.",
+  "additionalProperties": false,
+  "required": ["severity", "issues", "recommendation"],
+  "properties": {
+    "severity": {
+      "type": "string",
+      "enum": ["low", "medium", "high"],
+      "description": "Overall merge-risk level. Use high for correctness, security, migration, data-loss, or failed-verification concerns that should block merge."
+    },
+    "issues": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Short human-readable summary of concrete issues for the merge gate. Empty list when there are no meaningful issues."
+    },
+    "recommendation": {
+      "type": "string",
+      "enum": ["approve", "request_changes"],
+      "description": "approve only when verification passed and no blocking concerns remain. request_changes when the PR needs a Fixer/rebuild/human follow-up before merge."
+    },
+    "findings": {
+      "type": "array",
+      "description": "Optional structured findings suitable for later inline PR comments. Omit or leave empty when there are no concrete findings.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "severity", "message"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Repository-relative file path for the finding. Use an empty string only for a whole-PR finding with no specific file."
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Optional 1-based start line when the finding maps to a specific line."
+          },
+          "end_line": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Optional 1-based end line for a multi-line finding."
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["low", "medium", "high"],
+            "description": "Finding-specific severity."
+          },
+          "message": {
+            "type": "string",
+            "description": "One concise, actionable finding."
+          }
+        }
+      }
+    }
+  }
+}

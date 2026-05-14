@@ -1,0 +1,23 @@
+{% if commit_count not in (none, "", []) %}
+Commits: {{ commit_count|compact }}
+{% endif %}
+{% if files_changed not in (none, "", []) %}
+Files changed: {{ files_changed|compact }}
+{% endif %}
+{% if head_sha not in (none, "", []) %}
+Head SHA: {{ head_sha|compact }}
+{% endif %}
+{% if branch not in (none, "", []) %}
+Branch: {{ branch|compact }}
+{% endif %}
+{% if attempts %}
+
+Attempts:
+{% for attempt in attempts %}
+- {{ attempt|compact }}
+{% endfor %}
+{% endif %}
+{% if findings_block %}
+
+{{ findings_block }}
+{% endif %}

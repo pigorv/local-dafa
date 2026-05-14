@@ -309,6 +309,15 @@ services:
     depends_on:
       - transcript-transformer
 
+  darkfactory-worker-image:
+    image: ${DARKFACTORY_WORKER_IMAGE:-darkfactory-worker:polyglot}
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    profiles:
+      - worker-image
+    command: ["true"]
+
   darkfactory-orchestrator:
     image: darkfactory-orchestrator:dev
     build:
@@ -328,6 +337,7 @@ services:
       LANGFUSE_HOST: http://langfuse-web:3000
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      DARKFACTORY_WORKER_IMAGE: ${DARKFACTORY_WORKER_IMAGE:-darkfactory-worker:polyglot}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./src:/app/src:ro

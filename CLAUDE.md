@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Dark Factory is an autonomous coding pipeline that turns a user prompt (or a labeled GitHub issue) into a reviewed pull request. A Temporal workflow drives a sequence of stages — hydrate, triage, planning (PO → Architect → Plan Critic), brief gate, build (Builder + Tester), verify, fixer loop, reviewer, PR creation, merge gate, deterministic merge — where each stage is one or more Claude Agent SDK roles running inside a per-workflow Docker worker container.
+Dark Factory is an autonomous coding pipeline that turns a user prompt (or a labeled GitHub issue) into a reviewed pull request. A Temporal workflow drives a sequence of stages — hydrate, triage, planning (PO → Architect → Plan Critic), brief gate, build (Builder + Tester), verify, fixer loop, PR creation, reviewer, merge gate, deterministic merge — where each stage is one or more Claude Agent SDK roles running inside a per-workflow Docker worker container.
 
 The repo is mid-migration from v1 to v2 (see `docs/dark-factory-v2-implementation-plan.md`). The principle is **Planning describes intent; builders discover specifics** — planning emits an `ImplementationBrief` of work packages with verification predicates, and builders/testers use repo tools at execution time to discover concrete edits. Legacy `SpecSlice`/`affected_files` paths still exist as compatibility shims; the migration is tracked in `docs/dark-factory-v2-implementation-tracker.md`.
 
@@ -15,6 +15,7 @@ The repo is mid-migration from v1 to v2 (see `docs/dark-factory-v2-implementatio
 uv sync
 
 # Run the full local stack (Temporal + Langfuse + ClickHouse + Postgres + MinIO + OTel collector + orchestrator)
+docker compose --profile worker-image build darkfactory-worker-image
 docker compose up -d
 
 # Trigger a manual run against the local repo
@@ -75,11 +76,11 @@ The first-class artifact moving through the pipeline is `ImplementationBrief` (p
 
 ### Agents and LLM configuration
 
-Each role under `src/darkfactory/agents/` (po, architect, plan_critic, builder, tester, verifier_semantic, fixer, reviewer, pr_creator, triage) calls `darkfactory.llm_factory.build_options(role, ...)` to get a `ClaudeAgentOptions` with per-role model + thinking config. Defaults come from each role's manifest under `agents/manifests/` and can be overridden per-role with `LLM_<ROLE>_MODEL` / `LLM_<ROLE>_THINKING` env vars. Builder Supervisor (`agents/builder_supervisor.py`) is pure topo-sort, no LLM. `frontend.py` is a no-op stub for the Java-only target app.
+Each role under `src/darkfactory/agents/` (po, architect, plan_critic, builder, tester, verifier_semantic, fixer, reviewer, pr_creator, triage) calls `darkfactory.llm_factory.build_options(role, ...)` to get a `ClaudeAgentOptions` with per-role model + thinking config. Defaults come from each role's manifest under `agents/manifests/` and can be overridden per-role with `LLM_<ROLE>_MODEL` / `LLM_<ROLE>_THINKING` env vars. Builder Supervisor (`agents/builder_supervisor.py`) is pure topo-sort, no LLM. Every work package is dispatched to Builder + Tester — there is no language-based routing.
 
 `spec_adjustment.py` and the `spec_adjustment` role default are leftover from v1; the v2 replacement is `fixer.py` + `verifier_semantic.py`, and the activity is still exposed as `spec_adjustment_stage` for backwards compatibility. When touching planning/repair code, prefer the v2 names.
 
-The SDK is wired in `bypassPermissions` mode with `setting_sources=[]` for hermetic runs. Shell access is per-role: reasoning-only roles (PO, Architect) explicitly disallow `Bash`; the Builder, Tester, and Fixer run the built-in `Bash` directly with a pure-denylist policy (worker container is the isolation boundary, only `git push` blocked at the per-role layer); PR Creator routes process execution through the MCP `sandbox_bash` tool so `hooks/permission_gate.py` can enforce a per-role argv allowlist on top of the `FORBIDDEN_TOKENS` deny-list, no-merge enforcement, and role-owned commands like `git push` restricted to the PR Creator. `hooks/path_guard.py` adds an edit-path allowlist for `Edit`/`Write` calls.
+The SDK is wired in `bypassPermissions` mode with `setting_sources=["project"]`, so the target repo's `CLAUDE.md`, `.claude/skills/`, and `.claude/settings.json` (rooted at the worker's `/workspace` cwd) load into every spawned session; host-level `~/.claude/` is intentionally excluded so the worker container stays hermetic. For project-level skills to actually be invocable, the role manifest must list `Skill` in `tools.allowed`; every tool-using role does (`plan_critic` and `verifier_semantic` stay zero-tool by design). Shell access is per-role: read-only roles (PO, Architect, Reviewer) explicitly disallow `Bash`; the Builder, Tester, and Fixer run the built-in `Bash` directly with a pure-denylist policy (worker container is the isolation boundary, only `git push` blocked at the per-role layer); PR Creator routes process execution through the MCP `sandbox_bash` tool so `hooks/permission_gate.py` can enforce a per-role argv allowlist on top of the `FORBIDDEN_TOKENS` deny-list, no-merge enforcement, and role-owned commands like `git push` restricted to the PR Creator. `hooks/path_guard.py` adds an edit-path allowlist for `Edit`/`Write` calls.
 
 ### LangGraph subgraphs inside activities
 

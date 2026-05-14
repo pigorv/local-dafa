@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 from typing import Any, Awaitable, Callable
 
 from langgraph.graph import END, START, StateGraph
@@ -10,7 +12,6 @@ from darkfactory.agents.builder_supervisor import (
     SUPERVISOR_NAME,
     builder_supervisor_node,
 )
-from darkfactory.agents.frontend import run_frontend
 from darkfactory.agents.tester import run_tester
 from darkfactory.state import PipelineState
 from darkfactory.tools.git_diff import (
@@ -23,14 +24,45 @@ from darkfactory.tools.shell import get_sandbox, register_sandbox
 
 log = logging.getLogger(__name__)
 
-WORKER_NAMES = ("builder", "tester", "frontend")
+WORKER_NAMES = ("builder", "tester")
 BRANCH_INIT_NAME = "branch_init"
+DEFAULT_GIT_NAME = "darkfactory-agent"
+DEFAULT_GIT_EMAIL = "agent@darkfactory.local"
 
 WORKER_RUNNERS: dict[str, Callable[[dict], Awaitable[Any]]] = {
     "builder": run_builder,
     "tester": run_tester,
-    "frontend": run_frontend,
 }
+
+
+def _resolve_git_identity(sb: RepoSandbox) -> tuple[str, str]:
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not token:
+        return DEFAULT_GIT_NAME, DEFAULT_GIT_EMAIL
+
+    result = sb.exec(["gh", "api", "/user"])
+    if result.get("returncode") != 0:
+        log.debug(
+            "Falling back to default git identity; gh api /user failed: %s",
+            result.get("stderr") or result.get("stdout") or "unknown error",
+        )
+        return DEFAULT_GIT_NAME, DEFAULT_GIT_EMAIL
+
+    try:
+        payload = json.loads(result.get("stdout") or "{}")
+    except json.JSONDecodeError:
+        log.debug("Falling back to default git identity; gh api /user returned invalid JSON")
+        return DEFAULT_GIT_NAME, DEFAULT_GIT_EMAIL
+
+    login = str(payload.get("login") or "").strip()
+    name = login or str(payload.get("name") or "").strip() or DEFAULT_GIT_NAME
+    email = str(payload.get("email") or "").strip()
+    user_id = payload.get("id")
+    if not email and login and user_id is not None:
+        email = f"{user_id}+{login}@users.noreply.github.com"
+    if not email:
+        email = DEFAULT_GIT_EMAIL
+    return name, email
 
 
 def _branch_init_node(state: PipelineState, runtime=None) -> dict:
@@ -51,8 +83,9 @@ def _branch_init_node(state: PipelineState, runtime=None) -> dict:
     if sb is None:
         return {}
 
-    sb.exec(["git", "config", "user.name", "darkfactory-agent"])
-    sb.exec(["git", "config", "user.email", "agent@darkfactory.local"])
+    git_name, git_email = _resolve_git_identity(sb)
+    sb.exec(["git", "config", "user.name", git_name])
+    sb.exec(["git", "config", "user.email", git_email])
 
     cur = sb.exec(["git", "branch", "--show-current"])
     branch = (cur.get("stdout") or "").strip()
@@ -223,14 +256,11 @@ def _worker_node_factory(name: str):
     async def worker_node(state: PipelineState) -> dict:
         slice_id = state.get("current_slice") or ""
 
-        # Snapshot HEAD before the Builder / Tester runs so we can compute
-        # the ground-truth diff afterwards. Frontend stays on the legacy
-        # sentinel path (it's a no-op stub and not worth its own channel).
+        # Snapshot HEAD before the worker runs so we can compute the
+        # ground-truth diff afterwards.
         task_id = _resolve_task_id(state)
         sandbox = get_sandbox(task_id) if task_id else None
-        pre_sha = (
-            snapshot_head(sandbox) if name in ("builder", "tester") else ""
-        )
+        pre_sha = snapshot_head(sandbox) if sandbox is not None else ""
 
         try:
             result = await runner(state)
@@ -246,11 +276,11 @@ def _worker_node_factory(name: str):
                 ]
             }
 
-        # Builder / Tester patches come from `git diff` in PR B/C. In tests
-        # that run without a registered sandbox (no pre_sha, no sandbox),
-        # fall back to the result-dict shape so fixtures can drive patch
-        # contents directly without standing up a real git tree.
-        if name in ("builder", "tester") and pre_sha and sandbox is not None:
+        # Builder / Tester patches come from `git diff`. In tests that run
+        # without a registered sandbox (no pre_sha, no sandbox), fall back
+        # to the result-dict shape so fixtures can drive patch contents
+        # directly without standing up a real git tree.
+        if pre_sha and sandbox is not None:
             patches = compute_wp_diff(
                 sandbox, pre_sha, role=name, slice_id=slice_id
             )
@@ -260,21 +290,8 @@ def _worker_node_factory(name: str):
         coverage_entries = _coverage_entries_from_result(result)
         delta: dict[str, Any] = {}
 
-        # Sentinel-completion is per-worker. Builder + Tester no longer
-        # emit the ``(worker-completion)`` patch — the supervisor advances
-        # on ``builder_outputs`` / ``tester_outputs`` entries instead.
-        # Frontend keeps the sentinel since it doesn't have its own channel.
         if patches:
             delta["patches"] = patches
-        elif name == "frontend":
-            delta["patches"] = [
-                {
-                    "path": "(worker-completion)",
-                    "diff": "",
-                    "author_agent": name,
-                    "slice_id": slice_id,
-                }
-            ]
 
         # Builder-only plumbing: record the structured BuilderOutput on its
         # own state channel, expose the summary so the Tester can read it,

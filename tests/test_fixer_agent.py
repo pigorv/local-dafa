@@ -42,7 +42,7 @@ from darkfactory.state import (
 # Matches the canonical worker allowlist; kept inline so the test fails loud
 # if the manifest's allowed-tools list drifts. Fixer mirrors Builder/Tester:
 # built-in Bash with a pure denylist, no sandbox_bash, no MCP.
-ALLOWED_TOOLS: list[str] = ["Read", "Write", "Edit", "Grep", "Glob", "Bash"]
+ALLOWED_TOOLS: list[str] = ["Read", "Write", "Edit", "Grep", "Glob", "Bash", "Skill"]
 FIXER_DENYLIST: tuple[tuple[str, ...], ...] = (("git", "push"),)
 
 
@@ -223,7 +223,7 @@ def test_fixer_client_options_are_tool_using_and_hermetic() -> None:
 
     # Fixer mirrors Builder/Tester's shell pattern: built-in ``Bash`` with a
     # pure denylist (no ``sandbox_bash``, no ``darkfactory`` MCP server).
-    assert opts.setting_sources == []
+    assert opts.setting_sources == ["project"]
     assert opts.allowed_tools == ALLOWED_TOOLS
     assert "Bash" in opts.allowed_tools
     assert "sandbox_bash" not in opts.allowed_tools

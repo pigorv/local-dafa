@@ -189,8 +189,29 @@ def test_setup_worker_activity_clones_when_repo_url_given(monkeypatch):
     _assert_transcripts_mount(containers_api.run_kwargs, "wf-issue")
 
     cmds = [call["cmd"] for call in container.exec_calls]
-    assert cmds[0] == ["gh", "repo", "clone", url, "/workspace"]
-    assert any(cmd[0] == "git" and "checkout" in cmd for cmd in cmds[1:])
+    assert cmds[0] == ["gh", "auth", "setup-git"]
+    assert cmds[1] == ["gh", "repo", "clone", url, "/workspace"]
+    assert any(cmd[0] == "git" and "checkout" in cmd for cmd in cmds[2:])
+
+
+def test_setup_worker_activity_uses_default_polyglot_worker_image(monkeypatch):
+    monkeypatch.delenv(activities_mod.WORKER_IMAGE_ENV, raising=False)
+    _, containers_api = _patch_docker_for_setup(monkeypatch)
+
+    asyncio.run(setup_worker_activity("wf-image-default", "/host/path/to/repo"))
+
+    assert containers_api.run_kwargs is not None
+    assert containers_api.run_kwargs["image"] == activities_mod.DEFAULT_WORKER_IMAGE
+
+
+def test_setup_worker_activity_uses_configured_worker_image(monkeypatch):
+    monkeypatch.setenv(activities_mod.WORKER_IMAGE_ENV, "acme/worker-node:dev")
+    _, containers_api = _patch_docker_for_setup(monkeypatch)
+
+    asyncio.run(setup_worker_activity("wf-image-custom", "/host/path/to/repo"))
+
+    assert containers_api.run_kwargs is not None
+    assert containers_api.run_kwargs["image"] == "acme/worker-node:dev"
 
 
 def test_setup_worker_activity_raises_when_clone_fails(monkeypatch):
@@ -581,8 +602,11 @@ def test_pr_creator_stage_flows_url_into_pr_url(monkeypatch):
     monkeypatch.setattr(activities_mod, "get_sandbox", lambda _task_id: _FakeRepoSandbox())
 
     async def fake_run_pr_creator(state):
-        assert state["gate_approved"] is True
-        return "https://github.com/acme/demo/pull/42"
+        return {
+            "status": "created",
+            "pr_url": "https://github.com/acme/demo/pull/42",
+            "summary": "Opened PR for agent/wf-pr-1.",
+        }
 
     _install_fake_module(
         monkeypatch,
@@ -596,11 +620,56 @@ def test_pr_creator_stage_flows_url_into_pr_url(monkeypatch):
                 "wf_id": "wf-pr-1",
                 "task_id": "wf-pr-1",
                 "repo_path": "/workspace",
-                "gate_approved": True,
             }
         )
     )
     assert delta == {"pr_url": "https://github.com/acme/demo/pull/42"}
+
+
+def test_pr_creator_stage_short_circuits_when_pr_exists(monkeypatch):
+    """If `gh pr list` returns a URL, the SDK role is never invoked."""
+
+    class _PreexistingPRSandbox:
+        def __init__(self):
+            self.calls: list[list[str]] = []
+
+        def exec(self, argv, timeout=120):  # noqa: ARG002 — match RepoSandbox.exec
+            self.calls.append(list(argv))
+            if argv[:2] == ["gh", "pr"] and "list" in argv:
+                return {
+                    "returncode": 0,
+                    "stdout": "https://github.com/acme/demo/pull/7\n",
+                    "stderr": "",
+                }
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+
+    sandbox = _PreexistingPRSandbox()
+    monkeypatch.setattr(activities_mod, "get_sandbox", lambda _task_id: sandbox)
+
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("run_pr_creator must not be called when a PR already exists")
+
+    _install_fake_module(
+        monkeypatch,
+        "darkfactory.agents.pr_creator",
+        run_pr_creator=_explode,
+    )
+
+    delta = asyncio.run(
+        pr_creator_stage(
+            {
+                "wf_id": "wf-pr-existing",
+                "task_id": "wf-pr-existing",
+                "repo_path": "/workspace",
+            }
+        )
+    )
+
+    assert delta == {"pr_url": "https://github.com/acme/demo/pull/7"}
+    assert any(
+        argv[:2] == ["gh", "pr"] and "list" in argv and "--head" in argv
+        for argv in sandbox.calls
+    )
 
 
 def test_merge_branch_requires_pr_url(monkeypatch):

@@ -99,9 +99,9 @@ Output:
     "Which columns must the CSV include?",
     "Should the export respect the same filters and permissions as the on-screen report?"
   ],
-  "derived_user_request": "Add CSV export for reports, pending the target report, column set, and filtering behavior.",
+  "derived_user_request": "",
   "confidence": "low",
-  "rationale": "The issue names a capability but not the target surface or expected CSV contents."
+  "rationale": "**Decision:** Needs clarification.\n\n**Evidence:**\n- The issue names CSV export but not the target surface.\n- The expected CSV columns and filter/permission behavior are unspecified."
 }
 
 Ready issue:
@@ -115,9 +115,9 @@ Output:
 {
   "ready_to_build": true,
   "clarification_questions": [],
-  "derived_user_request": "Update GET /customers/{id} so missing customers return HTTP 404 with JSON body {\"error\":\"customer_not_found\"}, while successful lookups keep their current behavior. Add a controller test covering the missing-customer case.",
+  "derived_user_request": "**Request:** Update `GET /customers/{id}` so missing customers return HTTP 404 with JSON body `{\"error\":\"customer_not_found\"}`.\n\n**Acceptance details:**\n- Successful lookups keep their current behavior.\n- Add a controller test covering the missing-customer case.",
   "confidence": "high",
-  "rationale": "The issue specifies the endpoint, failure condition, response status, response body, unchanged behavior, and expected test coverage."
+  "rationale": "**Decision:** Ready to build.\n\n**Evidence:**\n- The issue specifies the endpoint, failure condition, response status, and response body.\n- The comments add expected test coverage and unchanged successful-lookup behavior."
 }
 
 Resolved by comments:
@@ -131,9 +131,9 @@ Output:
 {
   "ready_to_build": true,
   "clarification_questions": [],
-  "derived_user_request": "Reject invalid email addresses during signup using the same validation rules as the profile update endpoint, returning HTTP 400 with field error key email.",
+  "derived_user_request": "**Request:** Reject invalid email addresses during signup.\n\n**Acceptance details:**\n- Use the same validation rules as the profile update endpoint.\n- Return HTTP 400 with field error key `email`.",
   "confidence": "medium",
-  "rationale": "The comments resolve the validation rule and response shape; discovery can use repo context to locate the existing profile update behavior."
+  "rationale": "**Decision:** Ready to build.\n\n**Evidence:**\n- The comments resolve the validation rule and response shape.\n- Discovery can use repo context to locate the existing profile update behavior."
 }
 
 The structured-output schema describes each field; rely on the field

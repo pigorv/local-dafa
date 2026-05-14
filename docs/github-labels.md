@@ -49,7 +49,16 @@ Applied by the issue workflow or the poller when a run ends in a non-success sta
 
 ## One-shot setup with `gh`
 
-The following script creates every label above with reasonable defaults. Run it once per target repo before installing the schedule.
+Use the helper script to create or update every label above on a target repository. It reads the documented `gh label create` commands below, so this file stays the source of truth.
+
+```bash
+./scripts/sync_github_labels.py owner/name
+
+# Preview the GitHub CLI commands without changing the repo:
+./scripts/sync_github_labels.py owner/name --dry-run
+```
+
+The raw `gh` commands are kept here for transparency and for the helper to parse.
 
 ```bash
 REPO=owner/name   # e.g. acme/widgets

@@ -1,0 +1,8 @@
+{{ marker }}
+Dark Factory workflow `{{ workflow_id }}` for issue #{{ issue_number }} ended in state `{{ status_word }}`.
+
+{% if label %}
+Removed `{{ ready_label }}` and added `{{ label }}`. Re-add `{{ ready_label }}` after addressing the underlying problem to queue a fresh attempt.
+{% else %}
+Removed `{{ ready_label }}` to stop re-polling. If this issue still needs work, re-add `{{ ready_label }}` to queue a fresh attempt.
+{% endif %}

@@ -4,7 +4,9 @@ Builder, Tester, and PR Creator agents are composed via
 ``compose(role, ComposeState.from_mapping(...), task_id=...)``. The tests
 below assert:
 
-1. Option shape: hermetic ``setting_sources=[]``; the canonical worker
+1. Option shape: ``setting_sources=["project"]`` (target-repo CLAUDE.md
+   and .claude/skills/ are loaded but the host's ``~/.claude/`` is not);
+   the canonical worker
    ``allowed_tools`` list (no built-in ``Bash``); the in-process
    ``darkfactory`` MCP server attached; a ``can_use_tool`` callback wired;
    all the expected hook events populated.
@@ -43,7 +45,7 @@ from darkfactory.agents import pr_creator as pr_creator_mod
 from darkfactory.agents import tester as tester_mod
 from darkfactory.agents.builder import run_builder
 from darkfactory.agents.compose import ComposeState, compose
-from darkfactory.agents.pr_creator import PR_CREATOR_ALLOWLIST, run_pr_creator
+from darkfactory.agents.pr_creator import run_pr_creator
 from darkfactory.agents.registry import get_default_registry
 from darkfactory.agents.tester import run_tester
 
@@ -65,9 +67,9 @@ def _pr_creator_client(state_slice: dict) -> ClaudeSDKClient:
     return _compose_client("pr_creator", state_slice)
 
 
-BUILDER_TOOLS: list[str] = ["Read", "Write", "Edit", "Grep", "Glob", "Bash"]
-TESTER_TOOLS: list[str] = ["Read", "Write", "Edit", "Grep", "Glob", "Bash"]
-PR_CREATOR_TOOLS: list[str] = ["Read", "Grep", "Glob", "sandbox_bash"]
+BUILDER_TOOLS: list[str] = ["Read", "Write", "Edit", "Grep", "Glob", "Bash", "Skill"]
+TESTER_TOOLS: list[str] = ["Read", "Write", "Edit", "Grep", "Glob", "Bash", "Skill"]
+PR_CREATOR_TOOLS: list[str] = ["Read", "Grep", "Glob", "sandbox_bash", "Skill"]
 WORKER_DENYLIST: tuple[tuple[str, ...], ...] = (("git", "push"),)
 
 
@@ -97,7 +99,6 @@ def _pr_state_slice() -> dict:
             "wf_id": "wf-pr-123",
             "task_id": "wf-pr-123",
             "feature_branch": "agent/wf-pr-123",
-            "gate_approved": True,
             "verify_summary": {"passed": True, "failed_tests": 0, "hard_findings": 0},
             "review_decision": {
                 "severity": "low",
@@ -124,7 +125,7 @@ def test_builder_client_options_are_hermetic_and_sdk_native() -> None:
     # Builder runs the built-in ``Bash`` directly (no ``sandbox_bash``,
     # no ``darkfactory`` MCP server). The permission gate runs in pure
     # denylist mode: empty argv_allowlist, ``git push`` in argv_denylist.
-    assert opts.setting_sources == []
+    assert opts.setting_sources == ["project"]
     assert opts.allowed_tools == BUILDER_TOOLS
     assert "Bash" in opts.allowed_tools
     assert "sandbox_bash" not in opts.allowed_tools
@@ -156,7 +157,7 @@ def test_tester_client_options_are_hermetic_and_sdk_native() -> None:
 
     # Tester mirrors Builder's shell pattern: built-in ``Bash`` with a
     # pure denylist (no ``sandbox_bash``, no ``darkfactory`` MCP server).
-    assert opts.setting_sources == []
+    assert opts.setting_sources == ["project"]
     assert opts.allowed_tools == TESTER_TOOLS
     assert "Bash" in opts.allowed_tools
     assert "sandbox_bash" not in opts.allowed_tools
@@ -230,7 +231,7 @@ def test_pr_creator_client_options_are_pre_review_and_read_only() -> None:
     opts = client.options
     assert opts is not None
 
-    assert opts.setting_sources == []
+    assert opts.setting_sources == ["project"]
     assert opts.allowed_tools == PR_CREATOR_TOOLS
     assert "Bash" not in opts.allowed_tools
     assert "Write" not in opts.allowed_tools
@@ -241,10 +242,17 @@ def test_pr_creator_client_options_are_pre_review_and_read_only() -> None:
     assert opts.model == "claude-haiku-4-5-20251001"
     assert opts.thinking is not None
     assert opts.thinking["type"] == "disabled"
-    assert PR_CREATOR_ALLOWLIST == frozenset({"git", "gh", "cat", "ls"})
-    for event in ("PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop"):
+
+    manifest_tools = get_default_registry().get("pr_creator").tools
+    assert tuple(manifest_tools.argv_allowlist) == ("git", "gh")
+
+    # PreToolUse / PostToolUse / Stop are populated; UserPromptSubmit is
+    # intentionally absent — pr_creator is single-turn so goal_pin would
+    # never fire, and the manifest no longer attaches it.
+    for event in ("PreToolUse", "PostToolUse", "Stop"):
         assert event in opts.hooks, event
         assert isinstance(opts.hooks[event][0], HookMatcher)
+    assert "UserPromptSubmit" not in opts.hooks
 
 
 # ---------- argv allowlist behaviour ----------
@@ -338,8 +346,12 @@ def test_pr_creator_permission_gate_denies_off_allowlist_argv() -> None:
 
 
 def test_pr_creator_merge_tools_respect_gate() -> None:
+    # The modern PR Creator flow pushes through `sandbox_bash` + the
+    # role-owned `git push` argv prefix; the legacy `git_push_agent_branch`
+    # MCP tool is unused in production but still gated for defence-in-depth.
+    # Exercise both branches by toggling `gate_approved` explicitly.
     denied_client = _pr_creator_client({**_pr_state_slice(), "gate_approved": False})
-    allowed_client = _pr_creator_client(_pr_state_slice())
+    allowed_client = _pr_creator_client({**_pr_state_slice(), "gate_approved": True})
 
     async def denied() -> Any:
         return await denied_client.options.can_use_tool(
@@ -570,12 +582,15 @@ def test_run_tester_signals_parse_failure(
     assert out["parse_failure"] is True
 
 
-def test_run_pr_creator_returns_url_and_prompts_for_idempotent_check(
+def test_run_pr_creator_returns_structured_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake = _FakePRClient(
-        [[_assistant("https://github.com/acme/demo/pull/42"), _result_msg()]]
-    )
+    payload = {
+        "status": "created",
+        "pr_url": "https://github.com/acme/demo/pull/42",
+        "summary": "Opened PR for agent/wf-pr-123.",
+    }
+    fake = _FakePRClient([[_structured_assistant(payload), _result_msg()]])
 
     def _compose(*_args: Any, **_kwargs: Any) -> _FakePRClient:
         return fake
@@ -584,7 +599,10 @@ def test_run_pr_creator_returns_url_and_prompts_for_idempotent_check(
 
     out = asyncio.run(run_pr_creator(_pr_state_slice()))
 
-    assert out == "https://github.com/acme/demo/pull/42"
+    assert out == payload
     assert len(fake.queries) == 1
-    assert "gh pr list --head agent/wf-pr-123" in fake.queries[0]
-    assert "git push origin agent/wf-pr-123" in fake.queries[0]
+    # The rendered user message should carry the feature branch the
+    # agent is expected to push, and the "untrusted data" framing.
+    assert "agent/wf-pr-123" in fake.queries[0]
+    assert "git push origin" in fake.queries[0]
+    assert "untrusted" in fake.queries[0].lower()

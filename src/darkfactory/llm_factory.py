@@ -116,8 +116,11 @@ def build_options(
     explicitly; this function only layers ``LLM_<ROLE>_<KEY>`` env-var
     overrides on top, attaches the path guard for edit-capable roles, and
     stamps the OTel resource attributes the otel-collector needs to coalesce
-    orphan ``claude_code.*`` spans. Always sets ``setting_sources=[]`` for
-    hermetic runs.
+    orphan ``claude_code.*`` spans. Always sets
+    ``setting_sources=["project"]`` so the target repo's ``CLAUDE.md``,
+    ``.claude/skills/``, and ``.claude/settings.json`` (rooted at ``cwd``)
+    are loaded into every spawned session; host-level ``~/.claude/`` is
+    intentionally excluded so the worker container stays hermetic.
     """
     raw_model = _env(role, "MODEL")
     if raw_model:
@@ -156,7 +159,7 @@ def build_options(
         can_use_tool=can_use_tool,
         hooks=_with_path_guard(hooks, allowed_tools, path_guard_state),
         cwd=cwd,
-        setting_sources=[],
+        setting_sources=["project"],
         thinking=thinking_cfg,
         env=sdk_env,
         permission_mode="bypassPermissions",

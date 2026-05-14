@@ -99,7 +99,7 @@ def test_compose_noop_options_mirror_manifest() -> None:
     assert opts.can_use_tool is None
     assert opts.cwd == "/workspace"
     assert opts.permission_mode == "bypassPermissions"
-    assert opts.setting_sources == []
+    assert opts.setting_sources == ["project"]
     assert opts.thinking is not None and opts.thinking["type"] == "disabled"
 
 

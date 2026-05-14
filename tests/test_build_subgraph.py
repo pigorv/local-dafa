@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from types import SimpleNamespace
 
 from darkfactory.stages import build as build_mod
 from darkfactory.stages.build import build_subgraph
@@ -31,12 +33,8 @@ def _patch_runners(monkeypatch):
     async def fake_tester(state):
         return _empty_tester_output()
 
-    async def fake_frontend(state):
-        return {"patches": [], "note": "no frontend work"}
-
     monkeypatch.setitem(build_mod.WORKER_RUNNERS, "builder", fake_builder)
     monkeypatch.setitem(build_mod.WORKER_RUNNERS, "tester", fake_tester)
-    monkeypatch.setitem(build_mod.WORKER_RUNNERS, "frontend", fake_frontend)
 
 
 def test_build_subgraph_routes_through_supervisor_in_dependency_order(monkeypatch):
@@ -183,17 +181,13 @@ _BUILD_SPEC_SINGLE = [
 
 
 def _patch_builder_only(monkeypatch, fake_builder):
-    """Patch builder, tester, frontend so only ``fake_builder`` varies."""
+    """Patch builder and tester so only ``fake_builder`` varies."""
 
     async def fake_tester(state):
         return _empty_tester_output()
 
-    async def fake_frontend(state):
-        return {"patches": [], "note": "no frontend work"}
-
     monkeypatch.setitem(build_mod.WORKER_RUNNERS, "builder", fake_builder)
     monkeypatch.setitem(build_mod.WORKER_RUNNERS, "tester", fake_tester)
-    monkeypatch.setitem(build_mod.WORKER_RUNNERS, "frontend", fake_frontend)
 
 
 def test_build_subgraph_records_builder_output_and_summary(monkeypatch):
@@ -349,3 +343,82 @@ def test_build_subgraph_done_with_edits_but_no_patches_flags_unapplied(
         "src/main/java/app/UserController.java"
     ]
     assert findings[0]["actual_paths"] == []
+
+
+class _BranchInitSandbox:
+    def __init__(self, *, gh_result: dict | None = None):
+        self.calls: list[list[str]] = []
+        self.gh_result = gh_result or {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "gh auth missing",
+        }
+
+    def exec(self, argv, timeout=120):  # noqa: ARG002 - match RepoSandbox.exec
+        self.calls.append(list(argv))
+        if argv == ["gh", "api", "/user"]:
+            return dict(self.gh_result)
+        if argv == ["git", "branch", "--show-current"]:
+            return {"returncode": 0, "stdout": "main\n", "stderr": ""}
+        if argv[:3] == ["git", "rev-parse", "--verify"]:
+            return {"returncode": 1, "stdout": "", "stderr": ""}
+        return {"returncode": 0, "stdout": "", "stderr": ""}
+
+
+def _runtime_context(task_id: str = "wf-build-1", feature_branch: str | None = None):
+    return SimpleNamespace(
+        context=SimpleNamespace(
+            task_id=task_id,
+            repo_path="/workspace",
+            feature_branch=feature_branch,
+        )
+    )
+
+
+def test_branch_init_uses_github_token_identity_by_default(monkeypatch):
+    sandbox = _BranchInitSandbox(
+        gh_result={
+            "returncode": 0,
+            "stdout": json.dumps(
+                {
+                    "login": "octocat",
+                    "id": 7,
+                    "name": "The Octocat",
+                    "email": None,
+                }
+            ),
+            "stderr": "",
+        }
+    )
+    monkeypatch.setenv("GITHUB_TOKEN", "token")
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(build_mod, "get_sandbox", lambda _task_id: sandbox)
+    monkeypatch.setattr(build_mod, "register_sandbox", lambda *_args: None)
+
+    assert build_mod._branch_init_node({}, runtime=_runtime_context()) == {}
+    assert ["gh", "api", "/user"] in sandbox.calls
+    assert ["git", "config", "user.name", "octocat"] in sandbox.calls
+    assert [
+        "git",
+        "config",
+        "user.email",
+        "7+octocat@users.noreply.github.com",
+    ] in sandbox.calls
+
+
+def test_branch_init_falls_back_to_default_identity_without_token(monkeypatch):
+    sandbox = _BranchInitSandbox()
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(build_mod, "get_sandbox", lambda _task_id: sandbox)
+    monkeypatch.setattr(build_mod, "register_sandbox", lambda *_args: None)
+
+    assert build_mod._branch_init_node({}, runtime=_runtime_context()) == {}
+    assert ["gh", "api", "/user"] not in sandbox.calls
+    assert ["git", "config", "user.name", build_mod.DEFAULT_GIT_NAME] in sandbox.calls
+    assert [
+        "git",
+        "config",
+        "user.email",
+        build_mod.DEFAULT_GIT_EMAIL,
+    ] in sandbox.calls

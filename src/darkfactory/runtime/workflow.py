@@ -26,11 +26,12 @@ SUPERVISOR_TASK_QUEUE = "supervisor-tq"
 UNKNOWN_FIXER_TARGET = "__unknown__"
 
 # Build-stage activity scales its start_to_close_timeout by Work Package
-# count: 5 min base + 4 min per WP, capped at 60 min. A flat 15 min was
-# tight on multi-WP briefs.
+# count: 5 min base + 8 min per WP, capped at 90 min. A 4-min per-WP
+# slice was tight once Builder/Tester turns started using thinking
+# models (a 4-WP brief blew the 21-min budget mid-Builder turn).
 BUILD_STAGE_BASE_MINUTES = 5
-BUILD_STAGE_PER_WP_MINUTES = 4
-BUILD_STAGE_MAX_MINUTES = 60
+BUILD_STAGE_PER_WP_MINUTES = 8
+BUILD_STAGE_MAX_MINUTES = 90
 
 
 def _build_stage_timeout(state: Any) -> timedelta:
@@ -66,18 +67,58 @@ def _planning_approved(decision: Any) -> bool:
 
 
 def _planning_feedback_from_decision(decision: Any) -> str:
+    """Render a Plan Critic rejection as multi-line markdown.
+
+    The same string is read by humans (via the design phase comment) and by
+    the next planning attempt's LLM context, so it is shaped as readable
+    markdown rather than a JSON-stuffed sentence.
+    """
     reason = str(_state_value(decision, "reason", "") or "").strip()
     edits = _state_value(decision, "edits", {}) or {}
+    if not isinstance(edits, dict):
+        edits = {}
+
+    lines: list[str] = ["**Plan Critic rejected.**"]
+    if reason:
+        lines.extend(["", f"Reason: {reason}"])
     if edits:
-        try:
-            edits_text = json.dumps(edits, sort_keys=True)
-        except TypeError:
-            edits_text = str(edits)
-        if reason:
-            return f"Plan Critic rejected: {reason} Requested edits: {edits_text}"
-        return f"Plan Critic rejected: Requested edits: {edits_text}"
-    fallback = reason or "revise and try again."
-    return f"Plan Critic rejected: {fallback}"
+        lines.extend(["", "Requested edits:"])
+        for wp_id, changes in edits.items():
+            lines.append(f"- **{wp_id}**")
+            lines.extend(_format_plan_critic_changes(changes))
+    elif not reason:
+        lines.extend(["", "Reason: revise and try again."])
+    return "\n".join(lines)
+
+
+def _format_plan_critic_changes(changes: Any) -> list[str]:
+    """Indent one work-package's requested-edit fields into markdown bullets."""
+    if not isinstance(changes, dict):
+        return [f"  - {changes}"]
+    out: list[str] = []
+    for field, value in changes.items():
+        if isinstance(value, list):
+            out.append(f"  - {field}:")
+            for item in value:
+                out.append(f"    - {_plan_critic_value_text(item)}")
+        elif isinstance(value, dict):
+            out.append(f"  - {field}:")
+            for sub_field, sub_value in value.items():
+                out.append(f"    - {sub_field}: {_plan_critic_value_text(sub_value)}")
+        else:
+            out.append(f"  - {field}: {_plan_critic_value_text(value)}")
+    return out
+
+
+def _plan_critic_value_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)) or value is None:
+        return str(value)
+    try:
+        return json.dumps(value, sort_keys=True)
+    except TypeError:
+        return str(value)
 
 
 def _planning_feedback_from_human_revise(signal: Any) -> str:
@@ -614,6 +655,11 @@ class DarkFactoryWorkflow:
                     self._state,
                     task_queue=agent_tq,
                     start_to_close_timeout=timedelta(minutes=5),
+                    heartbeat_timeout=timedelta(minutes=5),
+                    retry_policy=RetryPolicy(
+                        maximum_attempts=2,
+                        non_retryable_error_types=["ParseError"],
+                    ),
                 ),
             )
             self._state = merge(
@@ -623,6 +669,10 @@ class DarkFactoryWorkflow:
                     self._state,
                     task_queue=agent_tq,
                     start_to_close_timeout=timedelta(minutes=5),
+                    retry_policy=RetryPolicy(
+                        maximum_attempts=2,
+                        non_retryable_error_types=["ParseError"],
+                    ),
                 ),
             )
 
@@ -691,6 +741,10 @@ class DarkFactoryWorkflow:
                             self._state,
                             task_queue=agent_tq,
                             start_to_close_timeout=timedelta(minutes=5),
+                            retry_policy=RetryPolicy(
+                                maximum_attempts=2,
+                                non_retryable_error_types=["ParseError"],
+                            ),
                         ),
                     )
                     continue
@@ -748,6 +802,10 @@ class DarkFactoryWorkflow:
                             self._state,
                             task_queue=agent_tq,
                             start_to_close_timeout=timedelta(minutes=5),
+                            retry_policy=RetryPolicy(
+                                maximum_attempts=2,
+                                non_retryable_error_types=["ParseError"],
+                            ),
                         ),
                     )
                     continue

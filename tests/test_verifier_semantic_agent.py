@@ -161,7 +161,7 @@ def test_verifier_semantic_client_options_match_plan_critic_pattern() -> None:
     assert opts is not None
     assert opts.allowed_tools == []
     assert opts.mcp_servers == {}
-    assert opts.setting_sources == []
+    assert opts.setting_sources == ["project"]
     assert opts.model == "claude-sonnet-4-5-20250929"
     assert opts.thinking is not None
     assert opts.thinking["type"] == "disabled"

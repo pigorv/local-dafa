@@ -1,0 +1,9 @@
+{% if merge_commit_sha not in (none, "", []) %}
+Merge commit: {{ merge_commit_sha|compact }}
+{% endif %}
+{% if branch_deleted not in (none, "", []) %}
+Branch deleted: {{ branch_deleted|compact }}
+{% endif %}
+{% if issue_closes not in (none, "", []) %}
+Issue close: {{ issue_closes|compact }}
+{% endif %}

@@ -1,8 +1,10 @@
-"""Reviewer - SDK-driven review role.
+"""Reviewer - SDK-driven read-only review role.
 
-Reviews the patches produced by Build plus the Verify summary, then emits a
-small structured summary for the human gate. It is a reasoning-only Haiku
-role: no built-in tools, no MCP server, no shell access.
+Reviews the produced PR, build traceability, patches, and Verify summary,
+then emits a structured summary for the human gate. The output shape is
+defined by ``schemas/reviewer_output.json`` and enforced by the SDK's
+``output_format``; this module validates and normalizes cross-field
+invariants before returning the state payload.
 """
 from __future__ import annotations
 
@@ -10,7 +12,14 @@ import json
 
 from typing import Any
 
-from darkfactory.agents._sdk_common import run_to_completion
+from pydantic import ValidationError
+
+from darkfactory.agents._sdk_common import (
+    ParseError,
+    _drain,
+    render_role_user_message,
+    repo_summary,
+)
 from darkfactory.agents.compose import ComposeState, compose
 from darkfactory.state import ReviewerSummary
 
@@ -27,47 +36,74 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
-def _field(value: Any, key: str, default: Any = None) -> Any:
-    if isinstance(value, dict):
-        return value.get(key, default)
-    return getattr(value, key, default)
+def _json_block(value: Any) -> str:
+    return json.dumps(_jsonable(value), indent=2)
 
 
-def _user_message(state_slice: dict) -> str:
-    patches = state_slice.get("patches") or []
-    verify_summary = state_slice.get("verify_summary") or {}
-    predicate_coverage = _field(verify_summary, "predicate_coverage", []) or []
-    findings = state_slice.get("findings") or []
-    test_results = state_slice.get("test_results") or []
-    audit_log = state_slice.get("audit_log") or []
-    attempt_log = state_slice.get("attempt_log") or []
-    return (
-        "Review the implementation for merge readiness.\n\n"
-        f"User request:\n{state_slice.get('user_request', '') or ''}\n\n"
-        f"Pull request URL:\n{state_slice.get('pr_url', '') or ''}\n\n"
-        "Implementation brief:\n"
-        f"{json.dumps(_jsonable(state_slice.get('implementation_brief') or {}), indent=2)}\n\n"
-        "Approved spec markdown:\n"
-        f"{state_slice.get('approved_spec_markdown', '') or ''}\n\n"
-        f"Patches:\n{json.dumps(_jsonable(patches), indent=2)}\n\n"
-        f"Verify summary:\n{json.dumps(_jsonable(verify_summary), indent=2)}\n\n"
-        "Predicate coverage:\n"
-        f"{json.dumps(_jsonable(predicate_coverage), indent=2)}\n\n"
-        f"Test results:\n{json.dumps(_jsonable(test_results), indent=2)}\n\n"
-        f"Findings:\n{json.dumps(_jsonable(findings), indent=2)}\n\n"
-        f"Audit log:\n{json.dumps(_jsonable(audit_log), indent=2)}\n\n"
-        f"Attempt log:\n{json.dumps(_jsonable(attempt_log), indent=2)}"
+def _render_user_prompt(state_slice: dict) -> str:
+    return render_role_user_message(
+        ROLE,
+        user_request=state_slice.get("user_request", "") or "",
+        pr_url=state_slice.get("pr_url", "") or "",
+        repo_context=repo_summary(state_slice.get("repo_context")),
+        implementation_brief=_json_block(
+            state_slice.get("implementation_brief") or {}
+        ),
+        approved_spec_markdown=state_slice.get("approved_spec_markdown", "") or "",
+        patches=_json_block(state_slice.get("patches") or []),
+        builder_outputs=_json_block(state_slice.get("builder_outputs") or []),
+        tester_outputs=_json_block(state_slice.get("tester_outputs") or []),
+        tester_findings=_json_block(state_slice.get("tester_findings") or []),
+        reconciliation_findings=_json_block(
+            state_slice.get("reconciliation_findings") or []
+        ),
+        coverage_entries=_json_block(state_slice.get("coverage_entries") or []),
+        verify_summary=_json_block(state_slice.get("verify_summary") or {}),
+        test_results=_json_block(state_slice.get("test_results") or []),
+        findings=_json_block(state_slice.get("findings") or []),
+        fixer_decision=_json_block(state_slice.get("fixer_decision") or {}),
+        attempt_log=_json_block(state_slice.get("attempt_log") or []),
+    )
+
+
+def normalize_reviewer_output(raw: dict[str, Any]) -> ReviewerSummary:
+    """Validate and enforce Reviewer invariants not expressible in JSON Schema."""
+    try:
+        summary = ReviewerSummary.model_validate(raw)
+    except ValidationError as exc:
+        raise ParseError(f"Reviewer emitted invalid structured output: {exc}") from exc
+
+    issues = [str(issue).strip() for issue in summary.issues if str(issue).strip()]
+    if not issues:
+        issues = [
+            finding.message.strip()
+            for finding in summary.findings
+            if finding.message.strip()
+        ]
+
+    high_finding = any(finding.severity == "high" for finding in summary.findings)
+    recommendation = summary.recommendation
+    if summary.severity == "high" or high_finding:
+        recommendation = "request_changes"
+
+    return summary.model_copy(
+        update={
+            "issues": issues,
+            "recommendation": recommendation,
+        }
     )
 
 
 async def run_reviewer(state_slice: dict) -> ReviewerSummary:
     compose_state = ComposeState.from_mapping(state_slice)
+    rendered = _render_user_prompt(state_slice)
     async with compose(
         ROLE,
         compose_state,
         task_id=compose_state.task_id,
     ) as client:
-        await client.query(_user_message(state_slice))
-        result = await run_to_completion(client, expect=ReviewerSummary)
-        assert isinstance(result, ReviewerSummary)
-        return result
+        await client.query(rendered)
+        _text, structured, _result = await _drain(client)
+    if structured is None:
+        raise ParseError("Reviewer emitted no structured output")
+    return normalize_reviewer_output(structured)

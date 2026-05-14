@@ -3,24 +3,51 @@
 //
 // Workers all run with cwd=/workspace, and claude-monitor groups by cwd.
 // We read raw transcripts from a per-workflow subpath of the shared volume,
-// rewrite cwd to /workspace--<wf_id>, and write to a flat cooked tree that
+// rewrite cwd to a short project name, and write to a flat cooked tree that
 // claude-monitor watches at its default ~/.claude/projects path.
 //
 // Idempotent by construction: rewriting an already-rewritten cwd is a no-op,
 // mtime cursor avoids redundant work, .tmp→rename keeps the watcher from
 // seeing partial files.
 
-import { readdir, mkdir, rename, stat } from 'node:fs/promises';
+import { readdir, mkdir, rename, rm, stat } from 'node:fs/promises';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { join, relative, dirname } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const RAW = process.env.RAW_ROOT ?? '/raw';
 const COOKED = process.env.COOKED_ROOT ?? '/cooked';
 const INTERVAL_MS = Number(process.env.WATCH_INTERVAL_S ?? 10) * 1000;
 const ORIGINAL_CWD = process.env.ORIGINAL_CWD ?? '/workspace';
+const ISSUE_WORKFLOW_PREFIX = 'df-issue-';
 
 const cursor = new Map(); // dst path -> last mtimeMs processed
+
+function sanitiseProjectName(value) {
+  const cleaned = String(value ?? '')
+    .trim()
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+  return cleaned || 'unknown-workflow';
+}
+
+export function projectNameForWorkflowId(wfId) {
+  const raw = String(wfId ?? '').trim();
+  const display = raw.startsWith(ISSUE_WORKFLOW_PREFIX)
+    ? raw.slice(ISSUE_WORKFLOW_PREFIX.length)
+    : raw;
+  return sanitiseProjectName(display || raw);
+}
+
+export function projectCwdForWorkflowId(wfId) {
+  return `/${projectNameForWorkflowId(wfId)}`;
+}
+
+export function claudeProjectDirForCwd(cwd) {
+  return String(cwd).replaceAll('/', '-');
+}
 
 async function* walkJsonl(dir) {
   let entries;
@@ -36,7 +63,12 @@ async function* walkJsonl(dir) {
   }
 }
 
-async function rewriteJsonl(src, dst, wfId) {
+export async function rewriteJsonl(
+  src,
+  dst,
+  wfId,
+  { originalCwd = ORIGINAL_CWD } = {},
+) {
   await mkdir(dirname(dst), { recursive: true });
   const tmp = `${dst}.tmp`;
   const out = createWriteStream(tmp);
@@ -44,7 +76,7 @@ async function rewriteJsonl(src, dst, wfId) {
     input: createReadStream(src),
     crlfDelay: Infinity,
   });
-  const newCwd = `${ORIGINAL_CWD}--${wfId}`;
+  const newCwd = projectCwdForWorkflowId(wfId);
   for await (const line of rl) {
     if (!line.trim()) {
       out.write('\n');
@@ -52,7 +84,7 @@ async function rewriteJsonl(src, dst, wfId) {
     }
     try {
       const obj = JSON.parse(line);
-      if (obj && obj.cwd === ORIGINAL_CWD) obj.cwd = newCwd;
+      if (obj && obj.cwd === originalCwd) obj.cwd = newCwd;
       out.write(JSON.stringify(obj) + '\n');
     } catch {
       // Pass corrupt/non-JSON lines through unchanged so we don't drop data.
@@ -65,10 +97,15 @@ async function rewriteJsonl(src, dst, wfId) {
   await rename(tmp, dst);
 }
 
-async function tickOnce() {
+export async function tickOnce({
+  rawRoot = RAW,
+  cookedRoot = COOKED,
+  originalCwd = ORIGINAL_CWD,
+  cursorMap = cursor,
+} = {}) {
   let workflows;
   try {
-    workflows = await readdir(RAW, { withFileTypes: true });
+    workflows = await readdir(rawRoot, { withFileTypes: true });
   } catch (err) {
     if (err.code !== 'ENOENT') throw err;
     return;
@@ -76,8 +113,11 @@ async function tickOnce() {
   for (const entry of workflows) {
     if (!entry.isDirectory()) continue;
     const wfId = entry.name;
-    const wsDir = join(RAW, wfId, 'projects', '-workspace');
-    const dstRoot = join(COOKED, `-workspace--${wfId}`);
+    const sourceProjectDir = claudeProjectDirForCwd(originalCwd);
+    const wsDir = join(rawRoot, wfId, 'projects', sourceProjectDir);
+    const projectCwd = projectCwdForWorkflowId(wfId);
+    const dstRoot = join(cookedRoot, claudeProjectDirForCwd(projectCwd));
+    const legacyDstRoot = join(cookedRoot, `${sourceProjectDir}--${wfId}`);
     for await (const src of walkJsonl(wsDir)) {
       const rel = relative(wsDir, src);
       const dst = join(dstRoot, rel);
@@ -87,13 +127,16 @@ async function tickOnce() {
       } catch {
         continue;
       }
-      if (cursor.get(dst) === stats.mtimeMs) continue;
+      if (cursorMap.get(dst) === stats.mtimeMs) continue;
       try {
-        await rewriteJsonl(src, dst, wfId);
-        cursor.set(dst, stats.mtimeMs);
+        await rewriteJsonl(src, dst, wfId, { originalCwd });
+        cursorMap.set(dst, stats.mtimeMs);
       } catch (err) {
         console.error(`[transformer] failed to rewrite ${src}:`, err.message);
       }
+    }
+    if (legacyDstRoot !== dstRoot) {
+      await rm(legacyDstRoot, { recursive: true, force: true });
     }
   }
 }
@@ -112,11 +155,13 @@ async function loop() {
   }
 }
 
-console.log(
-  `[transformer] watching ${RAW} → ${COOKED} every ${INTERVAL_MS / 1000}s ` +
-    `(rewrite cwd ${ORIGINAL_CWD} → ${ORIGINAL_CWD}--<wf_id>)`,
-);
-loop().catch(err => {
-  console.error('[transformer] fatal:', err);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  console.log(
+    `[transformer] watching ${RAW} → ${COOKED} every ${INTERVAL_MS / 1000}s ` +
+      `(rewrite cwd ${ORIGINAL_CWD} → /<project_name>)`,
+  );
+  loop().catch(err => {
+    console.error('[transformer] fatal:', err);
+    process.exit(1);
+  });
+}

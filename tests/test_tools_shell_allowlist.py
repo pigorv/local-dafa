@@ -17,10 +17,13 @@ from claude_agent_sdk.types import (
     ToolPermissionContext,
 )
 
-from darkfactory.agents.pr_creator import PR_CREATOR_ALLOWLIST
 from darkfactory.agents.registry import get_default_registry
 from darkfactory.hooks.permission_gate import make_permission_gate
 from darkfactory.tools.shell import FORBIDDEN_TOKENS
+
+
+def _pr_creator_allowlist() -> frozenset[str]:
+    return frozenset(get_default_registry().get("pr_creator").tools.argv_allowlist)
 
 
 WORKER_ALLOWLIST: frozenset[str] = frozenset(
@@ -248,7 +251,7 @@ def test_role_command_policy_for_push_and_pr_create():
     )
     pr_gate = make_permission_gate(
         "pr_creator",
-        PR_CREATOR_ALLOWLIST,
+        _pr_creator_allowlist(),
         role_owned_argv_prefixes=role_owned,
     )
 

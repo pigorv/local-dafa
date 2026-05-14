@@ -1,0 +1,12 @@
+{% if outcome %}
+Outcome: {{ outcome }}{{ (" (round " ~ round ~ "/" ~ max_rounds ~ ")") if (outcome == "needs-clarification" and round and max_rounds) else "" }}{{ (" — see " ~ clarify_url) if clarify_url else "" }}
+{% endif %}
+{% if derived_request %}
+Derived request: {{ derived_request }}
+{% endif %}
+{% if confidence %}
+Confidence: {{ confidence }}
+{% endif %}
+{% if rationale and status != "running" %}
+Rationale: {{ rationale }}
+{% endif %}

@@ -1,0 +1,11 @@
+### Recommended next actions
+{% if suggested %}
+Reviewer recommends: **{{ suggested }}**.
+{% else %}
+Reply with one of:
+{% endif %}
+{% for option in options %}
+- {{ option.command }} — {{ option.description }}{{ " ← recommended" if option.key == suggested else "" }}
+{% endfor %}
+
+Allowed approvers: repo collaborators with write access.

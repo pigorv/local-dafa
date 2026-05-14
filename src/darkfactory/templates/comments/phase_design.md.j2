@@ -1,0 +1,21 @@
+{% if revision_note %}
+{{ revision_note }}
+{% endif %}
+{% if status == "running" %}
+{% if feedback %}
+
+{{ feedback }}
+{% endif %}
+{% else %}
+{% if spec_markdown %}
+{{ spec_markdown }}
+{% endif %}
+{% if approval_note %}
+
+{{ approval_note }}
+{% endif %}
+{% if approval_block %}
+
+{{ approval_block }}
+{% endif %}
+{% endif %}

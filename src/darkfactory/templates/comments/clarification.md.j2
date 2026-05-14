@@ -1,0 +1,9 @@
+{{ marker }}
+Dark Factory needs a bit more context for issue #{{ issue_number }}.
+
+{% for question in questions %}
+- {{ question }}
+{% endfor %}
+
+Reply on this issue when you have the details.
+workflow_id: `{{ workflow_id }}`

@@ -64,6 +64,19 @@ class BuilderOutput(BaseModel):
     blockers: list[str] = Field(default_factory=list)
     summary: str = ""
 
+
+class PRCreatorOutput(BaseModel):
+    """Structured PR Creator report.
+
+    Mirrors ``schemas/pr_creator_output.json``. ``status`` distinguishes a
+    freshly opened PR from one the agent discovered already existed; the
+    activity records both shapes through the same ``pr_url`` channel.
+    """
+
+    status: Literal["created", "existing"]
+    pr_url: str
+    summary: str = ""
+
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
 
@@ -127,6 +140,30 @@ def repo_summary(
         if git_log:
             parts.append("Recent commits:\n" + "\n".join(git_log[:10]))
     return "\n\n".join(parts) if parts else "(empty repo)"
+
+
+def original_user_request(state_slice: dict) -> str:
+    """Return the verbatim user request.
+
+    For issue-driven runs, returns ``"Title: <title>\n\n<body>"`` from
+    ``state["issue"]`` — the raw text triage saw, before it summarized.
+    For CLI runs (no ``issue`` field), falls back to
+    ``state["user_request"]``, which is already the verbatim CLI prompt
+    since no triage stage overwrites it.
+    """
+    issue = state_slice.get("issue")
+    if issue is not None:
+        title = getattr(issue, "title", None)
+        body = getattr(issue, "body", None)
+        if title is None and isinstance(issue, dict):
+            title = issue.get("title")
+            body = issue.get("body")
+        title = (title or "").strip()
+        body = (body or "").strip()
+        if title and body:
+            return f"Title: {title}\n\n{body}"
+        return title or body
+    return str(state_slice.get("user_request") or "")
 
 
 def render_role_user_message(role: str, **substitutions: object) -> str:

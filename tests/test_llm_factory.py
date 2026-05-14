@@ -22,7 +22,7 @@ def test_build_options_passes_through_caller_supplied_defaults() -> None:
     opts = build_options("po", **_BASE_KWARGS)
     assert isinstance(opts, ClaudeAgentOptions)
     assert opts.model == "claude-sonnet-4-5-20250929"
-    assert opts.setting_sources == []
+    assert opts.setting_sources == ["project"]
     assert opts.thinking is not None and opts.thinking["type"] == "disabled"
 
 

@@ -1,26 +1,34 @@
 identity:
   role: reviewer
   description: >-
-    Reasoning-only Reviewer role that audits the patches produced by Build
-    plus the Verify summary and emits a small structured ReviewerSummary
-    for the human merge gate. No tools, no MCP, no shell access — Haiku
-    by default.
+    Read-only Reviewer role that audits the produced PR, patches, build
+    traceability, and Verify summary, then emits a structured
+    ReviewerSummary for the human merge gate. No shell, edit, or MCP access.
   when_to_use: >-
     After verify converges and a PR has been published, before the merge
     gate. Consumes the implementation brief, approved spec, patches,
-    verify summary, predicate coverage, test results, findings, audit
-    log, and attempt log; emits the ReviewerSummary that the merge gate
-    surfaces to the human approver.
+    build/tester outputs, reconciliation findings, verify summary,
+    predicate coverage, test results, findings, and attempt log; emits the
+    ReviewerSummary that the merge gate surfaces to the human approver.
 
 llm:
-  model: claude-haiku-4-5-20251001
+  model: claude-sonnet-4-5-20250929
   thinking:
     enabled: false
   prompt_path: prompts/reviewer.md
+  prompt_as_user_message: true
+  structured_output: schemas/reviewer_output.json
 
 tools:
-  allowed: []
-  disallowed: []
+  allowed:
+    - Read
+    - Grep
+    - Glob
+    - Skill
+  disallowed:
+    - Bash
+    - Edit
+    - Write
   argv_allowlist: []
   role_owned_argv_prefixes: []
   edit_path_allowlist: []
@@ -34,9 +42,24 @@ hooks:
   - event: PreToolUse
     name: call_cap
     parameters: {}
-  - event: UserPromptSubmit
-    name: goal_pin
+  - event: PreToolUse
+    name: heartbeat
+    parameters:
+      detail: "reviewer: pre tool"
+  - event: PostToolUse
+    name: prompt_injection_guard
     parameters: {}
+  - event: PostToolUse
+    name: structured_output_hint
+    parameters: {}
+  - event: PostToolUse
+    name: heartbeat
+    parameters:
+      detail: "reviewer: post tool"
+  - event: Stop
+    name: heartbeat
+    parameters:
+      detail: "reviewer: turn boundary"
 
 budgets:
   retry_caps: {}

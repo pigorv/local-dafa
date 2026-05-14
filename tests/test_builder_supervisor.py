@@ -4,10 +4,9 @@ from langgraph.graph import END
 
 from darkfactory.agents.builder_supervisor import (
     builder_supervisor_node,
-    route_slice,
     topo_sort,
 )
-from darkfactory.state import Patch, WorkPackageDict
+from darkfactory.state import WorkPackageDict
 
 
 def _slice(
@@ -29,10 +28,6 @@ def _slice(
     )
 
 
-def _patch(slice_id: str, author_agent: str) -> Patch:
-    return Patch(path="x", diff="", author_agent=author_agent, slice_id=slice_id)
-
-
 def _builder_output(slice_id: str, status: str = "done") -> dict:
     return {
         "wp_id": slice_id,
@@ -52,17 +47,6 @@ def test_topo_sort_db_api_test_order():
     assert topo_sort(spec) == ["db-1", "api-1", "test-1"]
 
 
-def test_route_slice_assigns_workers_by_paths():
-    db = _slice("d", new_files=["src/main/resources/db/migration/V3__x.sql"])
-    api = _slice("b", affected_files=["src/main/java/foo/UserController.java"])
-    test = _slice("t", test_files=["src/test/java/foo/UserControllerTest.java"])
-    frontend = _slice("f", affected_files=["web/src/App.tsx"])
-    assert route_slice(db) == "builder"
-    assert route_slice(api) == "builder"
-    assert route_slice(test) == "builder"
-    assert route_slice(frontend) == "frontend"
-
-
 def _tester_output(slice_id: str, *, parse_failure: bool = False) -> dict:
     return {
         "wp_id": slice_id,
@@ -74,9 +58,8 @@ def _tester_output(slice_id: str, *, parse_failure: bool = False) -> dict:
 
 
 def test_supervisor_dispatches_builder_then_tester_per_slice_in_dependency_order():
-    """PR C: Builder and Tester completion are keyed on
-    ``builder_outputs`` / ``tester_outputs`` entries rather than on
-    sentinel patches. Frontend keeps the legacy patch-sentinel path.
+    """Builder and Tester completion are keyed on ``builder_outputs`` /
+    ``tester_outputs`` entries rather than on sentinel patches.
     """
     spec = [
         _slice(

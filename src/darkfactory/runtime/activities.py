@@ -25,13 +25,15 @@ from darkfactory.runtime.approval import (
     is_authorized,
     parse_command,
 )
+from darkfactory.runtime.comment_templates import render as render_comment_template
 from darkfactory.runtime.issue_comments import filter_dark_factory_marker_comments
 from darkfactory.runtime.phase_comment import end_marker_for, marker_for
 from darkfactory.tools.sandbox import RepoSandbox
 from darkfactory.tools.shell import get_sandbox, register_sandbox
 from darkfactory.state import IssueComment, IssueRef, IssueRunRequest
 
-WORKER_IMAGE = "darkfactory-worker:latest"
+DEFAULT_WORKER_IMAGE = "darkfactory-worker:polyglot"
+WORKER_IMAGE_ENV = "DARKFACTORY_WORKER_IMAGE"
 WORKER_NETWORK = "darkfactory-net"
 WORKER_TRANSCRIPTS_VOLUME = os.environ.get(
     "DARKFACTORY_TRANSCRIPTS_VOLUME", "darkfactory_raw-claude"
@@ -85,6 +87,14 @@ DF_POLL_LABELS = (
     DF_IN_PROGRESS_LABEL,
     DF_CANCEL_LABEL,
 )
+
+
+def _worker_image() -> str:
+    """Return the per-workflow worker image, allowing deploy-time overrides."""
+    configured = os.environ.get(WORKER_IMAGE_ENV, "").strip()
+    return configured or DEFAULT_WORKER_IMAGE
+
+
 DF_STATE_LABELS = (
     DF_READY_LABEL,
     DF_TRIAGING_LABEL,
@@ -484,18 +494,12 @@ def render_clarification_comment_body(
     if round_number < 1:
         raise ValueError("clarification_round must be >= 1")
 
-    marker = f"<!-- df-clarify:{workflow_id}:{round_number} -->"
-    bullets = "\n".join(f"- {question}" for question in questions)
-    return "\n".join(
-        [
-            marker,
-            f"Dark Factory needs a bit more context for issue #{issue_number}.",
-            "",
-            bullets,
-            "",
-            "Reply on this issue when you have the details.",
-            f"workflow_id: `{workflow_id}`",
-        ]
+    return render_comment_template(
+        "clarification.md.j2",
+        marker=f"<!-- df-clarify:{workflow_id}:{round_number} -->",
+        issue_number=issue_number,
+        questions=questions,
+        workflow_id=workflow_id,
     )
 
 
@@ -516,24 +520,13 @@ def render_needs_human_comment_body(
     if round_number < 1:
         raise ValueError("clarification_round must be >= 1")
 
-    questions = _clarification_questions(clarification_questions or [])
-    marker = f"<!-- df-clarify:{workflow_id}:{round_number} -->"
-    lines = [
-        marker,
-        f"Dark Factory reached the clarification limit for issue #{issue_number}.",
-        "",
-        "I've added `df:needs-human` so a maintainer can refine the request.",
-    ]
-    if questions:
-        lines.extend(
-            [
-                "",
-                "Outstanding questions:",
-                *[f"- {question}" for question in questions],
-            ]
-        )
-    lines.extend(["", f"workflow_id: `{workflow_id}`"])
-    return "\n".join(lines)
+    return render_comment_template(
+        "needs_human.md.j2",
+        marker=f"<!-- df-clarify:{workflow_id}:{round_number} -->",
+        issue_number=issue_number,
+        questions=_clarification_questions(clarification_questions or []),
+        workflow_id=workflow_id,
+    )
 
 
 def _activity_task_id(explicit_task_id: str | None = None) -> str | None:
@@ -724,30 +717,15 @@ def render_quarantine_comment_body(
     workflow_id: str,
     closure_status: str,
 ) -> str:
-    marker = _quarantine_marker(workflow_id)
-    status_word = (closure_status or "closed").lower()
-    label = _quarantine_label_for(closure_status)
-    if label:
-        action_line = (
-            f"Removed `{DF_READY_LABEL}` and added `{label}`. "
-            f"Re-add `{DF_READY_LABEL}` after addressing the underlying problem "
-            "to queue a fresh attempt."
-        )
-    else:
-        action_line = (
-            f"Removed `{DF_READY_LABEL}` to stop re-polling. "
-            f"If this issue still needs work, re-add `{DF_READY_LABEL}` to queue "
-            "a fresh attempt."
-        )
-    return "\n".join(
-        [
-            marker,
-            f"Dark Factory workflow `{workflow_id}` for issue #{issue_number} "
-            f"ended in state `{status_word}`.",
-            "",
-            action_line,
-        ]
-    )
+    return render_comment_template(
+        "quarantine.md.j2",
+        marker=_quarantine_marker(workflow_id),
+        workflow_id=workflow_id,
+        issue_number=issue_number,
+        status_word=(closure_status or "closed").lower(),
+        label=_quarantine_label_for(closure_status),
+        ready_label=DF_READY_LABEL,
+    ).rstrip()
 
 
 def _gh_issue_view_argv(repo: str, number: int, fields: str) -> list[str]:
@@ -1590,7 +1568,7 @@ async def setup_worker_activity(wf_id: str, repo_url: str) -> str:
     )
     transcripts_mount["VolumeOptions"] = {"Subpath": wf_id}
     container = client.containers.run(
-        image=WORKER_IMAGE,
+        image=_worker_image(),
         name=name,
         detach=True,
         network=WORKER_NETWORK,
@@ -2195,15 +2173,40 @@ async def code_quality_stage(state: dict) -> dict:
     return await reviewer_stage(state)
 
 
+def _existing_pr_url(sb: Any, branch: str) -> str:
+    """Return an open PR URL for ``branch`` if one exists, else empty string.
+
+    Run before invoking the PR Creator role so the activity is idempotent
+    under Temporal retry: if a previous attempt already created the PR,
+    we return its URL without re-prompting the model.
+    """
+    if sb is None or not branch:
+        return ""
+    result = sb.exec(
+        ["gh", "pr", "list", "--head", branch, "--json", "url", "--jq", ".[0].url"]
+    )
+    if int(result.get("returncode", 1)) != 0:
+        return ""
+    return str(result.get("stdout", "") or "").strip()
+
+
 @activity.defn
 @with_repo_state("agent/{wf_id}")
 async def pr_creator_stage(state: dict) -> dict:
     """Run the PR Creator role and return the workflow's `pr_url` channel."""
     _stamp_temporal_activity_attrs()
     _heartbeat("pr_creator: starting")
+
+    sb = _ensure_repo_sandbox(state)
+    branch = _branch_from_state(state, "agent/{wf_id}")
+    existing = _existing_pr_url(sb, branch)
+    if existing:
+        return {"pr_url": existing}
+
     from darkfactory.agents.pr_creator import run_pr_creator
 
-    return {"pr_url": await run_pr_creator(state)}
+    output = await run_pr_creator(state)
+    return {"pr_url": output["pr_url"]}
 
 
 def _gh_pr_state(sb: Any, pr_url: str) -> str:

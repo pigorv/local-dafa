@@ -13,6 +13,8 @@ wheels/
 # Secrets
 .env
 .env.local
+secrets/
+*.pem
 
 # Local runtime state
 .darkfactory/

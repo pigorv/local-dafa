@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from typing import Iterable, Literal
+from typing import Literal
 
 from langgraph.graph import END
 from langgraph.types import Command
 
 from darkfactory.state import PipelineState, WorkPackageDict
 
-WorkerName = Literal["builder", "tester", "frontend"]
+WorkerName = Literal["builder", "tester"]
 
 SUPERVISOR_NAME = "builder_supervisor"
 
@@ -38,39 +38,6 @@ def topo_sort(spec: list[WorkPackageDict]) -> list[str]:
         for sid in remaining:
             pending[sid] -= ready_set
     return order
-
-
-def _has_ext(paths: Iterable[str], exts: tuple[str, ...]) -> bool:
-    return any(p.lower().endswith(exts) for p in paths)
-
-
-def route_slice(slice_: WorkPackageDict) -> WorkerName:
-    """Pick the implementation worker for a slice.
-
-    The v2 build stage uses Builder + Tester for ordinary work. Frontend
-    remains a no-op escape hatch for the current Java-only target app.
-    """
-    affected = list(slice_.get("affected_files") or [])
-    new_files = list(slice_.get("new_files") or [])
-    test_files = list(slice_.get("test_files") or [])
-    all_paths = affected + new_files + test_files
-    if _has_ext(
-        all_paths,
-        (".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte", ".css", ".html"),
-    ):
-        return "frontend"
-    return "builder"
-
-
-def _slice_has_worker_patch(
-    state: PipelineState,
-    slice_id: str,
-    worker: WorkerName,
-) -> bool:
-    return any(
-        p.get("slice_id") == slice_id and p.get("author_agent") == worker
-        for p in (state.get("patches") or [])
-    )
 
 
 def _slice_has_builder_run(state: PipelineState, slice_id: str) -> bool:
@@ -105,16 +72,8 @@ def _next_worker_for_slice(
 ) -> WorkerName | None:
     """Return the next v2 build-stage worker needed for one slice."""
     slice_id = slice_["story_id"]
-    implementation_worker = route_slice(slice_)
-    if implementation_worker == "builder":
-        if not _slice_has_builder_run(state, slice_id):
-            return "builder"
-    elif not _slice_has_worker_patch(
-        state, slice_id, implementation_worker
-    ):
-        return implementation_worker
-    if implementation_worker == "frontend":
-        return None
+    if not _slice_has_builder_run(state, slice_id):
+        return "builder"
     if not _slice_has_tester_run(state, slice_id):
         return "tester"
     return None

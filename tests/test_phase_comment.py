@@ -73,6 +73,34 @@ def test_render_review_recommends_action_based_on_verdict() -> None:
     assert "`/df approve` — merge the PR" in body
 
 
+def test_render_review_includes_structured_findings() -> None:
+    body = render_phase_comment(
+        "review",
+        "done",
+        {
+            "review_decision": {
+                "recommendation": "request_changes",
+                "severity": "high",
+                "issues": [],
+                "findings": [
+                    {
+                        "path": "src/app.py",
+                        "line": 12,
+                        "severity": "high",
+                        "message": "Tenant cursor can leak data.",
+                    }
+                ],
+            },
+            "include_merge_instructions": False,
+        },
+        wf_id="wf-1",
+        attempt=1,
+    )
+
+    assert "Findings:" in body
+    assert "[HIGH] src/app.py:12 — Tenant cursor can leak data." in body
+
+
 def test_render_phase_comment_includes_status_fields_and_workflow() -> None:
     body = render_phase_comment(
         "triage",
@@ -98,7 +126,6 @@ def test_render_phase_comment_includes_status_fields_and_workflow() -> None:
 
 def test_render_spec_markdown_frames_work_package_files_as_hints() -> None:
     body = render_spec_markdown(
-        user_request="Expose cursor pagination.",
         stories=[
             {
                 "id": "US-1",
