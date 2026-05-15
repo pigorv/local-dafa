@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
@@ -124,19 +125,88 @@ def compose(
         thinking=manifest.llm.thinking.enabled,
         thinking_budget_tokens=manifest.llm.thinking.budget_tokens or 4096,
         system_prompt=system_prompt,
-        allowed_tools=list(manifest.tools.allowed),
+        allowed_tools=_resolve_allowed_tools(role, manifest),
         hooks=hooks,
         mcp_servers=mcp_servers,
         can_use_tool=can_use_tool,
         path_guard_state=_path_guard_state(state_slice),
         cwd=overrides.cwd or "/workspace",
         output_format=output_format,
+        skills=_resolve_skills(role, manifest),
     )
 
     options.disallowed_tools = list(manifest.tools.disallowed)
     _apply_in_process_overrides(options, manifest, overrides)
     _stamp_manifest_attrs(registry, role, manifest, prompt_path)
     return ClaudeSDKClient(options=options)
+
+
+def _resolve_allowed_tools(role: str, manifest: RoleManifest) -> list[str]:
+    """Assemble the role's effective ``allowed_tools`` list.
+
+    Starts from ``manifest.tools.allowed``. Then appends project-MCP
+    allowlist patterns sourced from ``manifest.tools.project_mcp_allowed``
+    (default ``["*"]``) — overridable per role at runtime with
+    ``LLM_<ROLE>_PROJECT_MCP`` (``"*"`` for all servers, ``"name1,name2"``
+    for an explicit list, empty string to disable). Server names expand
+    to ``mcp__<name>__*``; the literal ``"*"`` entry expands to
+    ``mcp__*``. Duplicates are dropped. Roles that declare
+    ``tools.allowed: []`` (plan_critic, verifier_semantic) are zero-tool
+    by design and short-circuit before expansion — an empty manifest
+    allowlist is treated as a deliberate "no tools" statement, not
+    "expand from nothing". Project skills are gated separately via
+    :func:`_resolve_skills` and the SDK's ``skills`` option; they do not
+    appear in ``allowed_tools``.
+    """
+    allowed = list(manifest.tools.allowed)
+    if not allowed:
+        return allowed
+    patterns = _expand_project_mcp_patterns(_project_mcp_entries(role, manifest))
+    for pattern in patterns:
+        if pattern not in allowed:
+            allowed.append(pattern)
+    return allowed
+
+
+def _project_mcp_entries(role: str, manifest: RoleManifest) -> list[str]:
+    raw = os.getenv(f"LLM_{role.upper()}_PROJECT_MCP")
+    if raw is None:
+        return list(manifest.tools.project_mcp_allowed)
+    return [entry.strip() for entry in raw.split(",") if entry.strip()]
+
+
+def _expand_project_mcp_patterns(entries: list[str]) -> list[str]:
+    out: list[str] = []
+    for entry in entries:
+        if entry == "*":
+            pattern = "mcp__*"
+        else:
+            pattern = f"mcp__{entry}__*"
+        if pattern not in out:
+            out.append(pattern)
+    return out
+
+
+def _resolve_skills(role: str, manifest: RoleManifest) -> str | list[str] | None:
+    """Resolve which project skills should be enabled for the role.
+
+    Returns ``"all"`` (every discovered skill), a list of skill names
+    (restrict to those), or ``None`` (no skills). Zero-tool roles always
+    get ``None``. ``LLM_<ROLE>_SKILLS`` overrides the manifest:
+    ``"all"`` → all, ``"name1,name2"`` → list, empty string → disabled.
+    """
+    if not manifest.tools.allowed:
+        return None
+    raw = os.getenv(f"LLM_{role.upper()}_SKILLS")
+    if raw is None:
+        value = manifest.tools.skills
+    elif raw.strip().lower() == "all":
+        value = "all"
+    else:
+        value = [entry.strip() for entry in raw.split(",") if entry.strip()]
+    if isinstance(value, list) and not value:
+        return None
+    return value
 
 
 def _load_output_format(structured_output: str | None) -> dict[str, Any] | None:

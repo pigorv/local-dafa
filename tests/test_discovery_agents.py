@@ -122,10 +122,11 @@ def test_po_client_options_allow_read_only_tools() -> None:
     client = compose("po", state, task_id=state.task_id)
     opts = client.options
     assert opts is not None
-    assert set(opts.allowed_tools) == {"Read", "Grep", "Glob", "Skill"}
+    assert set(opts.allowed_tools) == {"Read", "Grep", "Glob", "mcp__*"}
     assert set(opts.disallowed_tools) == {"Bash", "Edit", "Write"}
     assert opts.mcp_servers == {}
     assert opts.setting_sources == ["project"]
+    assert opts.skills == "all"
     assert opts.model == "claude-haiku-4-5-20251001"  # po default per ARCH §9
     assert opts.system_prompt is None  # prompt is the user message; default kept
     assert opts.output_format is not None
@@ -148,7 +149,7 @@ def test_architect_client_options_allow_read_only_tools() -> None:
     client = compose("architect", state, task_id=state.task_id)
     opts = client.options
     assert opts is not None
-    assert set(opts.allowed_tools) == {"Read", "Grep", "Glob", "Skill"}
+    assert set(opts.allowed_tools) == {"Read", "Grep", "Glob", "mcp__*"}
     assert set(opts.disallowed_tools) == {"Bash", "Edit", "Write"}
     assert opts.mcp_servers == {}
     # No MCP and no sandbox_bash in allowed_tools → no permission gate.
@@ -156,6 +157,7 @@ def test_architect_client_options_allow_read_only_tools() -> None:
     # so exposing a shell channel would be dead surface.
     assert opts.can_use_tool is None
     assert opts.setting_sources == ["project"]
+    assert opts.skills == "all"
     assert opts.model == "claude-sonnet-4-5-20250929"  # architect default per ARCH §9
     assert opts.system_prompt is None  # prompt is the user message; default kept
     assert opts.output_format is not None
@@ -181,6 +183,9 @@ def test_plan_critic_client_options_are_hermetic_and_no_tool() -> None:
     assert opts.allowed_tools == []
     assert opts.mcp_servers == {}
     assert opts.setting_sources == ["project"]
+    # Zero-tool role → skills explicitly disabled (no token cost for skill
+    # definitions the model couldn't invoke anyway).
+    assert opts.skills is None
     assert opts.model == "claude-sonnet-4-5-20250929"  # plan_critic default per ARCH §9
     assert opts.system_prompt is None  # prompt is the user message; default kept
     assert opts.output_format is not None

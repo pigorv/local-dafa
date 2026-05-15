@@ -7,6 +7,7 @@ from langgraph.graph import END, START, StateGraph
 from darkfactory.agents.architect import run_architect
 from darkfactory.agents.plan_critic import run_plan_critic
 from darkfactory.agents.po import run_po
+from darkfactory.runtime.tracing import phase_span
 from darkfactory.state import (
     ImplementationBrief,
     PipelineState,
@@ -26,12 +27,14 @@ def _expected_behavior_from_stories(stories: Any) -> list[str]:
 
 
 async def po_node(state: PipelineState) -> dict:
-    result = await run_po(state)
+    with phase_span("node.po"):
+        result = await run_po(state)
     return {"stories": list(result.get("stories") or [])}
 
 
 async def architect_node(state: PipelineState) -> dict:
-    result = await run_architect(state)
+    with phase_span("node.architect"):
+        result = await run_architect(state)
     stories = state.get("stories") or []
     work_packages = [
         WorkPackage.model_validate(wp) for wp in result.get("work_packages") or []
@@ -57,7 +60,8 @@ async def architect_node(state: PipelineState) -> dict:
 
 
 async def plan_critic_node(state: PipelineState) -> dict:
-    result = await run_plan_critic(state)
+    with phase_span("node.plan_critic"):
+        result = await run_plan_critic(state)
     return {"review_decision": result}
 
 

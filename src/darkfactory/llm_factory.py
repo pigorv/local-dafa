@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 
 from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
 from claude_agent_sdk.types import (
@@ -109,6 +109,7 @@ def build_options(
     path_guard_state: Mapping[str, Any] | None = None,
     cwd: str = "/workspace",
     output_format: dict[str, Any] | None = None,
+    skills: Literal["all"] | list[str] | None = None,
 ) -> ClaudeAgentOptions:
     """Per-role ClaudeAgentOptions with env overrides and path-guard wiring.
 
@@ -121,6 +122,10 @@ def build_options(
     ``.claude/skills/``, and ``.claude/settings.json`` (rooted at ``cwd``)
     are loaded into every spawned session; host-level ``~/.claude/`` is
     intentionally excluded so the worker container stays hermetic.
+    ``skills`` controls which discovered project skills are actually
+    enabled — ``"all"`` for every one, a list of skill names to restrict,
+    ``None``/``[]`` to disable. The Agent SDK defaults to ``None`` even
+    when skills exist on disk, so callers must pass the resolved value.
     """
     raw_model = _env(role, "MODEL")
     if raw_model:
@@ -163,6 +168,7 @@ def build_options(
         env=sdk_env,
         permission_mode="bypassPermissions",
         output_format=output_format,
+        skills=skills,
     )
     # Roles that send their prompt as the first user message
     # (``prompt_as_user_message: true``) pass ``system_prompt=None``: leaving

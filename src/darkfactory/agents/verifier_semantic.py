@@ -11,8 +11,14 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from darkfactory.agents._sdk_common import _drain, render_role_user_message
+from darkfactory.agents._sdk_common import (
+    _drain,
+    render_role_user_message,
+    role_turn_span,
+    stamp_turn_usage,
+)
 from darkfactory.agents.compose import ComposeState, compose
+from opentelemetry import trace
 
 ROLE = "verifier_semantic"
 
@@ -82,13 +88,15 @@ def _render_user_prompt(state_slice: dict) -> str:
 async def run_verifier_semantic(state_slice: dict) -> dict[str, Any]:
     compose_state = ComposeState.task_only(_resolve_task_id(state_slice))
     rendered = _render_user_prompt(state_slice)
-    async with compose(
-        ROLE,
-        compose_state,
-        task_id=compose_state.task_id,
-    ) as client:
-        await client.query(rendered)
-        _text, structured, _result = await _drain(client)
+    async with role_turn_span(ROLE):
+        async with compose(
+            ROLE,
+            compose_state,
+            task_id=compose_state.task_id,
+        ) as client:
+            await client.query(rendered)
+            _text, structured, _result = await _drain(client)
+            stamp_turn_usage(trace.get_current_span(), _result)
     if structured is None:
         return {"predicate_coverage": []}
     return {"predicate_coverage": list(structured.get("predicate_coverage") or [])}

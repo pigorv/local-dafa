@@ -19,9 +19,15 @@ import json
 from string import Template
 from typing import Any
 
-from darkfactory.agents._sdk_common import ParseError, _drain
+from darkfactory.agents._sdk_common import (
+    ParseError,
+    _drain,
+    role_turn_span,
+    stamp_turn_usage,
+)
 from darkfactory.agents.compose import ComposeState, compose
 from darkfactory.agents.registry import get_default_registry, resolve_prompt_path
+from opentelemetry import trace
 
 DEFAULT_PLANNING_MAX_ATTEMPTS = 5
 
@@ -126,13 +132,15 @@ def _resolve_task_id(state_slice: dict) -> str:
 async def run_plan_critic(state_slice: dict) -> dict[str, Any]:
     compose_state = ComposeState.task_only(_resolve_task_id(state_slice))
     rendered = _render_user_prompt(state_slice)
-    async with compose(
-        "plan_critic",
-        compose_state,
-        task_id=compose_state.task_id,
-    ) as client:
-        await client.query(rendered)
-        _text, structured, _result = await _drain(client)
+    async with role_turn_span("plan_critic"):
+        async with compose(
+            "plan_critic",
+            compose_state,
+            task_id=compose_state.task_id,
+        ) as client:
+            await client.query(rendered)
+            _text, structured, _result = await _drain(client)
+            stamp_turn_usage(trace.get_current_span(), _result)
     if structured is None:
         raise ParseError("Plan Critic emitted no structured output")
     return normalize_plan_critic_output(structured)

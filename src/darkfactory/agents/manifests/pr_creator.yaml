@@ -24,7 +24,6 @@ tools:
     - Grep
     - Glob
     - sandbox_bash
-    - Skill
   disallowed: []
   argv_allowlist:
     - git

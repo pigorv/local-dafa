@@ -23,7 +23,17 @@ def test_build_options_passes_through_caller_supplied_defaults() -> None:
     assert isinstance(opts, ClaudeAgentOptions)
     assert opts.model == "claude-sonnet-4-5-20250929"
     assert opts.setting_sources == ["project"]
+    # ``skills`` is None unless the caller (compose) passes it explicitly.
+    # The SDK loads no project skills without it.
+    assert opts.skills is None
     assert opts.thinking is not None and opts.thinking["type"] == "disabled"
+
+
+def test_build_options_passes_skills_through() -> None:
+    opts_all = build_options("po", skills="all", **_BASE_KWARGS)
+    assert opts_all.skills == "all"
+    opts_list = build_options("po", skills=["pdf", "docx"], **_BASE_KWARGS)
+    assert opts_list.skills == ["pdf", "docx"]
 
 
 def test_build_options_thinking_enabled_writes_budget() -> None:

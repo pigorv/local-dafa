@@ -5,6 +5,7 @@ from typing import Annotated, Any, Literal
 from langgraph.graph import END, START, StateGraph
 
 from darkfactory.agents.triage import TriageOutput, run_triage
+from darkfactory.runtime.tracing import phase_span
 from darkfactory.state import PipelineState, overwrite
 
 TRIAGE_NODE = "triage"
@@ -23,7 +24,8 @@ class TriageState(PipelineState, total=False):
 
 
 async def triage_node(state: TriageState) -> TriageOutput:
-    return await run_triage(state)
+    with phase_span("node.triage"):
+        return await run_triage(state)
 
 
 def triage_edge(state: TriageState) -> TriageEdge:

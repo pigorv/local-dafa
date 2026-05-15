@@ -149,7 +149,8 @@ def test_reviewer_client_options_are_hermetic_and_read_only() -> None:
     client = compose("reviewer", state, task_id=state.task_id)
     opts = client.options
     assert opts is not None
-    assert set(opts.allowed_tools) == {"Read", "Grep", "Glob", "Skill"}
+    assert set(opts.allowed_tools) == {"Read", "Grep", "Glob", "mcp__*"}
+    assert opts.skills == "all"
     assert set(opts.disallowed_tools) == {"Bash", "Edit", "Write"}
     assert opts.mcp_servers == {}
     assert opts.can_use_tool is None

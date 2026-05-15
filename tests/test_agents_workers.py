@@ -67,9 +67,15 @@ def _pr_creator_client(state_slice: dict) -> ClaudeSDKClient:
     return _compose_client("pr_creator", state_slice)
 
 
-BUILDER_TOOLS: list[str] = ["Read", "Write", "Edit", "Grep", "Glob", "Bash", "Skill"]
-TESTER_TOOLS: list[str] = ["Read", "Write", "Edit", "Grep", "Glob", "Bash", "Skill"]
-PR_CREATOR_TOOLS: list[str] = ["Read", "Grep", "Glob", "sandbox_bash", "Skill"]
+BUILDER_TOOLS: list[str] = [
+    "Read", "Write", "Edit", "Grep", "Glob", "Bash", "mcp__*",
+]
+TESTER_TOOLS: list[str] = [
+    "Read", "Write", "Edit", "Grep", "Glob", "Bash", "mcp__*",
+]
+PR_CREATOR_TOOLS: list[str] = [
+    "Read", "Grep", "Glob", "sandbox_bash", "mcp__*",
+]
 WORKER_DENYLIST: tuple[tuple[str, ...], ...] = (("git", "push"),)
 
 
@@ -126,6 +132,7 @@ def test_builder_client_options_are_hermetic_and_sdk_native() -> None:
     # no ``darkfactory`` MCP server). The permission gate runs in pure
     # denylist mode: empty argv_allowlist, ``git push`` in argv_denylist.
     assert opts.setting_sources == ["project"]
+    assert opts.skills == "all"
     assert opts.allowed_tools == BUILDER_TOOLS
     assert "Bash" in opts.allowed_tools
     assert "sandbox_bash" not in opts.allowed_tools

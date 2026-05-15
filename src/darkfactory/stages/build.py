@@ -13,6 +13,7 @@ from darkfactory.agents.builder_supervisor import (
     builder_supervisor_node,
 )
 from darkfactory.agents.tester import run_tester
+from darkfactory.runtime.tracing import phase_span
 from darkfactory.state import PipelineState
 from darkfactory.tools.git_diff import (
     compute_wp_diff,
@@ -262,19 +263,20 @@ def _worker_node_factory(name: str):
         sandbox = get_sandbox(task_id) if task_id else None
         pre_sha = snapshot_head(sandbox) if sandbox is not None else ""
 
-        try:
-            result = await runner(state)
-        except Exception as exc:  # keep the graph progressing on worker failure
-            return {
-                "patches": [
-                    {
-                        "path": "(worker-error)",
-                        "diff": f"error: {exc}",
-                        "author_agent": name,
-                        "slice_id": slice_id,
-                    }
-                ]
-            }
+        with phase_span("build.wp", wp_id=slice_id or None, role=name):
+            try:
+                result = await runner(state)
+            except Exception as exc:  # keep the graph progressing on worker failure
+                return {
+                    "patches": [
+                        {
+                            "path": "(worker-error)",
+                            "diff": f"error: {exc}",
+                            "author_agent": name,
+                            "slice_id": slice_id,
+                        }
+                    ]
+                }
 
         # Builder / Tester patches come from `git diff`. In tests that run
         # without a registered sandbox (no pre_sha, no sandbox), fall back

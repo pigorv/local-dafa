@@ -93,13 +93,17 @@ def test_compose_noop_options_mirror_manifest() -> None:
 
     assert opts.model == manifest.llm.model
     assert opts.system_prompt == prompt
-    assert list(opts.allowed_tools or []) == list(manifest.tools.allowed)
+    # Default project_mcp_allowed=["*"] appends ``mcp__*`` to the
+    # manifest's allowed list at compose time.
+    assert list(opts.allowed_tools or []) == [*manifest.tools.allowed, "mcp__*"]
     assert list(opts.disallowed_tools or []) == list(manifest.tools.disallowed)
     assert (opts.mcp_servers or {}) == {}
     assert opts.can_use_tool is None
     assert opts.cwd == "/workspace"
     assert opts.permission_mode == "bypassPermissions"
     assert opts.setting_sources == ["project"]
+    # Non-empty tools.allowed → skills resolves to manifest default "all".
+    assert opts.skills == "all"
     assert opts.thinking is not None and opts.thinking["type"] == "disabled"
 
 
@@ -173,6 +177,211 @@ def test_compose_applies_env_then_in_process_overrides(
     assert opts.thinking is not None
     assert opts.thinking["type"] == "enabled"
     assert opts.thinking["budget_tokens"] == 2222
+
+
+def _mcp_manifest_payload(
+    prompt_path: Path,
+    *,
+    role: str = "mcptest",
+    project_mcp_allowed: list[str] | None = None,
+    skills: str | list[str] | None = None,
+) -> dict[str, Any]:
+    """Minimal manifest used to exercise the project_mcp_allowed knob."""
+    payload: dict[str, Any] = {
+        "identity": {
+            "role": role,
+            "description": "Project MCP knob fixture.",
+            "when_to_use": "compose tests only.",
+        },
+        "llm": {
+            "model": "claude-sonnet-4-5-20250929",
+            "thinking": {"enabled": False, "budget_tokens": None},
+            "prompt_path": str(prompt_path),
+        },
+        "tools": {
+            "allowed": ["Read", "Grep", "Glob"],
+            "disallowed": [],
+            "argv_allowlist": [],
+            "role_owned_argv_prefixes": [],
+            "edit_path_allowlist": [],
+        },
+        "mcp": [],
+        "hooks": [],
+        "budgets": {"timeout": None, "heartbeat": None, "retry_caps": {}},
+    }
+    if project_mcp_allowed is not None:
+        payload["tools"]["project_mcp_allowed"] = project_mcp_allowed
+    if skills is not None:
+        payload["tools"]["skills"] = skills
+    return payload
+
+
+def _compose_mcp_role(
+    tmp_path: Path,
+    *,
+    project_mcp_allowed: list[str] | None,
+) -> list[str]:
+    prompt = tmp_path / "mcp.md"
+    prompt.write_text("MCP knob prompt", encoding="utf-8")
+    manifests_dir = tmp_path / "manifests"
+    _write_manifest(
+        manifests_dir,
+        _mcp_manifest_payload(prompt, project_mcp_allowed=project_mcp_allowed),
+    )
+    registry = load_registry(manifests_dir)
+    client = compose(
+        "mcptest",
+        ComposeState(task_id="task-mcp"),
+        task_id="task-mcp",
+        overrides=ComposeOverrides(registry=registry),
+    )
+    return list(client.options.allowed_tools or [])
+
+
+def test_project_mcp_allowed_default_is_wildcard(tmp_path: Path) -> None:
+    """Omitting the field defaults to ["*"] -> mcp__* gets appended."""
+    tools = _compose_mcp_role(tmp_path, project_mcp_allowed=None)
+    assert tools == ["Read", "Grep", "Glob", "mcp__*"]
+
+
+def test_project_mcp_allowed_explicit_empty_list_disables(tmp_path: Path) -> None:
+    """Manifest can opt out by setting project_mcp_allowed: []."""
+    tools = _compose_mcp_role(tmp_path, project_mcp_allowed=[])
+    assert tools == ["Read", "Grep", "Glob"]
+    assert not any(t.startswith("mcp__") for t in tools)
+
+
+def test_project_mcp_allowed_skipped_for_zero_tool_roles(tmp_path: Path) -> None:
+    """Roles with allowed=[] short-circuit; default ["*"] is not expanded.
+
+    Mirrors the plan_critic / verifier_semantic design: an empty
+    allowed list is a deliberate "no tools" statement.
+    """
+    prompt = tmp_path / "zero.md"
+    prompt.write_text("zero", encoding="utf-8")
+    manifests_dir = tmp_path / "manifests"
+    payload = _mcp_manifest_payload(prompt, role="zerotool")
+    payload["tools"]["allowed"] = []
+    _write_manifest(manifests_dir, payload)
+    registry = load_registry(manifests_dir)
+    client = compose(
+        "zerotool",
+        ComposeState(task_id="task-mcp"),
+        task_id="task-mcp",
+        overrides=ComposeOverrides(registry=registry),
+    )
+    assert list(client.options.allowed_tools or []) == []
+
+
+def test_project_mcp_allowed_expands_server_names(tmp_path: Path) -> None:
+    tools = _compose_mcp_role(
+        tmp_path, project_mcp_allowed=["filesystem", "linear"]
+    )
+    assert tools == [
+        "Read",
+        "Grep",
+        "Glob",
+        "mcp__filesystem__*",
+        "mcp__linear__*",
+    ]
+
+
+def test_project_mcp_allowed_wildcard_expands_to_mcp_star(tmp_path: Path) -> None:
+    tools = _compose_mcp_role(tmp_path, project_mcp_allowed=["*"])
+    assert tools[-1] == "mcp__*"
+    assert tools[:3] == ["Read", "Grep", "Glob"]
+
+
+def test_project_mcp_allowed_env_override_replaces_manifest_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LLM_MCPTEST_PROJECT_MCP", "filesystem,sqlite")
+    tools = _compose_mcp_role(tmp_path, project_mcp_allowed=["linear"])
+    # The env list wins; the manifest's "linear" is not expanded.
+    assert "mcp__linear__*" not in tools
+    assert "mcp__filesystem__*" in tools
+    assert "mcp__sqlite__*" in tools
+
+
+def test_project_mcp_allowed_empty_env_disables_manifest_opt_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty env string is an explicit override: no project MCPs."""
+    monkeypatch.setenv("LLM_MCPTEST_PROJECT_MCP", "")
+    tools = _compose_mcp_role(tmp_path, project_mcp_allowed=["filesystem"])
+    assert not any(t.startswith("mcp__") for t in tools)
+
+
+def test_project_mcp_allowed_env_wildcard_overrides_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LLM_MCPTEST_PROJECT_MCP", "*")
+    tools = _compose_mcp_role(tmp_path, project_mcp_allowed=["filesystem"])
+    assert "mcp__*" in tools
+    assert "mcp__filesystem__*" not in tools
+
+
+def _compose_skills_role(
+    tmp_path: Path,
+    *,
+    skills: str | list[str] | None,
+    zero_tool: bool = False,
+) -> str | list[str] | None:
+    prompt = tmp_path / "skills.md"
+    prompt.write_text("skills knob prompt", encoding="utf-8")
+    manifests_dir = tmp_path / "manifests"
+    payload = _mcp_manifest_payload(prompt, role="skilltest", skills=skills)
+    if zero_tool:
+        payload["tools"]["allowed"] = []
+    _write_manifest(manifests_dir, payload)
+    registry = load_registry(manifests_dir)
+    client = compose(
+        "skilltest",
+        ComposeState(task_id="task-skills"),
+        task_id="task-skills",
+        overrides=ComposeOverrides(registry=registry),
+    )
+    return client.options.skills
+
+
+def test_skills_default_is_all(tmp_path: Path) -> None:
+    """Omitting the field defaults to "all" (every project skill enabled)."""
+    assert _compose_skills_role(tmp_path, skills=None) == "all"
+
+
+def test_skills_manifest_list_restricts(tmp_path: Path) -> None:
+    assert _compose_skills_role(tmp_path, skills=["pdf", "docx"]) == ["pdf", "docx"]
+
+
+def test_skills_manifest_empty_list_disables(tmp_path: Path) -> None:
+    """Empty list is treated as "no skills" (returns None)."""
+    assert _compose_skills_role(tmp_path, skills=[]) is None
+
+
+def test_skills_zero_tool_role_disables(tmp_path: Path) -> None:
+    """Roles with allowed=[] never load skills, regardless of manifest."""
+    assert _compose_skills_role(tmp_path, skills="all", zero_tool=True) is None
+
+
+def test_skills_env_override_all(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LLM_SKILLTEST_SKILLS", "all")
+    assert _compose_skills_role(tmp_path, skills=["pdf"]) == "all"
+
+
+def test_skills_env_override_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LLM_SKILLTEST_SKILLS", "pdf,docx")
+    assert _compose_skills_role(tmp_path, skills="all") == ["pdf", "docx"]
+
+
+def test_skills_empty_env_disables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LLM_SKILLTEST_SKILLS", "")
+    assert _compose_skills_role(tmp_path, skills="all") is None
 
 
 def test_compose_stamps_manifest_and_prompt_sha_on_active_span() -> None:

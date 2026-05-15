@@ -33,6 +33,7 @@ from darkfactory.agents._sdk_common import (
     ParseError,
     render_role_user_message,
     repo_summary,
+    role_turn_span,
     run_to_completion,
 )
 from darkfactory.agents.compose import ComposeState, compose
@@ -150,26 +151,27 @@ async def run_builder(state_slice: dict) -> dict[str, Any]:
     compose_state = ComposeState.from_mapping(state_slice)
     rendered = _render_user_prompt(state_slice)
     slice_id = state_slice.get("current_slice") or ""
-    async with compose(
-        ROLE,
-        compose_state,
-        task_id=compose_state.task_id,
-    ) as client:
-        await client.query(rendered)
-        try:
-            output = await run_to_completion(client, expect=BuilderOutput)
-        except ParseError as exc:
-            log.warning(
-                "builder: structured output parse failure for slice %r: %s",
-                slice_id,
-                exc,
-            )
-            output = BuilderOutput(
-                wp_id=slice_id,
-                status="blocked",
-                blockers=[f"Builder produced no parseable structured output: {exc}"],
-                summary="",
-            )
+    async with role_turn_span(ROLE, wp_id=slice_id or None):
+        async with compose(
+            ROLE,
+            compose_state,
+            task_id=compose_state.task_id,
+        ) as client:
+            await client.query(rendered)
+            try:
+                output = await run_to_completion(client, expect=BuilderOutput)
+            except ParseError as exc:
+                log.warning(
+                    "builder: structured output parse failure for slice %r: %s",
+                    slice_id,
+                    exc,
+                )
+                output = BuilderOutput(
+                    wp_id=slice_id,
+                    status="blocked",
+                    blockers=[f"Builder produced no parseable structured output: {exc}"],
+                    summary="",
+                )
     payload = output.model_dump()
     # The build subgraph already knows which slice it dispatched; pin the
     # wp_id to the dispatched slice so a hallucinated wp_id in the agent

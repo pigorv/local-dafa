@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Literal, TypeVar
+from typing import Any, AsyncIterator, Literal, TypeVar
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -27,7 +28,10 @@ from claude_agent_sdk import (
     TextBlock,
 )
 from claude_agent_sdk.types import ToolUseBlock
+from opentelemetry import trace
 from pydantic import BaseModel, Field, ValidationError
+
+_AGENT_TRACER = trace.get_tracer("darkfactory.agent")
 
 STRUCTURED_OUTPUT_TOOL_NAME = "StructuredOutput"
 
@@ -275,6 +279,59 @@ async def _drain(
     return "".join(last_text_chunks), structured, final
 
 
+@asynccontextmanager
+async def role_turn_span(
+    role: str, **attrs: Any
+) -> AsyncIterator[trace.Span]:
+    """Open a `darkfactory.agent.<role>` span around one SDK invocation.
+
+    Wrap the ``compose(...) → run_to_completion(...)`` block so that
+    ``llm_factory._otel_resource_attributes_with_parent_span`` — which reads
+    the active OTel span at SDK options-build time — captures this span as
+    the parent. The collector's `transform/coalesce_trace_id` then
+    re-parents every orphan top-level ``claude_code.*`` span onto this
+    one. Token / duration attributes are stamped via :func:`stamp_turn_usage`
+    once the SDK's ``ResultMessage`` is in hand.
+    """
+    span_attrs: dict[str, Any] = {"darkfactory.role": role}
+    for key, value in attrs.items():
+        if value is None:
+            continue
+        span_attrs[f"darkfactory.{key}"] = value
+    with _AGENT_TRACER.start_as_current_span(
+        f"darkfactory.agent.{role}", attributes=span_attrs
+    ) as span:
+        yield span
+
+
+def stamp_turn_usage(span: trace.Span, result: ResultMessage | None) -> None:
+    """Stamp gen_ai.usage.* and darkfactory.agent.num_turns from a ResultMessage.
+
+    Safe to call with ``result is None``; in that case the span is left
+    untouched. Reads token counts off whichever shape the SDK exposes
+    (an ``Usage`` object or a dict-shaped ``usage`` attribute).
+    """
+    if result is None or not span.is_recording():
+        return
+    usage = getattr(result, "usage", None)
+    if usage is not None:
+        input_tokens = getattr(usage, "input_tokens", None)
+        output_tokens = getattr(usage, "output_tokens", None)
+        if isinstance(usage, dict):
+            input_tokens = usage.get("input_tokens", input_tokens)
+            output_tokens = usage.get("output_tokens", output_tokens)
+        if input_tokens is not None:
+            span.set_attribute("gen_ai.usage.input_tokens", int(input_tokens))
+        if output_tokens is not None:
+            span.set_attribute("gen_ai.usage.output_tokens", int(output_tokens))
+    num_turns = getattr(result, "num_turns", None)
+    if num_turns is not None:
+        span.set_attribute("darkfactory.agent.num_turns", int(num_turns))
+    duration_ms = getattr(result, "duration_ms", None)
+    if duration_ms is not None:
+        span.set_attribute("darkfactory.agent.duration_ms", int(duration_ms))
+
+
 async def run_to_completion(
     client: ClaudeSDKClient,
     *,
@@ -293,6 +350,7 @@ async def run_to_completion(
     failure it raises ``ParseError``.
     """
     text, structured, result = await _drain(client)
+    stamp_turn_usage(trace.get_current_span(), result)
 
     if expect is None:
         return {"text": text, "result": result}
@@ -317,7 +375,8 @@ async def run_to_completion(
         "JSON Schema. Do not include code fences, commentary, or preamble — "
         "only the raw JSON object.\n\nSchema:\n" + schema
     )
-    text, structured, _ = await _drain(client)
+    text, structured, retry_result = await _drain(client)
+    stamp_turn_usage(trace.get_current_span(), retry_result)
     if structured is not None:
         try:
             return expect.model_validate(structured)

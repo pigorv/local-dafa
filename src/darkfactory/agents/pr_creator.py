@@ -18,6 +18,7 @@ from typing import Any
 from darkfactory.agents._sdk_common import (
     PRCreatorOutput,
     render_role_user_message,
+    role_turn_span,
     run_to_completion,
 )
 from darkfactory.agents.compose import ComposeState, compose
@@ -92,11 +93,12 @@ async def run_pr_creator(state_slice: dict) -> dict[str, Any]:
     """
     compose_state = ComposeState.from_mapping(state_slice)
     rendered = _render_user_prompt(state_slice)
-    async with compose(
-        ROLE,
-        compose_state,
-        task_id=compose_state.task_id,
-    ) as client:
-        await client.query(rendered)
-        output = await run_to_completion(client, expect=PRCreatorOutput)
+    async with role_turn_span(ROLE, branch=_feature_branch(state_slice)):
+        async with compose(
+            ROLE,
+            compose_state,
+            task_id=compose_state.task_id,
+        ) as client:
+            await client.query(rendered)
+            output = await run_to_completion(client, expect=PRCreatorOutput)
     return output.model_dump()

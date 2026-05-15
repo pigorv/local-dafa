@@ -20,7 +20,6 @@ tools:
     - Read
     - Grep
     - Glob
-    - Skill
   disallowed:
     - Bash
     - Edit

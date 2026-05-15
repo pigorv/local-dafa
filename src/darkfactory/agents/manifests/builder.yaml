@@ -26,7 +26,6 @@ tools:
     - Grep
     - Glob
     - Bash
-    - Skill
   disallowed: []
   # Pure denylist policy: the worker container is the isolation
   # boundary, so the gate runs only the global denies (FORBIDDEN_TOKENS,

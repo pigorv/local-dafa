@@ -36,6 +36,7 @@ from langgraph.graph import END, START, StateGraph
 from darkfactory.agents._sdk_common import ParseError
 from darkfactory.agents.verifier_semantic import run_verifier_semantic
 from darkfactory.agents.verify_planner import run_verify_planner
+from darkfactory.runtime.tracing import phase_span
 from darkfactory.state import (
     Finding,
     PipelineState,
@@ -91,7 +92,8 @@ async def ensure_plan_node(state: PipelineState, runtime=None) -> dict:
         return {}
 
     try:
-        plan = await run_verify_planner(dict(state))
+        with phase_span("node.verify_planner"):
+            plan = await run_verify_planner(dict(state))
     except ParseError as exc:
         return {
             "findings": [
@@ -463,7 +465,8 @@ async def run_semantic_coverage_node(state: PipelineState, runtime=None) -> dict
     if not _has_verification_predicates(state):
         return {}
 
-    result = await run_verifier_semantic(dict(state))
+    with phase_span("node.verifier_semantic"):
+        result = await run_verifier_semantic(dict(state))
     predicate_coverage = [
         _coverage_to_dict(item)
         for item in (result.get("predicate_coverage") or [])

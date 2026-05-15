@@ -27,7 +27,10 @@ from darkfactory.agents._sdk_common import (
     original_user_request,
     render_role_user_message,
     repo_summary,
+    role_turn_span,
+    stamp_turn_usage,
 )
+from opentelemetry import trace
 from darkfactory.agents.compose import ComposeState, compose
 
 _LEGACY_ALIASES: dict[str, str] = {
@@ -102,13 +105,15 @@ def _render_user_prompt(state_slice: dict) -> str:
 async def run_po(state_slice: dict) -> dict[str, Any]:
     compose_state = ComposeState.from_mapping(state_slice)
     rendered = _render_user_prompt(state_slice)
-    async with compose(
-        "po",
-        compose_state,
-        task_id=compose_state.task_id,
-    ) as client:
-        await client.query(rendered)
-        _text, structured, _result = await _drain(client)
+    async with role_turn_span("po"):
+        async with compose(
+            "po",
+            compose_state,
+            task_id=compose_state.task_id,
+        ) as client:
+            await client.query(rendered)
+            _text, structured, _result = await _drain(client)
+            stamp_turn_usage(trace.get_current_span(), _result)
     if structured is None:
         raise ParseError("PO emitted no structured output")
     return normalize_po_output(structured)

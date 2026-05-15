@@ -39,7 +39,18 @@ processors:
           # Stamp langfuse.trace.name on EVERY span in the unified trace.
           # Langfuse OTLP last-write-wins on trace name; without this, late-
           # arriving CLI spans (claude_code.*) overwrite the trace name with
-          # their own. Hardcoded to the only workflow type in dark-factory.
+          # their own. Fallback order:
+          #   1. `temporal.workflow.type` span attribute — present on every
+          #      Python-side activity span (set by _stamp_temporal_activity_attrs)
+          #      and on the RunWorkflow:* root span (set by SessionStampingSpanProcessor).
+          #   2. `resource.darkfactory.workflow_type` — set by setup_worker_activity
+          #      on the worker container's OTEL_RESOURCE_ATTRIBUTES, so the bundled
+          #      `claude` CLI's native spans (which don't speak Temporal) get
+          #      labelled too.
+          #   3. Constant `DarkFactoryWorkflow` for anything else, so the trace
+          #      always has a name and last-write-wins can't blank it.
+          - set(attributes["langfuse.trace.name"], attributes["temporal.workflow.type"]) where attributes["darkfactory._wf_src"] != nil and attributes["temporal.workflow.type"] != nil
+          - set(attributes["langfuse.trace.name"], resource.attributes["darkfactory.workflow_type"]) where attributes["darkfactory._wf_src"] != nil and attributes["langfuse.trace.name"] == nil and resource.attributes["darkfactory.workflow_type"] != nil
           - set(attributes["langfuse.trace.name"], "DarkFactoryWorkflow") where attributes["darkfactory._wf_src"] != nil and attributes["langfuse.trace.name"] == nil
           - delete_key(attributes, "darkfactory._wf_src")
 

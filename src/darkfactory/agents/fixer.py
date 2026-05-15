@@ -25,6 +25,8 @@ from darkfactory.agents._sdk_common import (
     _drain,
     render_role_user_message,
     repo_summary,
+    role_turn_span,
+    stamp_turn_usage,
 )
 from darkfactory.agents.compose import ComposeState, compose
 
@@ -240,13 +242,15 @@ async def run_fixer(state_slice: dict) -> dict[str, Any]:
 
     rendered = _render_user_prompt(state_slice, target_wp)
 
-    async with compose(
-        ROLE,
-        compose_state,
-        task_id=compose_state.task_id,
-    ) as client:
-        await client.query(rendered)
-        _text, structured, _result = await _drain(client)
+    async with role_turn_span(ROLE, wp_id=target_wp or None):
+        async with compose(
+            ROLE,
+            compose_state,
+            task_id=compose_state.task_id,
+        ) as client:
+            await client.query(rendered)
+            _text, structured, _result = await _drain(client)
+            stamp_turn_usage(_otel_trace.get_current_span(), _result)
 
     if structured is None:
         return _synthesize_parse_failure(state_slice, target_wp)

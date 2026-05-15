@@ -44,6 +44,13 @@ class SessionStampingSpanProcessor(SpanProcessor):
          temporalio.contrib.opentelemetry.TracingInterceptor on RunActivity
          spans, lets Python-side child spans (LangGraph, etc.) inherit the
          workflow id even in the multi-workflow orchestrator.
+      4. The span's own resource attribute `darkfactory.workflow_id` — set
+         by the worker container via OTEL_RESOURCE_ATTRIBUTES; catches spans
+         whose parent is non-recording or unavailable at on_start.
+
+    Root spans whose workflow id cannot be resolved through any of the four
+    fallbacks emit a WARNING log (gated by DARKFACTORY_OTEL_VERBOSE) so
+    coalescing escapes are visible in diagnostics rather than silent.
 
     Cross-trace coalescing into a single Langfuse trace is handled by the
     otel-collector's `transform/coalesce_trace_id` processor, which derives
@@ -68,9 +75,29 @@ class SessionStampingSpanProcessor(SpanProcessor):
             if parent is not None and parent.is_recording():
                 attrs = getattr(parent, "attributes", None) or {}
                 wf_id = attrs.get(_SESSION_ATTR) or attrs.get(_TEMPORAL_WF_ATTR)
+        if not wf_id:
+            # Fourth fallback: the span's own resource attributes. The worker
+            # container sets `darkfactory.workflow_id` via OTEL_RESOURCE_ATTRIBUTES
+            # (see runtime/activities.py:setup_worker_activity); the collector
+            # already coalesces by that attribute, but stamping it from Python at
+            # on_start lets in-process consumers see the right session id too.
+            resource = getattr(span, "resource", None)
+            if resource is not None:
+                wf_id = resource.attributes.get("darkfactory.workflow_id")
         if wf_id:
             span.set_attribute(_SESSION_ATTR, wf_id)
             span.set_attribute(_SESSION_ATTR_ALT, wf_id)
+        else:
+            # Surface coalescing escapes. Only warn for root spans — child spans
+            # inherit trace_id from their parent so they coalesce regardless of
+            # the session attribute. Gated by DARKFACTORY_OTEL_VERBOSE so the
+            # log stays quiet in normal operation.
+            if os.environ.get("DARKFACTORY_OTEL_VERBOSE"):
+                parent = trace.get_current_span(parent_context)
+                if parent is None or not parent.is_recording():
+                    logging.getLogger(__name__).warning(
+                        "orphan span without workflow id: name=%s", span.name
+                    )
         if self._environment:
             span.set_attribute(_ENV_ATTR, self._environment)
             span.set_attribute(_ENV_ATTR_ALT, self._environment)

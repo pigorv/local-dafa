@@ -37,6 +37,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from darkfactory.agents._sdk_common import (
     ParseError,
     repo_summary,
+    role_turn_span,
     run_to_completion,
 )
 from darkfactory.agents.compose import ComposeState, compose
@@ -176,13 +177,14 @@ def _resolve_task_id(state_slice: dict) -> str:
 async def run_triage(state_slice: dict) -> TriageOutput:
     compose_state = ComposeState.task_only(_resolve_task_id(state_slice))
     rendered = _render_user_prompt(state_slice)
-    async with compose(
-        "triage",
-        compose_state,
-        task_id=compose_state.task_id,
-    ) as client:
-        await client.query(rendered)
-        parsed = await run_to_completion(client, expect=_TriageParsedOutput)
+    async with role_turn_span("triage"):
+        async with compose(
+            "triage",
+            compose_state,
+            task_id=compose_state.task_id,
+        ) as client:
+            await client.query(rendered)
+            parsed = await run_to_completion(client, expect=_TriageParsedOutput)
     if not isinstance(parsed, _TriageParsedOutput):
         raise ParseError("Triage returned unexpected output shape")
     normalized = normalize_triage_output(parsed.model_dump())

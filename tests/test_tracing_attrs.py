@@ -30,8 +30,10 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.testing import ActivityEnvironment
 from temporalio.worker import Worker
 
+from darkfactory.agents._sdk_common import role_turn_span
 from darkfactory.bootstrap import SessionStampingSpanProcessor
 from darkfactory.runtime.activities import _stamp_temporal_activity_attrs
+from darkfactory.runtime.tracing import phase_span
 from tests.temporal_testing import start_time_skipping_env
 
 
@@ -175,3 +177,137 @@ async def _run_workflow_probe() -> None:
         f"root span missing langfuse.trace.name; got {root_attrs}"
     )
     assert root_attrs.get("temporal.workflow.type") == "AttrProbeWorkflow"
+
+
+@activity.defn(name="phase_probe_activity")
+async def phase_probe_activity() -> dict[str, Any]:
+    """Activity that opens phase + agent.turn spans and returns their context.
+
+    The activity exercises the full structural chain the production
+    pipeline produces: activity → phase → agent.turn. We return the OTel
+    span ids so the test can assert parent-child links from the exported
+    span tree.
+    """
+    _stamp_temporal_activity_attrs()
+    activity_ctx = trace.get_current_span().get_span_context()
+    with phase_span("probe", attempt=1) as ps:
+        phase_ctx = ps.get_span_context()
+        async with role_turn_span("probe_role", wp_id="A1") as ts:
+            turn_ctx = ts.get_span_context()
+    return {
+        "activity_span_id": format(activity_ctx.span_id, "016x"),
+        "phase_span_id": format(phase_ctx.span_id, "016x"),
+        "turn_span_id": format(turn_ctx.span_id, "016x"),
+    }
+
+
+@workflow.defn(name="PhaseProbeWorkflow", sandboxed=False)
+class PhaseProbeWorkflow:
+    @workflow.run
+    async def run(self) -> dict[str, Any]:
+        from datetime import timedelta
+
+        return await workflow.execute_activity(
+            "phase_probe_activity",
+            start_to_close_timeout=timedelta(seconds=10),
+        )
+
+
+def test_all_spans_for_one_workflow_share_session_and_structure() -> None:
+    """Every span emitted for one workflow run shares one session id, and
+    the activity → phase → agent.turn chain forms a proper parent tree.
+
+    This locks in the coalescing invariant — Langfuse groups by OTel
+    trace_id (rewritten by the collector from `langfuse.session.id`), so
+    if any span in the chain is missing the session attribute, that span
+    lands in a different Langfuse trace.
+    """
+    asyncio.run(_run_phase_probe())
+
+
+async def _run_phase_probe() -> None:
+    exporter = _attach_in_memory_exporter()
+    exporter.clear()
+
+    interceptor = TracingInterceptor()
+    wf_id = "test-wf-phase-probe"
+
+    async with await start_time_skipping_env(
+        data_converter=pydantic_data_converter,
+        interceptors=[interceptor],
+    ) as env:
+        async with Worker(
+            env.client,
+            task_queue="phase-probe-tq",
+            workflows=[PhaseProbeWorkflow],
+            activities=[phase_probe_activity],
+            interceptors=[interceptor],
+        ):
+            span_ids = await env.client.execute_workflow(
+                PhaseProbeWorkflow.run,
+                id=wf_id,
+                task_queue="phase-probe-tq",
+            )
+
+    trace.get_tracer_provider().force_flush()  # type: ignore[attr-defined]
+
+    spans = list(exporter.get_finished_spans())
+    # Temporal emits a RunActivity:* span on both the orchestrator-side
+    # scheduler and the worker-side executor — same name, different
+    # processes simulated by the same in-memory test exporter. Look up by
+    # span_id rather than by name so we assert against the span the
+    # activity body actually ran on.
+    spans_by_id = {format(s.context.span_id, "016x"): s for s in spans}
+
+    activity_span = spans_by_id.get(span_ids["activity_span_id"])
+    phase = spans_by_id.get(span_ids["phase_span_id"])
+    turn = spans_by_id.get(span_ids["turn_span_id"])
+    assert activity_span is not None, (
+        f"worker-side activity span {span_ids['activity_span_id']} not exported"
+    )
+    assert phase is not None and turn is not None
+
+    # 1. Spans created in-process from the activity body downward must carry
+    #    `langfuse.session.id == wf_id` so the collector groups them by session.
+    #    The workflow-root span is a known exception: temporalio sets
+    #    `temporalWorkflowID` AFTER `on_start`, so the Python processor can't
+    #    stamp session.id there — the collector reads `temporalWorkflowID`
+    #    instead, which is what produces the unified trace at export time.
+    for label, span in (
+        ("activity", activity_span),
+        ("phase", phase),
+        ("agent.turn", turn),
+    ):
+        attrs = dict(span.attributes or {})
+        assert attrs.get("langfuse.session.id") == wf_id, (
+            f"{label} span has wrong langfuse.session.id: "
+            f"{attrs.get('langfuse.session.id')!r} (expected {wf_id!r})"
+        )
+        assert attrs.get("session.id") == wf_id, (
+            f"{label} span missing session.id"
+        )
+    root_spans = [s for s in spans if s.name == "RunWorkflow:PhaseProbeWorkflow"]
+    assert root_spans, "missing RunWorkflow:PhaseProbeWorkflow span"
+    root_attrs = dict(root_spans[0].attributes or {})
+    assert root_attrs.get("temporalWorkflowID") == wf_id, (
+        "RunWorkflow span missing temporalWorkflowID — collector cannot "
+        "coalesce trace_id without it"
+    )
+
+    # 2. Parent-child chain: turn → phase → activity.
+    assert turn.parent is not None and format(turn.parent.span_id, "016x") == span_ids["phase_span_id"], (
+        f"agent.turn parent is not phase span; got {turn.parent}"
+    )
+    assert phase.parent is not None and format(phase.parent.span_id, "016x") == span_ids["activity_span_id"], (
+        f"phase parent is not activity span; got {phase.parent}"
+    )
+
+    # 3. Phase span carries the iteration attribute we passed.
+    phase_attrs = dict(phase.attributes or {})
+    assert phase_attrs.get("darkfactory.phase") == "probe"
+    assert phase_attrs.get("darkfactory.attempt") == 1
+
+    # 4. Agent.turn span carries the role + wp_id we passed.
+    turn_attrs = dict(turn.attributes or {})
+    assert turn_attrs.get("darkfactory.role") == "probe_role"
+    assert turn_attrs.get("darkfactory.wp_id") == "A1"

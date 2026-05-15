@@ -42,7 +42,9 @@ from darkfactory.state import (
 # Matches the canonical worker allowlist; kept inline so the test fails loud
 # if the manifest's allowed-tools list drifts. Fixer mirrors Builder/Tester:
 # built-in Bash with a pure denylist, no sandbox_bash, no MCP.
-ALLOWED_TOOLS: list[str] = ["Read", "Write", "Edit", "Grep", "Glob", "Bash", "Skill"]
+ALLOWED_TOOLS: list[str] = [
+    "Read", "Write", "Edit", "Grep", "Glob", "Bash", "mcp__*",
+]
 FIXER_DENYLIST: tuple[tuple[str, ...], ...] = (("git", "push"),)
 
 

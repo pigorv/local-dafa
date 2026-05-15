@@ -28,6 +28,7 @@ from darkfactory.runtime.approval import (
 from darkfactory.runtime.comment_templates import render as render_comment_template
 from darkfactory.runtime.issue_comments import filter_dark_factory_marker_comments
 from darkfactory.runtime.phase_comment import end_marker_for, marker_for
+from darkfactory.runtime.tracing import phase_span
 from darkfactory.tools.sandbox import RepoSandbox
 from darkfactory.tools.shell import get_sandbox, register_sandbox
 from darkfactory.state import IssueComment, IssueRef, IssueRunRequest
@@ -1556,6 +1557,12 @@ async def setup_worker_activity(wf_id: str, repo_url: str) -> str:
 
     otlp_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", DEFAULT_OTLP_ENDPOINT)
     environment = os.environ.get("DARKFACTORY_ENVIRONMENT", "local")
+    # Propagate the parent workflow's type as a resource attribute so every span
+    # emitted from the worker container — including the bundled `claude` CLI's
+    # native spans, which inherit OTEL_RESOURCE_ATTRIBUTES but otherwise have no
+    # Temporal awareness — gets the right `langfuse.trace.name` after the
+    # collector's coalesce_trace_id transform runs.
+    workflow_type = activity.info().workflow_type if activity.in_activity() else ""
     repo_is_url = _is_repo_url(repo_url)
     volumes = (
         {} if repo_is_url else {repo_url: {"bind": "/workspace", "mode": "rw"}}
@@ -1600,8 +1607,9 @@ async def setup_worker_activity(wf_id: str, repo_url: str) -> str:
             "OTEL_LOG_RAW_API_BODIES": "file:/var/log/claude-bodies",
             "OTEL_RESOURCE_ATTRIBUTES": (
                 f"darkfactory.workflow_id={wf_id},"
-                f"darkfactory.environment={environment},"
-                "service.namespace=darkfactory"
+                + (f"darkfactory.workflow_type={workflow_type}," if workflow_type else "")
+                + f"darkfactory.environment={environment},"
+                + "service.namespace=darkfactory"
             ),
         },
         volumes=volumes,
@@ -1640,53 +1648,56 @@ async def hydrate_stage(state: dict) -> dict:
     than via a one-node subgraph.
     """
     _stamp_temporal_activity_attrs()
-    _heartbeat("hydrate: starting")
-    from darkfactory.stages.hydrator import hydrate_state
+    with phase_span("hydrate"):
+        _heartbeat("hydrate: starting")
+        from darkfactory.stages.hydrator import hydrate_state
 
-    repo_path = state.get("repo_path")
-    if not repo_path:
-        existing = state.get("repo_context") or {}
-        if isinstance(existing, dict):
-            repo_path = existing.get("repo_root")
-    if not repo_path:
-        repo_path = "/workspace"
-    return hydrate_state(state, repo_path)
+        repo_path = state.get("repo_path")
+        if not repo_path:
+            existing = state.get("repo_context") or {}
+            if isinstance(existing, dict):
+                repo_path = existing.get("repo_root")
+        if not repo_path:
+            repo_path = "/workspace"
+        return hydrate_state(state, repo_path)
 
 
 @activity.defn
 async def discovery_stage(state: dict) -> dict:
     """Run the Discovery subgraph (PO → Architect → Plan Critic)."""
     _stamp_temporal_activity_attrs()
-    _heartbeat("discovery: starting subgraph")
-    from darkfactory.stages.discovery import discovery_subgraph
+    with phase_span("discovery", attempt=state.get("planning_attempts")):
+        _heartbeat("discovery: starting subgraph")
+        from darkfactory.stages.discovery import discovery_subgraph
 
-    sg = discovery_subgraph()
-    result = await sg.ainvoke(state)
-    return {
-        "stories": result.get("stories", []),
-        "spec": result.get("spec", []),
-        "work_packages": result.get("work_packages", []),
-        "implementation_brief": result.get("implementation_brief"),
-        "review_decision": result.get("review_decision"),
-    }
+        sg = discovery_subgraph()
+        result = await sg.ainvoke(state)
+        return {
+            "stories": result.get("stories", []),
+            "spec": result.get("spec", []),
+            "work_packages": result.get("work_packages", []),
+            "implementation_brief": result.get("implementation_brief"),
+            "review_decision": result.get("review_decision"),
+        }
 
 
 @activity.defn
 async def triage_stage(state: dict) -> dict:
     """Run the issue triage subgraph and return its decision channels."""
     _stamp_temporal_activity_attrs()
-    _heartbeat("triage: starting subgraph")
-    from darkfactory.stages.triage import triage_subgraph
+    with phase_span("triage", round=state.get("triage_round")):
+        _heartbeat("triage: starting subgraph")
+        from darkfactory.stages.triage import triage_subgraph
 
-    sg = triage_subgraph()
-    result = await sg.ainvoke(state)
-    return {
-        "ready_to_build": result.get("ready_to_build"),
-        "clarification_questions": result.get("clarification_questions", []),
-        "derived_user_request": result.get("derived_user_request", ""),
-        "confidence": result.get("confidence"),
-        "rationale": result.get("rationale", ""),
-    }
+        sg = triage_subgraph()
+        result = await sg.ainvoke(state)
+        return {
+            "ready_to_build": result.get("ready_to_build"),
+            "clarification_questions": result.get("clarification_questions", []),
+            "derived_user_request": result.get("derived_user_request", ""),
+            "confidence": result.get("confidence"),
+            "rationale": result.get("rationale", ""),
+        }
 
 
 @activity.defn
@@ -1971,19 +1982,20 @@ async def mark_issue_done_activity(
 async def build_stage(state: dict) -> dict:
     """Run the Build subgraph (Builder Supervisor + Builder/Tester workers)."""
     _stamp_temporal_activity_attrs()
-    _heartbeat("build: starting subgraph")
-    from darkfactory.stages.build import build_subgraph
+    with phase_span("build"):
+        _heartbeat("build: starting subgraph")
+        from darkfactory.stages.build import build_subgraph
 
-    ctx = _runctx_from_state(state)
-    sg = build_subgraph()
-    result = await sg.ainvoke(state, context=ctx)
-    return {
-        "build_order": result.get("build_order"),
-        "current_slice": result.get("current_slice"),
-        "coverage_entries": result.get("coverage_entries", []),
-        "tester_findings": result.get("tester_findings", []),
-        "patches": result.get("patches", []),
-    }
+        ctx = _runctx_from_state(state)
+        sg = build_subgraph()
+        result = await sg.ainvoke(state, context=ctx)
+        return {
+            "build_order": result.get("build_order"),
+            "current_slice": result.get("current_slice"),
+            "coverage_entries": result.get("coverage_entries", []),
+            "tester_findings": result.get("tester_findings", []),
+            "patches": result.get("patches", []),
+        }
 
 
 @activity.defn
@@ -2000,24 +2012,30 @@ async def verify_stage(state: dict) -> dict:
     itself.
     """
     _stamp_temporal_activity_attrs()
-    _heartbeat("verify: starting plan-driven subgraph")
-    from darkfactory.stages.verify import verify_subgraph
+    verify_cycle = sum(
+        1
+        for entry in (state.get("attempt_log") or [])
+        if isinstance(entry, dict) and entry.get("kind") == "verify"
+    ) + 1
+    with phase_span("verify", verify_cycle=verify_cycle):
+        _heartbeat("verify: starting plan-driven subgraph")
+        from darkfactory.stages.verify import verify_subgraph
 
-    ctx = _runctx_from_state(state)
-    sg = verify_subgraph()
-    result = await sg.ainvoke(state, context=ctx)
-    delta: dict[str, Any] = {
-        "test_results": result.get("test_results", []),
-        "findings": result.get("findings", []),
-        "verify_summary": result.get("verify_summary"),
-    }
-    if "verification_plan" in result:
-        delta["verification_plan"] = result["verification_plan"]
-    if "verification_plan_rev" in result:
-        delta["verification_plan_rev"] = result["verification_plan_rev"]
-    if "verify_retries" in result:
-        delta["verify_retries"] = result["verify_retries"]
-    return delta
+        ctx = _runctx_from_state(state)
+        sg = verify_subgraph()
+        result = await sg.ainvoke(state, context=ctx)
+        delta: dict[str, Any] = {
+            "test_results": result.get("test_results", []),
+            "findings": result.get("findings", []),
+            "verify_summary": result.get("verify_summary"),
+        }
+        if "verification_plan" in result:
+            delta["verification_plan"] = result["verification_plan"]
+        if "verification_plan_rev" in result:
+            delta["verification_plan_rev"] = result["verification_plan_rev"]
+        if "verify_retries" in result:
+            delta["verify_retries"] = result["verify_retries"]
+        return delta
 
 
 @activity.defn
@@ -2025,8 +2043,16 @@ async def verify_stage(state: dict) -> dict:
 async def fixer_stage(state: dict) -> dict:
     """Run Fixer on failing verifier diagnostics and return captured patches."""
     _stamp_temporal_activity_attrs()
-    _heartbeat("fixer: starting")
-    return await _run_fixer_stage(state)
+    fixer_attempts = state.get("fixer_attempts_by_wp") or {}
+    target_wp: str | None = None
+    target_attempt: int | None = None
+    if isinstance(fixer_attempts, dict) and fixer_attempts:
+        target_wp, target_attempt = max(
+            fixer_attempts.items(), key=lambda kv: kv[1]
+        )
+    with phase_span("fixer", wp_id=target_wp, attempt=target_attempt):
+        _heartbeat("fixer: starting")
+        return await _run_fixer_stage(state)
 
 
 async def _run_fixer_stage(state: dict) -> dict:
@@ -2160,11 +2186,12 @@ def _fixer_delta(
 async def reviewer_stage(state: dict) -> dict:
     """Run the Reviewer and surface its gate summary."""
     _stamp_temporal_activity_attrs()
-    _heartbeat("reviewer: starting")
-    from darkfactory.agents.reviewer import run_reviewer
+    with phase_span("reviewer"):
+        _heartbeat("reviewer: starting")
+        from darkfactory.agents.reviewer import run_reviewer
 
-    result = await run_reviewer(state)
-    return {"review_decision": result.model_dump()}
+        result = await run_reviewer(state)
+        return {"review_decision": result.model_dump()}
 
 
 @activity.defn(name="code_quality_stage")
@@ -2195,18 +2222,19 @@ def _existing_pr_url(sb: Any, branch: str) -> str:
 async def pr_creator_stage(state: dict) -> dict:
     """Run the PR Creator role and return the workflow's `pr_url` channel."""
     _stamp_temporal_activity_attrs()
-    _heartbeat("pr_creator: starting")
+    with phase_span("pr_creator"):
+        _heartbeat("pr_creator: starting")
 
-    sb = _ensure_repo_sandbox(state)
-    branch = _branch_from_state(state, "agent/{wf_id}")
-    existing = _existing_pr_url(sb, branch)
-    if existing:
-        return {"pr_url": existing}
+        sb = _ensure_repo_sandbox(state)
+        branch = _branch_from_state(state, "agent/{wf_id}")
+        existing = _existing_pr_url(sb, branch)
+        if existing:
+            return {"pr_url": existing}
 
-    from darkfactory.agents.pr_creator import run_pr_creator
+        from darkfactory.agents.pr_creator import run_pr_creator
 
-    output = await run_pr_creator(state)
-    return {"pr_url": output["pr_url"]}
+        output = await run_pr_creator(state)
+        return {"pr_url": output["pr_url"]}
 
 
 def _gh_pr_state(sb: Any, pr_url: str) -> str:
@@ -2234,38 +2262,39 @@ async def merge_branch(state: dict) -> dict:
     local branch cleanup is not load-bearing.
     """
     _stamp_temporal_activity_attrs()
-    _heartbeat("merge_branch: starting")
-    pr_url = state.get("pr_url")
-    if not pr_url:
-        raise ValueError("merge_branch requires state['pr_url']")
+    with phase_span("merge"):
+        _heartbeat("merge_branch: starting")
+        pr_url = state.get("pr_url")
+        if not pr_url:
+            raise ValueError("merge_branch requires state['pr_url']")
 
-    sb = _ensure_repo_sandbox(state)
-    if sb is None:
-        raise ValueError("merge_branch requires state['task_id'] or state['wf_id']")
+        sb = _ensure_repo_sandbox(state)
+        if sb is None:
+            raise ValueError("merge_branch requires state['task_id'] or state['wf_id']")
 
-    if _gh_pr_state(sb, pr_url) == "MERGED":
-        log.info("merge_branch: PR %s already merged, skipping gh pr merge", pr_url)
-        return {"merged": True}
-
-    result = sb.exec(["gh", "pr", "merge", pr_url, "--squash", "--delete-branch"])
-    if int(result.get("returncode", 1)) != 0:
         if _gh_pr_state(sb, pr_url) == "MERGED":
-            log.warning(
-                "merge_branch: gh pr merge returned rc=%s but PR %s is MERGED; "
-                "treating as success (stderr=%r)",
-                result.get("returncode"),
-                pr_url,
-                result.get("stderr", ""),
-            )
+            log.info("merge_branch: PR %s already merged, skipping gh pr merge", pr_url)
             return {"merged": True}
-        raise RuntimeError(
-            "gh pr merge failed "
-            f"(rc={result.get('returncode')}, "
-            f"stdout={result.get('stdout', '')!r}, "
-            f"stderr={result.get('stderr', '')!r})"
-        )
 
-    return {"merged": True}
+        result = sb.exec(["gh", "pr", "merge", pr_url, "--squash", "--delete-branch"])
+        if int(result.get("returncode", 1)) != 0:
+            if _gh_pr_state(sb, pr_url) == "MERGED":
+                log.warning(
+                    "merge_branch: gh pr merge returned rc=%s but PR %s is MERGED; "
+                    "treating as success (stderr=%r)",
+                    result.get("returncode"),
+                    pr_url,
+                    result.get("stderr", ""),
+                )
+                return {"merged": True}
+            raise RuntimeError(
+                "gh pr merge failed "
+                f"(rc={result.get('returncode')}, "
+                f"stdout={result.get('stdout', '')!r}, "
+                f"stderr={result.get('stderr', '')!r})"
+            )
+
+        return {"merged": True}
 
 
 STAGE_ACTIVITIES: tuple = (

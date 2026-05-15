@@ -19,9 +19,12 @@ from darkfactory.agents._sdk_common import (
     _drain,
     render_role_user_message,
     repo_summary,
+    role_turn_span,
+    stamp_turn_usage,
 )
 from darkfactory.agents.compose import ComposeState, compose
 from darkfactory.state import ReviewerSummary
+from opentelemetry import trace
 
 ROLE = "reviewer"
 
@@ -97,13 +100,15 @@ def normalize_reviewer_output(raw: dict[str, Any]) -> ReviewerSummary:
 async def run_reviewer(state_slice: dict) -> ReviewerSummary:
     compose_state = ComposeState.from_mapping(state_slice)
     rendered = _render_user_prompt(state_slice)
-    async with compose(
-        ROLE,
-        compose_state,
-        task_id=compose_state.task_id,
-    ) as client:
-        await client.query(rendered)
-        _text, structured, _result = await _drain(client)
+    async with role_turn_span(ROLE):
+        async with compose(
+            ROLE,
+            compose_state,
+            task_id=compose_state.task_id,
+        ) as client:
+            await client.query(rendered)
+            _text, structured, _result = await _drain(client)
+            stamp_turn_usage(trace.get_current_span(), _result)
     if structured is None:
         raise ParseError("Reviewer emitted no structured output")
     return normalize_reviewer_output(structured)
