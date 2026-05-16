@@ -101,7 +101,7 @@ def build_options(
     model: str,
     thinking: bool,
     thinking_budget_tokens: int = _DEFAULT_THINKING_BUDGET_TOKENS,
-    system_prompt: str,
+    system_prompt: str | None,
     allowed_tools: list[str],
     hooks: dict[str, Any],
     mcp_servers: dict[str, Any] | None = None,
@@ -152,7 +152,6 @@ def build_options(
 
     options = ClaudeAgentOptions(
         model=model,
-        system_prompt=system_prompt,
         allowed_tools=allowed_tools,
         disallowed_tools=list(_DISALLOWED_BUILTIN_TOOLS),
         mcp_servers=mcp_servers or {},
@@ -165,4 +164,10 @@ def build_options(
         permission_mode="bypassPermissions",
         output_format=output_format,
     )
+    # Roles that send their prompt as the first user message
+    # (``prompt_as_user_message: true``) pass ``system_prompt=None``: leaving
+    # the SDK field unset keeps the default Claude Code system prompt instead
+    # of overriding it with an empty string.
+    if system_prompt is not None:
+        options.system_prompt = system_prompt
     return options

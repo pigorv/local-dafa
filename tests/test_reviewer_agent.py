@@ -157,7 +157,7 @@ def test_reviewer_client_options_are_hermetic_and_read_only() -> None:
     assert opts.model == "claude-sonnet-4-5-20250929"
     assert opts.thinking is not None
     assert opts.thinking["type"] == "disabled"
-    assert opts.system_prompt == ""
+    assert opts.system_prompt is None
     assert opts.output_format is not None
     assert opts.output_format["type"] == "json_schema"
     assert opts.output_format["schema"]["title"] == "ReviewerSummary"
