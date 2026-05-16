@@ -192,7 +192,7 @@ def _read_agents_md(root: Path) -> str:
 
 def _git_log_oneline(root: Path, n: int = 10) -> list[str]:
     try:
-        from git import Repo, InvalidGitRepositoryError
+        from git import Repo
     except ImportError:
         return []
     try:

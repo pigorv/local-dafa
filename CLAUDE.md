@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Dark Factory is an autonomous coding pipeline that turns a user prompt (or a labeled GitHub issue) into a reviewed pull request. A Temporal workflow drives a sequence of stages — hydrate, triage, planning (PO → Architect → Plan Critic), brief gate, build (Builder + Tester), verify, fixer loop, PR creation, reviewer, merge gate, deterministic merge — where each stage is one or more Claude Agent SDK roles running inside a per-workflow Docker worker container.
 
-The repo is mid-migration from v1 to v2 (see `docs/dark-factory-v2-implementation-plan.md`). The principle is **Planning describes intent; builders discover specifics** — planning emits an `ImplementationBrief` of work packages with verification predicates, and builders/testers use repo tools at execution time to discover concrete edits. Legacy `SpecSlice`/`affected_files` paths still exist as compatibility shims; the migration is tracked in `docs/dark-factory-v2-implementation-tracker.md`.
+The repo is mid-migration from v1 to v2. The principle is **Planning describes intent; builders discover specifics** — planning emits an `ImplementationBrief` of work packages with verification predicates, and builders/testers use repo tools at execution time to discover concrete edits. Legacy `SpecSlice`/`affected_files` paths still exist as compatibility shims.
 
 ## Common commands
 
@@ -105,4 +105,4 @@ The bundled `claude` CLI emits its own native spans (`claude_code.interaction`, 
 - **Brief gate vs merge gate.** Brief gate uses `approve_brief` / `revise_brief` / `reject_brief`; merge gate uses `approve_merge` / `reject_merge` / `trigger_fix` / `trigger_rebuild`. The legacy `approve_gate` / `reject_gate` aliases route by `_pending_gate`; prefer the dedicated update method on new code.
 - **GitHub state lives in labels.** The issue workflow drives a strict `df:*` label lifecycle through `swap_state_label_activity`; the schedule's `IssuePollRequest.label` is the entry filter. Comment-driven approval signals are detected by `detect_approval_signal_activity` (see `runtime/approval.py`).
 - **Compatibility shims are intentional.** `spec_adjustment_stage`, `SpecSlice`, `affected_files`, `VERIFY_RETRY_CAP` etc. exist to keep older tests green during the v2 migration. Prefer the v2 path in new code; remove a shim only when its callers and tests are gone.
-- **`ARCHITECTURE.md` is referenced in code comments but not present in the tree.** Treat those references as historical pointers; the live design is in `docs/dark-factory-v2-implementation-plan.md` plus this file.
+- **`ARCHITECTURE.md` is referenced in code comments but not present in the tree.** Treat those references as historical pointers; the live design lives in this file (`CLAUDE.md`).
