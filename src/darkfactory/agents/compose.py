@@ -110,7 +110,7 @@ def compose(
 
     prompt_path = resolve_prompt_path(manifest.llm.prompt_path)
     system_prompt = (
-        "" if manifest.llm.prompt_as_user_message
+        None if manifest.llm.prompt_as_user_message
         else prompt_path.read_text(encoding="utf-8")
     )
     hooks = _materialize_hooks(role, manifest, state_slice, runtime_task_id)
