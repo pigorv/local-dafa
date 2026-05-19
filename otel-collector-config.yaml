@@ -15,8 +15,10 @@ processors:
   # two spans in distinct OTel traces stamped with identical `langfuse.trace.id`
   # still landed as two separate Langfuse traces).
   #
-  # We derive a deterministic 32-char hex from whichever workflow id source
-  # the span carries, then `set(trace_id.string, ...)`. The fallback chain:
+  # We derive a deterministic 32-char hex from the workflow id source AND
+  # the Temporal run id source the span carries (so one Langfuse trace ==
+  # one Temporal run, not one workflow id), then `set(trace_id.string,...)`.
+  # The workflow-id fallback chain:
   #   1. attributes["temporalWorkflowID"] — set by temporalio's TracingInterceptor
   #      on every workflow / activity span on the Python side.
   #   2. attributes["langfuse.session.id"] — stamped by SessionStampingSpanProcessor
@@ -35,24 +37,33 @@ processors:
           - set(attributes["darkfactory._wf_src"], attributes["temporalWorkflowID"]) where attributes["temporalWorkflowID"] != nil
           - set(attributes["darkfactory._wf_src"], attributes["langfuse.session.id"]) where attributes["darkfactory._wf_src"] == nil and attributes["langfuse.session.id"] != nil
           - set(attributes["darkfactory._wf_src"], resource.attributes["darkfactory.workflow_id"]) where attributes["darkfactory._wf_src"] == nil and resource.attributes["darkfactory.workflow_id"] != nil
-          - set(trace_id.string, Substring(SHA256(attributes["darkfactory._wf_src"]), 0, 32)) where attributes["darkfactory._wf_src"] != nil
-          # Stamp langfuse.trace.name on EVERY span in the unified trace.
-          # Langfuse OTLP last-write-wins on trace name; without this, late-
-          # arriving CLI spans (claude_code.*) overwrite the trace name with
-          # their own. Fallback order:
-          #   1. `temporal.workflow.type` span attribute — present on every
-          #      Python-side activity span (set by _stamp_temporal_activity_attrs)
-          #      and on the RunWorkflow:* root span (set by SessionStampingSpanProcessor).
-          #   2. `resource.darkfactory.workflow_type` — set by setup_worker_activity
-          #      on the worker container's OTEL_RESOURCE_ATTRIBUTES, so the bundled
-          #      `claude` CLI's native spans (which don't speak Temporal) get
-          #      labelled too.
-          #   3. Constant `DarkFactoryWorkflow` for anything else, so the trace
-          #      always has a name and last-write-wins can't blank it.
-          - set(attributes["langfuse.trace.name"], attributes["temporal.workflow.type"]) where attributes["darkfactory._wf_src"] != nil and attributes["temporal.workflow.type"] != nil
-          - set(attributes["langfuse.trace.name"], resource.attributes["darkfactory.workflow_type"]) where attributes["darkfactory._wf_src"] != nil and attributes["langfuse.trace.name"] == nil and resource.attributes["darkfactory.workflow_type"] != nil
-          - set(attributes["langfuse.trace.name"], "DarkFactoryWorkflow") where attributes["darkfactory._wf_src"] != nil and attributes["langfuse.trace.name"] == nil
+          # Run-id source. Temporal workflow/activity spans carry
+          # `temporalRunID` (TracingInterceptor); non-Temporal Python child
+          # spans get it from bootstrap.SessionStampingSpanProcessor (bound
+          # per activity); the bundled `claude` CLI subprocess gets it as the
+          # resource attr `darkfactory.workflow_run_id` (llm_factory).
+          - set(attributes["darkfactory._run_src"], attributes["temporalRunID"]) where attributes["temporalRunID"] != nil
+          - set(attributes["darkfactory._run_src"], resource.attributes["darkfactory.workflow_run_id"]) where attributes["darkfactory._run_src"] == nil and resource.attributes["darkfactory.workflow_run_id"] != nil
+          # Trace id is UNIQUE PER TEMPORAL RUN: hash(workflow_id + "/" +
+          # run_id). Re-running the same workflow id (common while testing)
+          # yields a fresh trace instead of appending to the first run's
+          # trace. Spans that cannot resolve a run id fall back to the
+          # workflow-id-only hash so they still coalesce somewhere rather
+          # than keeping a random per-process OTel trace id.
+          - set(trace_id.string, Substring(SHA256(Concat([attributes["darkfactory._wf_src"], attributes["darkfactory._run_src"]], "/")), 0, 32)) where attributes["darkfactory._wf_src"] != nil and attributes["darkfactory._run_src"] != nil
+          - set(trace_id.string, Substring(SHA256(attributes["darkfactory._wf_src"]), 0, 32)) where attributes["darkfactory._wf_src"] != nil and attributes["darkfactory._run_src"] == nil
+          # Trace name = "<workflow id>/<run id>" so re-runs are
+          # distinguishable in the Langfuse trace list. Set on EVERY span
+          # (Langfuse OTLP last-write-wins on trace name; the value is
+          # identical for all spans in one run so it stays stable). Falls
+          # back to the workflow id alone when no run id is resolvable.
+          # langfuse.session.id stays = workflow id (set by transform/langfuse
+          # + SessionStampingSpanProcessor), so all runs of one workflow id
+          # still group under a single Langfuse Session.
+          - set(attributes["langfuse.trace.name"], Concat([attributes["darkfactory._wf_src"], attributes["darkfactory._run_src"]], "/")) where attributes["darkfactory._wf_src"] != nil and attributes["darkfactory._run_src"] != nil
+          - set(attributes["langfuse.trace.name"], attributes["darkfactory._wf_src"]) where attributes["darkfactory._wf_src"] != nil and attributes["darkfactory._run_src"] == nil
           - delete_key(attributes, "darkfactory._wf_src")
+          - delete_key(attributes, "darkfactory._run_src")
 
           # Re-parent orphan top-level claude_code.* spans onto the Python
           # span that spawned the SDK subprocess. The CLI emits `tool` and

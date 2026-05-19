@@ -18,6 +18,7 @@ from darkfactory.agents.registry import (
     set_default_registry,
 )
 from darkfactory.bootstrap import init_observability
+from darkfactory.sdk_diagnostics import install_argv_logging
 from darkfactory.runtime.activities import (
     STAGE_ACTIVITIES,
     mark_issue_done_activity,
@@ -56,6 +57,7 @@ async def main() -> None:
     if task_queue.startswith(AGENT_TASK_QUEUE_PREFIX):
         os.environ.setdefault("DARKFACTORY_WF_ID", task_queue[len(AGENT_TASK_QUEUE_PREFIX):])
     init_observability("darkfactory-worker")
+    install_argv_logging()  # no-op unless DARKFACTORY_LOG_SDK_ARGV is set
     _load_manifest_registry()
     address = os.environ.get("TEMPORAL_ADDRESS", DEFAULT_TEMPORAL_ADDRESS)
     tracing_interceptor = TracingInterceptor()

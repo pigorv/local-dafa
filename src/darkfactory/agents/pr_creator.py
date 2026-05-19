@@ -2,9 +2,11 @@
 
 The activity wrapper deterministically checks for an existing PR before
 this role runs, so the agent only ever needs to push the feature branch
-and open a new PR. The role can read/search the repo and can run a
-narrow set of git/gh commands through ``sandbox_bash``; it cannot edit
-files, merge, or use the built-in Bash tool.
+and open a new PR. The role can read/search the repo and runs ``git`` /
+``gh`` through the built-in ``Bash`` tool, argv-gated by
+``hooks/permission_gate.py`` to a tight ``[git, gh]`` allowlist (with
+``gh issue`` and ``gh pr merge`` denied); it cannot edit files or
+merge.
 
 Output is a structured ``PRCreatorOutput`` enforced by the SDK's
 ``output_format``; the activity translates that into the ``pr_url``

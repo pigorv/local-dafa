@@ -20,9 +20,10 @@ from darkfactory.agents.registry import (
     role_summaries,
 )
 from darkfactory.bootstrap import init_observability
+from darkfactory.eval.runner import WorkflowRun
 from darkfactory.runtime import schedule_admin
 from darkfactory.runtime.workflow import DarkFactoryWorkflow
-from darkfactory.state import RunRequest
+from darkfactory.state import GateDecision, RunRequest, RunResult
 
 
 DEFAULT_TEMPORAL_ADDRESS = "localhost:7233"
@@ -43,6 +44,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--wait", dest="wait", action="store_true", default=True
     )
     run_parser.add_argument("--no-wait", dest="wait", action="store_false")
+
+    eval_parser = subparsers.add_parser("eval")
+    eval_parser.add_argument("benchmark", type=Path)
+    eval_parser.add_argument("--dataset-name", default="benchmark-prod")
+    eval_parser.add_argument("--tag", action="append", default=[])
+    eval_parser.add_argument("--run-name", default=None)
+    eval_parser.add_argument("--dry-run", action="store_true")
+    eval_parser.add_argument("--no-langfuse", action="store_true")
+    eval_parser.add_argument("--keep-prs", action="store_true")
 
     schedule_parser = subparsers.add_parser("schedule")
     schedule_subparsers = schedule_parser.add_subparsers(
@@ -120,6 +130,78 @@ async def _connect_client() -> Client:
     )
 
 
+async def _wait_for_result_with_eval_gates(handle) -> RunResult:
+    result_task = asyncio.create_task(handle.result())
+    approved_brief = False
+    rejected_merge = False
+    while not result_task.done():
+        summary = await handle.query(DarkFactoryWorkflow.current_state_summary)
+        pending_gate = summary.get("pending_gate")
+        if pending_gate == "brief" and not approved_brief:
+            await handle.execute_update(
+                DarkFactoryWorkflow.approve_brief,
+                GateDecision(approved=True, reason="benchmark auto-approved brief"),
+            )
+            approved_brief = True
+        elif pending_gate == "merge" and not rejected_merge:
+            await handle.execute_update(
+                DarkFactoryWorkflow.reject_merge,
+                GateDecision(
+                    approved=False,
+                    reason="benchmark stopped before merge",
+                ),
+            )
+            rejected_merge = True
+        await asyncio.sleep(2)
+    return await result_task
+
+
+async def _start_workflow_and_wait(
+    *,
+    prompt: str,
+    repo: Path,
+    workflow_id: str | None = None,
+    wait: bool = True,
+    auto_eval_gates: bool = False,
+) -> WorkflowRun:
+    workflow_id = workflow_id or f"darkfactory-{uuid.uuid4().hex}"
+    request = RunRequest(
+        repo_url=str(repo.resolve()),
+        repo_path="/workspace",
+        user_request=prompt,
+        model_profile=os.environ.get("LLM_MODEL_PROFILE"),
+    )
+    tracer = trace.get_tracer("darkfactory.cli")
+    with tracer.start_as_current_span("darkfactory.cli.run") as span:
+        span.set_attribute("langfuse.session.id", workflow_id)
+        span.set_attribute("session.id", workflow_id)
+        span.set_attribute("workflow.id", workflow_id)
+        client = await _connect_client()
+        handle = await client.start_workflow(
+            DarkFactoryWorkflow.run,
+            request,
+            id=workflow_id,
+            task_queue=SUPERVISOR_TASK_QUEUE,
+        )
+        workflow_run_id = handle.first_execution_run_id
+        if workflow_run_id:
+            span.set_attribute("temporalRunID", workflow_run_id)
+        if not wait:
+            return WorkflowRun(
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
+            )
+        if auto_eval_gates:
+            result = await _wait_for_result_with_eval_gates(handle)
+        else:
+            result = await handle.result()
+    return WorkflowRun(
+        workflow_id=workflow_id,
+        workflow_run_id=workflow_run_id,
+        result=result,
+    )
+
+
 async def run_command(args: argparse.Namespace) -> int:
     # Init observability so the CLI process has a TracerProvider; the
     # TracingInterceptor on the client then has an active span context to
@@ -157,34 +239,40 @@ async def run_command(args: argparse.Namespace) -> int:
         raise SystemExit("darkfactory run requires a prompt unless --hello-worker is set")
 
     workflow_id = args.workflow_id or f"darkfactory-{uuid.uuid4().hex}"
-    repo = args.repo.resolve()
-    request = RunRequest(
-        repo_url=str(repo),
-        repo_path="/workspace",
-        user_request=args.prompt,
-        model_profile=os.environ.get("LLM_MODEL_PROFILE"),
+    run = await _start_workflow_and_wait(
+        prompt=args.prompt,
+        repo=args.repo,
+        workflow_id=workflow_id,
+        wait=args.wait,
     )
-    with tracer.start_as_current_span("darkfactory.cli.run") as span:
-        span.set_attribute("langfuse.session.id", workflow_id)
-        span.set_attribute("session.id", workflow_id)
-        span.set_attribute("workflow.id", workflow_id)
-        client = await _connect_client()
-        handle = await client.start_workflow(
-            DarkFactoryWorkflow.run,
-            request,
-            id=workflow_id,
-            task_queue=SUPERVISOR_TASK_QUEUE,
-        )
-        print(f"workflow_id={workflow_id}")
-
-        if not args.wait:
-            _flush_traces()
-            return 0
-
-        result = await handle.result()
     _flush_traces()
-    print(result)
+    print(f"workflow_id={run.workflow_id}")
+    if args.wait and run.result is not None:
+        print(run.result)
     return 0
+
+
+async def eval_command(args: argparse.Namespace) -> int:
+    from darkfactory.eval.runner import load_dataset, run as run_eval
+
+    cases = load_dataset(args.benchmark)
+    selected = cases
+    if args.tag:
+        wanted = set(args.tag)
+        selected = [
+            case for case in cases if wanted.intersection(case.get("tags") or [])
+        ]
+    if args.dry_run:
+        print(f"loaded {len(selected)} cases; schema OK")
+        return 0
+    return await run_eval(
+        args.benchmark,
+        dataset_name=args.dataset_name,
+        tag_filter=args.tag,
+        run_name=args.run_name,
+        write_langfuse=not args.no_langfuse,
+        close_prs=not args.keep_prs,
+    )
 
 
 async def schedule_command(args: argparse.Namespace) -> int:
@@ -322,7 +410,11 @@ def _roles_list() -> int:
         print(f"role: {summary.role}")
         print(f"model: {summary.model}")
         print(f"prompt: {summary.prompt_path}")
-        print(f"allowed_tools: {summary.allowed_tool_count}")
+        allowed_tools_display = (
+            "all" if summary.allowed_tool_count < 0
+            else summary.allowed_tool_count
+        )
+        print(f"allowed_tools: {allowed_tools_display}")
         print(f"hooks: {hooks}")
         print(f"mcp: {mcp}")
         print(f"manifest_sha: {summary.manifest_sha}")
@@ -345,6 +437,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "run":
         return asyncio.run(run_command(args))
+    if args.command == "eval":
+        return asyncio.run(eval_command(args))
     if args.command == "schedule":
         return asyncio.run(schedule_command(args))
     if args.command == "roles":

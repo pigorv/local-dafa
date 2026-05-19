@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from claude_agent_sdk import ClaudeSDKClient, HookMatcher
 from claude_agent_sdk.types import (
@@ -24,7 +24,7 @@ from darkfactory.agents.registry import (
 )
 from darkfactory.hooks.permission_gate import make_permission_gate
 from darkfactory.llm_factory import build_options
-from darkfactory.tools.server import build_mcp_server
+from darkfactory.sdk_diagnostics import log_resolved_options
 
 
 @dataclass(slots=True)
@@ -114,9 +114,12 @@ def compose(
         None if manifest.llm.prompt_as_user_message
         else prompt_path.read_text(encoding="utf-8")
     )
+    tools_value = _resolve_tools(role, manifest)
     hooks = _materialize_hooks(role, manifest, state_slice, runtime_task_id)
     mcp_servers = _materialize_mcp_servers(manifest.mcp, runtime_task_id)
-    can_use_tool = _materialize_permission_gate(role, manifest, state_slice, registry)
+    can_use_tool = _materialize_permission_gate(
+        role, manifest, state_slice, registry, tools_value
+    )
     output_format = _load_output_format(manifest.llm.structured_output)
 
     options = build_options(
@@ -125,40 +128,79 @@ def compose(
         thinking=manifest.llm.thinking.enabled,
         thinking_budget_tokens=manifest.llm.thinking.budget_tokens or 4096,
         system_prompt=system_prompt,
-        allowed_tools=_resolve_allowed_tools(role, manifest),
+        allowed_tools=_resolve_allowed_tools(role, manifest, tools_value),
         hooks=hooks,
         mcp_servers=mcp_servers,
         can_use_tool=can_use_tool,
         path_guard_state=_path_guard_state(state_slice),
         cwd=overrides.cwd or "/workspace",
         output_format=output_format,
-        skills=_resolve_skills(role, manifest),
+        skills=_resolve_skills(role, manifest, tools_value),
+        # "all" resolves to an empty allowed_tools, so the Edit/Write
+        # path guard can no longer self-trigger off the concrete list —
+        # force it on (Edit/Write are reachable under bypassPermissions
+        # unless explicitly in ``disallowed``).
+        force_path_guard=(tools_value == "all"),
     )
 
     options.disallowed_tools = list(manifest.tools.disallowed)
     _apply_in_process_overrides(options, manifest, overrides)
     _stamp_manifest_attrs(registry, role, manifest, prompt_path)
+    log_resolved_options(role, options)
     return ClaudeSDKClient(options=options)
 
 
-def _resolve_allowed_tools(role: str, manifest: RoleManifest) -> list[str]:
-    """Assemble the role's effective ``allowed_tools`` list.
+def _resolve_tools(
+    role: str, manifest: RoleManifest
+) -> Literal["all"] | list[str]:
+    """Resolve the role's tool allowlist, applying the env override.
 
-    Starts from ``manifest.tools.allowed``. Then appends project-MCP
-    allowlist patterns sourced from ``manifest.tools.project_mcp_allowed``
-    (default ``["*"]``) — overridable per role at runtime with
+    Returns ``"all"`` (pure-yolo: any tool the CLI exposes) or an
+    explicit list of tool names (``[]`` == zero-tool). ``manifest.tools.
+    allowed`` is the default; ``LLM_<ROLE>_TOOLS`` overrides it at
+    compose time: ``"all"`` (case-insensitive) → ``"all"``,
+    ``"name1,name2"`` → that list, empty string → ``[]`` (force
+    zero-tool). Mirrors :func:`_resolve_skills` /
+    :func:`_project_mcp_entries`.
+    """
+    raw = os.getenv(f"LLM_{role.upper()}_TOOLS")
+    if raw is None:
+        return manifest.tools.allowed
+    if raw.strip().lower() == "all":
+        return "all"
+    return [entry.strip() for entry in raw.split(",") if entry.strip()]
+
+
+def _resolve_allowed_tools(
+    role: str,
+    manifest: RoleManifest,
+    tools_value: Literal["all"] | list[str],
+) -> list[str]:
+    """Assemble the role's effective SDK ``allowed_tools`` list.
+
+    ``tools_value == "all"`` is pure-yolo: it resolves to an *empty*
+    list so the SDK emits no ``--allowedTools`` flag. Under
+    ``permission_mode="bypassPermissions"`` every tool the CLI exposes
+    (including project ``.mcp.json`` servers) is already auto-approved,
+    so the project-MCP allowlist expansion is moot and skipped — the
+    real guardrails for ``"all"`` roles are ``disallowed`` and the
+    ``can_use_tool`` argv gate, both of which compose force-installs.
+
+    Otherwise ``tools_value`` is an explicit list: project-MCP allowlist
+    patterns from ``manifest.tools.project_mcp_allowed`` (default
+    ``["*"]``) are appended, overridable per role at runtime with
     ``LLM_<ROLE>_PROJECT_MCP`` (``"*"`` for all servers, ``"name1,name2"``
     for an explicit list, empty string to disable). Server names expand
     to ``mcp__<name>__*``; the literal ``"*"`` entry expands to
-    ``mcp__*``. Duplicates are dropped. Roles that declare
-    ``tools.allowed: []`` (plan_critic, verifier_semantic) are zero-tool
-    by design and short-circuit before expansion — an empty manifest
-    allowlist is treated as a deliberate "no tools" statement, not
-    "expand from nothing". Project skills are gated separately via
-    :func:`_resolve_skills` and the SDK's ``skills`` option; they do not
-    appear in ``allowed_tools``.
+    ``mcp__*``. Duplicates are dropped. An empty list (plan_critic,
+    verifier_semantic, or ``LLM_<ROLE>_TOOLS=""``) is a deliberate "no
+    tools" statement and short-circuits before expansion. Project skills
+    are gated separately via :func:`_resolve_skills` and the SDK's
+    ``skills`` option; they do not appear in ``allowed_tools``.
     """
-    allowed = list(manifest.tools.allowed)
+    if tools_value == "all":
+        return []
+    allowed = list(tools_value)
     if not allowed:
         return allowed
     patterns = _expand_project_mcp_patterns(_project_mcp_entries(role, manifest))
@@ -187,15 +229,22 @@ def _expand_project_mcp_patterns(entries: list[str]) -> list[str]:
     return out
 
 
-def _resolve_skills(role: str, manifest: RoleManifest) -> str | list[str] | None:
+def _resolve_skills(
+    role: str,
+    manifest: RoleManifest,
+    tools_value: Literal["all"] | list[str],
+) -> str | list[str] | None:
     """Resolve which project skills should be enabled for the role.
 
     Returns ``"all"`` (every discovered skill), a list of skill names
     (restrict to those), or ``None`` (no skills). Zero-tool roles always
-    get ``None``. ``LLM_<ROLE>_SKILLS`` overrides the manifest:
-    ``"all"`` → all, ``"name1,name2"`` → list, empty string → disabled.
+    get ``None`` — keyed off the *resolved* tool value so that
+    ``LLM_<ROLE>_TOOLS=""`` disables skills the same way a manifest
+    ``allowed: []`` does. ``tools_value == "all"`` is not zero-tool.
+    ``LLM_<ROLE>_SKILLS`` overrides the manifest: ``"all"`` → all,
+    ``"name1,name2"`` → list, empty string → disabled.
     """
-    if not manifest.tools.allowed:
+    if tools_value != "all" and not tools_value:
         return None
     raw = os.getenv(f"LLM_{role.upper()}_SKILLS")
     if raw is None:
@@ -223,24 +272,38 @@ def _path_guard_state(state_slice: ComposeState) -> Mapping[str, bool]:
     }
 
 
+def _bash_reachable(
+    manifest: RoleManifest, tools_value: Literal["all"] | list[str]
+) -> bool:
+    """Whether the role can reach a shell via the built-in ``Bash`` tool.
+
+    ``"all"`` exposes every tool (Bash included) unless ``Bash`` is
+    explicitly in ``disallowed``; an explicit list reaches Bash only when
+    it lists ``Bash`` (and it is not also disallowed).
+    """
+    if "Bash" in manifest.tools.disallowed:
+        return False
+    if tools_value == "all":
+        return True
+    return "Bash" in tools_value
+
+
 def _materialize_permission_gate(
     role: str,
     manifest: RoleManifest,
     state_slice: ComposeState,
     registry: Registry,
+    tools_value: Literal["all"] | list[str],
 ):
-    # The gate is installed whenever the role can reach a shell — either
-    # the built-in ``Bash`` tool, the ``sandbox_bash`` MCP tool, or any
-    # MCP server (since they all expose tool surfaces that can route
-    # through ``can_use_tool``). A non-empty ``argv_allowlist`` or
-    # ``argv_denylist`` also forces installation. Reasoning-only roles
-    # (PO, Architect) with none of these short-circuit to ``None``.
+    # The gate is installed whenever the role can reach a shell via the
+    # built-in ``Bash`` tool, or declares a non-empty ``argv_allowlist``
+    # / ``argv_denylist``. Reasoning-only roles (PO, Architect) with none
+    # of these short-circuit to ``None``. ``allowed: "all"`` reaches Bash,
+    # so the argv gate is force-installed for yolo roles.
     if not (
         manifest.tools.argv_allowlist
         or manifest.tools.argv_denylist
-        or "Bash" in manifest.tools.allowed
-        or "sandbox_bash" in manifest.tools.allowed
-        or manifest.mcp
+        or _bash_reachable(manifest, tools_value)
     ):
         return None
     return make_permission_gate(
@@ -253,12 +316,21 @@ def _materialize_permission_gate(
 
 
 def _materialize_mcp_servers(names: list[str], task_id: str) -> dict[str, Any]:
-    servers: dict[str, Any] = {}
-    for name in names:
-        if name != "darkfactory":
-            raise ValueError(f"unknown MCP server declared in manifest: {name!r}")
-        servers[name] = build_mcp_server(task_id)
-    return servers
+    """Resolve manifest-declared in-process MCP servers.
+
+    The lone in-process server (``darkfactory`` / ``sandbox_bash``) was
+    removed once every role moved to the built-in ``Bash`` tool, so no
+    role declares an in-process MCP server anymore. An empty list yields
+    no servers; any declared name is a misconfiguration — project MCP
+    servers are loaded from the target repo's ``.mcp.json`` via
+    ``setting_sources=["project"]``, not from this manifest field.
+    """
+    if names:
+        raise ValueError(
+            "in-process MCP servers were removed; declare project MCP "
+            f"servers via the target repo's .mcp.json instead: {names!r}"
+        )
+    return {}
 
 
 def _materialize_hooks(

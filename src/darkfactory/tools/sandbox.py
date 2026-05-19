@@ -3,9 +3,10 @@
 Runs commands directly inside the worker container's filesystem. The worker
 container itself is the isolation boundary (cap_drop, no-new-privileges,
 pids_limit, mem_limit, network); there is no second inner container. The
-shared `{returncode, stdout, stderr, timed_out}` shape, the per-task
-registry in `tools/shell.py`, and the MCP `sandbox_bash` tool body are all
-unchanged so callers (parsers, hooks, agents) need no edits.
+shared `{returncode, stdout, stderr, timed_out}` shape and the per-task
+registry in `tools/shell.py` are consumed deterministically by the build /
+verify subgraphs and repo-touching activities (e.g. the PR-existence
+check); agent shell access goes through the built-in `Bash` tool instead.
 """
 from __future__ import annotations
 

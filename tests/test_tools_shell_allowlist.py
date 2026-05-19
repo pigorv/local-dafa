@@ -1,10 +1,12 @@
 """Unit tests for permission_gate argv allowlist handling.
 
 These tests exercise ``make_permission_gate`` behaviour, not a specific
-role's manifest. Builder and Tester both run in pure-denylist mode
-(empty argv_allowlist, ``git push`` in argv_denylist); the synthetic
-``WORKER_ALLOWLIST`` here is what Fixer / PR Creator use and lets the
-allowlist branch still be exercised in isolation.
+role's manifest. The gate guards a single surface — the built-in
+``Bash`` tool (``tool_input["command"]``). Builder and Tester run in
+pure-denylist mode (empty argv_allowlist, ``git push`` in
+argv_denylist); the synthetic ``WORKER_ALLOWLIST`` here mirrors the
+tight allowlist PR Creator uses and lets the allowlist branch still be
+exercised in isolation.
 """
 from __future__ import annotations
 
@@ -48,14 +50,13 @@ def test_forbidden_tokens_preserved():
         assert tok in FORBIDDEN_TOKENS
 
 
+# ---------- built-in Bash enforcement ----------
+
+
 def test_mvn_test_q_passes_permission_gate():
     gate = make_permission_gate("builder", WORKER_ALLOWLIST)
     result = _run(
-        gate(
-            "sandbox_bash",
-            {"argv": ["mvn", "test", "-q"]},
-            ToolPermissionContext(),
-        )
+        gate("Bash", {"command": "mvn test -q"}, ToolPermissionContext())
     )
     assert isinstance(result, PermissionResultAllow)
 
@@ -64,8 +65,8 @@ def test_mvn_chain_with_rm_rejected():
     gate = make_permission_gate("builder", WORKER_ALLOWLIST)
     result = _run(
         gate(
-            "sandbox_bash",
-            {"argv": ["mvn", "test", "&&", "rm", "-rf", "/"]},
+            "Bash",
+            {"command": "mvn test && rm -rf /"},
             ToolPermissionContext(),
         )
     )
@@ -76,26 +77,10 @@ def test_mvn_chain_with_rm_rejected():
 def test_binary_outside_allowlist_rejected():
     gate = make_permission_gate("builder", WORKER_ALLOWLIST)
     result = _run(
-        gate(
-            "sandbox_bash",
-            {"argv": ["rm", "-rf", "/"]},
-            ToolPermissionContext(),
-        )
+        gate("Bash", {"command": "rm -rf /"}, ToolPermissionContext())
     )
     assert isinstance(result, PermissionResultDeny)
     assert "allowlist" in result.message
-
-
-def test_empty_argv_rejected():
-    gate = make_permission_gate("builder", WORKER_ALLOWLIST)
-    result = _run(
-        gate("sandbox_bash", {"argv": []}, ToolPermissionContext())
-    )
-    assert isinstance(result, PermissionResultDeny)
-    assert result.message == "argv must be non-empty"
-
-
-# ---------- built-in Bash enforcement ----------
 
 
 def test_bash_allows_mvn_compile():
@@ -257,15 +242,15 @@ def test_role_command_policy_for_push_and_pr_create():
 
     worker_push = _run(
         worker_gate(
-            "sandbox_bash",
-            {"argv": ["git", "push", "origin", "agent/wf-1"]},
+            "Bash",
+            {"command": "git push origin agent/wf-1"},
             ToolPermissionContext(),
         )
     )
     pr_create = _run(
         pr_gate(
-            "sandbox_bash",
-            {"argv": ["gh", "pr", "create", "--title", "T"]},
+            "Bash",
+            {"command": "gh pr create --title T"},
             ToolPermissionContext(),
         )
     )

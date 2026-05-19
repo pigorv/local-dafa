@@ -41,13 +41,13 @@ def _manifest_payload(prompt_path: Path, *, role: str = "hooked") -> dict[str, A
             "prompt_path": str(prompt_path),
         },
         "tools": {
-            "allowed": ["Read", "Edit", "sandbox_bash"],
+            "allowed": ["Read", "Edit", "Bash"],
             "disallowed": [],
             "argv_allowlist": ["cat"],
             "role_owned_argv_prefixes": [],
             "edit_path_allowlist": [],
         },
-        "mcp": ["darkfactory"],
+        "mcp": [],
         "hooks": [
             {
                 "event": "PreToolUse",
@@ -92,7 +92,14 @@ def test_compose_noop_options_mirror_manifest() -> None:
     opts = client.options
 
     assert opts.model == manifest.llm.model
-    assert opts.system_prompt == prompt
+    # A role that supplies its own prompt text (no prompt_as_user_message)
+    # gets it appended onto the Claude Code preset, so CLAUDE.md/skills
+    # scaffolding survives instead of being wiped by a bare --system-prompt.
+    assert opts.system_prompt == {
+        "type": "preset",
+        "preset": "claude_code",
+        "append": prompt,
+    }
     # Default project_mcp_allowed=["*"] appends ``mcp__*`` to the
     # manifest's allowed list at compose time.
     assert list(opts.allowed_tools or []) == [*manifest.tools.allowed, "mcp__*"]
@@ -107,7 +114,7 @@ def test_compose_noop_options_mirror_manifest() -> None:
     assert opts.thinking is not None and opts.thinking["type"] == "disabled"
 
 
-def test_compose_materializes_hooks_mcp_permission_gate_and_state(
+def test_compose_materializes_hooks_permission_gate_and_state(
     tmp_path: Path,
 ) -> None:
     prompt = tmp_path / "hooked.md"
@@ -130,7 +137,9 @@ def test_compose_materializes_hooks_mcp_permission_gate_and_state(
     )
     opts = client.options
 
-    assert "darkfactory" in opts.mcp_servers
+    # In-process MCP servers were removed; the gate is still installed
+    # because the role declares Bash + a non-empty argv_allowlist.
+    assert (opts.mcp_servers or {}) == {}
     assert callable(opts.can_use_tool)
     assert opts.thinking is not None
     assert opts.thinking["type"] == "enabled"
@@ -185,6 +194,7 @@ def _mcp_manifest_payload(
     role: str = "mcptest",
     project_mcp_allowed: list[str] | None = None,
     skills: str | list[str] | None = None,
+    allowed: str | list[str] | None = None,
 ) -> dict[str, Any]:
     """Minimal manifest used to exercise the project_mcp_allowed knob."""
     payload: dict[str, Any] = {
@@ -213,7 +223,113 @@ def _mcp_manifest_payload(
         payload["tools"]["project_mcp_allowed"] = project_mcp_allowed
     if skills is not None:
         payload["tools"]["skills"] = skills
+    if allowed is not None:
+        payload["tools"]["allowed"] = allowed
     return payload
+
+
+def _compose_tools_role(
+    tmp_path: Path,
+    *,
+    allowed: str | list[str],
+    role: str = "toolstest",
+) -> Any:
+    """Compose a role with the given ``tools.allowed`` and return options."""
+    prompt = tmp_path / "tools.md"
+    prompt.write_text("tools knob prompt", encoding="utf-8")
+    manifests_dir = tmp_path / "manifests"
+    _write_manifest(
+        manifests_dir,
+        _mcp_manifest_payload(prompt, role=role, allowed=allowed),
+    )
+    registry = load_registry(manifests_dir)
+    client = compose(
+        role,
+        ComposeState(task_id="task-tools"),
+        task_id="task-tools",
+        overrides=ComposeOverrides(registry=registry),
+    )
+    return client.options
+
+
+def _pre_tool_hook_names(options: Any) -> list[str]:
+    hooks = options.hooks or {}
+    matchers = hooks.get("PreToolUse") or []
+    if not matchers:
+        return []
+    return [hook.__name__ for hook in matchers[0].hooks]
+
+
+def test_tools_all_sentinel_is_pure_yolo(tmp_path: Path) -> None:
+    """``allowed: "all"`` -> empty allowed_tools, no project-MCP expansion,
+    but the Bash gate and Edit/Write path guard are force-installed."""
+    opts = _compose_tools_role(tmp_path, allowed="all")
+
+    assert list(opts.allowed_tools or []) == []
+    assert not any(
+        str(t).startswith("mcp__") for t in (opts.allowed_tools or [])
+    )
+    assert callable(opts.can_use_tool)
+    assert _pre_tool_hook_names(opts) == ["path_guard_hook"]
+    # "all" is not zero-tool, so skills still resolve (manifest default).
+    assert opts.skills == "all"
+
+
+def test_tools_all_sentinel_disallowed_bash_skips_gate(
+    tmp_path: Path,
+) -> None:
+    """``allowed: "all"`` + ``disallowed: [Bash]`` -> Bash unreachable, so
+    the argv gate is not installed (path guard still is)."""
+    prompt = tmp_path / "tools.md"
+    prompt.write_text("p", encoding="utf-8")
+    manifests_dir = tmp_path / "manifests"
+    payload = _mcp_manifest_payload(prompt, role="nobash", allowed="all")
+    payload["tools"]["disallowed"] = ["Bash"]
+    _write_manifest(manifests_dir, payload)
+    registry = load_registry(manifests_dir)
+    client = compose(
+        "nobash",
+        ComposeState(task_id="task-tools"),
+        task_id="task-tools",
+        overrides=ComposeOverrides(registry=registry),
+    )
+
+    assert client.options.can_use_tool is None
+    assert _pre_tool_hook_names(client.options) == ["path_guard_hook"]
+
+
+def test_tools_env_override_all_turns_list_role_yolo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LLM_TOOLSTEST_TOOLS", "all")
+    opts = _compose_tools_role(tmp_path, allowed=["Read", "Grep", "Glob"])
+
+    assert list(opts.allowed_tools or []) == []
+    assert callable(opts.can_use_tool)
+    assert _pre_tool_hook_names(opts) == ["path_guard_hook"]
+
+
+def test_tools_env_override_list_overrides_all_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LLM_TOOLSTEST_TOOLS", "Read,Grep")
+    opts = _compose_tools_role(tmp_path, allowed="all")
+
+    # Back on the explicit-list path: project-MCP wildcard is appended.
+    assert list(opts.allowed_tools or []) == ["Read", "Grep", "mcp__*"]
+
+
+def test_tools_empty_env_forces_zero_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LLM_TOOLSTEST_TOOLS", "")
+    opts = _compose_tools_role(tmp_path, allowed="all")
+
+    assert list(opts.allowed_tools or []) == []
+    # Empty resolved list is zero-tool: skills disabled, no gate, no guard.
+    assert opts.skills is None
+    assert opts.can_use_tool is None
+    assert _pre_tool_hook_names(opts) == []
 
 
 def _compose_mcp_role(

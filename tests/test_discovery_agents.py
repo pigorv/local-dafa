@@ -128,7 +128,8 @@ def test_po_client_options_allow_read_only_tools() -> None:
     assert opts.setting_sources == ["project"]
     assert opts.skills == "all"
     assert opts.model == "claude-haiku-4-5-20251001"  # po default per ARCH §9
-    assert opts.system_prompt is None  # prompt is the user message; default kept
+    # prompt is the user message; Claude Code default preserved via preset
+    assert opts.system_prompt == {"type": "preset", "preset": "claude_code"}
     assert opts.output_format is not None
     assert opts.output_format["type"] == "json_schema"
     assert "PreToolUse" in opts.hooks
@@ -159,7 +160,8 @@ def test_architect_client_options_allow_read_only_tools() -> None:
     assert opts.setting_sources == ["project"]
     assert opts.skills == "all"
     assert opts.model == "claude-sonnet-4-5-20250929"  # architect default per ARCH §9
-    assert opts.system_prompt is None  # prompt is the user message; default kept
+    # prompt is the user message; Claude Code default preserved via preset
+    assert opts.system_prompt == {"type": "preset", "preset": "claude_code"}
     assert opts.output_format is not None
     assert opts.output_format["type"] == "json_schema"
     assert "PreToolUse" in opts.hooks
@@ -187,7 +189,8 @@ def test_plan_critic_client_options_are_hermetic_and_no_tool() -> None:
     # definitions the model couldn't invoke anyway).
     assert opts.skills is None
     assert opts.model == "claude-sonnet-4-5-20250929"  # plan_critic default per ARCH §9
-    assert opts.system_prompt is None  # prompt is the user message; default kept
+    # prompt is the user message; Claude Code default preserved via preset
+    assert opts.system_prompt == {"type": "preset", "preset": "claude_code"}
     assert opts.output_format is not None
     assert opts.output_format["type"] == "json_schema"
     # Plan critic is single-turn with zero tools: PreToolUse / per-N-prompt

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 from typing import Optional
@@ -30,6 +31,25 @@ _SESSION_ATTR_ALT = "session.id"
 _ENV_ATTR = "langfuse.environment"
 _ENV_ATTR_ALT = "deployment.environment"
 _TEMPORAL_WF_ATTR = "temporalWorkflowID"
+_TEMPORAL_RUN_ATTR = "temporalRunID"
+
+# Per-execution Temporal run id. The worker container is reused across
+# re-runs of the same workflow id, so the run id cannot be a process
+# constant like DARKFACTORY_WF_ID — it is set per activity from
+# `activity.info().workflow_run_id` (see runtime/activities.py:
+# _stamp_temporal_activity_attrs) and read here so every in-process child
+# span (LangGraph nodes, phase_span, openinference) carries `temporalRunID`.
+# Temporal-native spans get it from the TracingInterceptor; this covers the
+# rest so the collector can key one trace per run, not per workflow id.
+_current_run_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "darkfactory_run_id", default=None
+)
+
+
+def set_current_run_id(run_id: Optional[str]) -> None:
+    """Bind the active Temporal run id to the current async context."""
+    if run_id:
+        _current_run_id.set(run_id)
 
 
 class SessionStampingSpanProcessor(SpanProcessor):
@@ -101,6 +121,13 @@ class SessionStampingSpanProcessor(SpanProcessor):
         if self._environment:
             span.set_attribute(_ENV_ATTR, self._environment)
             span.set_attribute(_ENV_ATTR_ALT, self._environment)
+        # Stamp the active Temporal run id so non-Temporal child spans
+        # (LangGraph nodes, phase_span, openinference) coalesce into the
+        # same per-run trace the collector derives. Harmless when Temporal's
+        # interceptor later sets the same attribute — the value is identical.
+        run_id = _current_run_id.get()
+        if run_id:
+            span.set_attribute(_TEMPORAL_RUN_ATTR, run_id)
         # Temporal's TracingInterceptor names the workflow root span
         # `RunWorkflow:<WorkflowType>`. Lift the type onto langfuse.trace.name
         # so each workflow execution shows up in Langfuse with the workflow's

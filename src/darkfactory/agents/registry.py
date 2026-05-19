@@ -248,6 +248,8 @@ class RoleSummary:
     role: str
     model: str
     prompt_path: Path
+    # ``-1`` is the ``allowed: "all"`` sentinel (pure-yolo, no explicit
+    # allowlist); otherwise the count of explicitly-listed tools.
     allowed_tool_count: int
     hook_names: tuple[str, ...]
     mcp_servers: tuple[str, ...]
@@ -266,7 +268,11 @@ def _role_summary(registry: Registry, role: str) -> RoleSummary:
         role=role,
         model=manifest.llm.model,
         prompt_path=prompt_path,
-        allowed_tool_count=len(manifest.tools.allowed),
+        allowed_tool_count=(
+            -1
+            if manifest.tools.allowed == "all"
+            else len(manifest.tools.allowed)
+        ),
         hook_names=tuple(att.name for att in manifest.hooks),
         mcp_servers=tuple(manifest.mcp),
         manifest_sha=_file_sha(registry.source_path(role)),

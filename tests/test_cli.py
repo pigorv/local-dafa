@@ -16,10 +16,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import yaml
 
-from darkfactory.cli import build_parser, roles_command, run_command, schedule_command
+from darkfactory.cli import (
+    _wait_for_result_with_eval_gates,
+    build_parser,
+    eval_command,
+    roles_command,
+    run_command,
+    schedule_command,
+)
 from darkfactory.runtime import schedule_admin
 from darkfactory.runtime.workflow import DarkFactoryWorkflow
-from darkfactory.state import RunRequest, RunResult
+from darkfactory.state import GateDecision, RunRequest, RunResult
 
 
 def _fake_client(result: RunResult | None = None) -> tuple[MagicMock, MagicMock]:
@@ -105,6 +112,74 @@ def test_run_workflow_id_override(tmp_path: Path):
         asyncio.run(run_command(args))
 
     assert client.start_workflow.await_args.kwargs["id"] == "darkfactory-demo-001"
+
+
+def test_eval_gate_wait_approves_brief_then_rejects_merge():
+    async def exercise() -> tuple[RunResult, list[tuple[object, GateDecision]]]:
+        real_sleep = asyncio.sleep
+        done = asyncio.Event()
+        updates: list[tuple[object, GateDecision]] = []
+
+        class FakeHandle:
+            async def result(self) -> RunResult:
+                await done.wait()
+                return RunResult(status="rejected", state={})
+
+            async def query(self, query: object) -> dict[str, str | None]:
+                assert query is DarkFactoryWorkflow.current_state_summary
+                if not updates:
+                    return {"pending_gate": "brief"}
+                if len(updates) == 1:
+                    return {"pending_gate": "merge"}
+                return {"pending_gate": None}
+
+            async def execute_update(
+                self,
+                update: object,
+                decision: GateDecision,
+            ) -> None:
+                updates.append((update, decision))
+                if update is DarkFactoryWorkflow.reject_merge:
+                    done.set()
+
+        async def fast_sleep(_: float) -> None:
+            await real_sleep(0)
+
+        with patch("darkfactory.cli.asyncio.sleep", fast_sleep):
+            result = await _wait_for_result_with_eval_gates(FakeHandle())
+        return result, updates
+
+    result, updates = asyncio.run(exercise())
+
+    assert result.status == "rejected"
+    assert [update for update, _ in updates] == [
+        DarkFactoryWorkflow.approve_brief,
+        DarkFactoryWorkflow.reject_merge,
+    ]
+    assert [decision.approved for _, decision in updates] == [True, False]
+    assert [decision.reason for _, decision in updates] == [
+        "benchmark auto-approved brief",
+        "benchmark stopped before merge",
+    ]
+
+
+def test_eval_dry_run_loads_schema_without_temporal(capsys):
+    benchmark = Path("tests/fixtures/eval/benchmark.yaml")
+    args = _parse(["eval", str(benchmark), "--dry-run"])
+
+    with patch(
+        "darkfactory.cli._connect_client",
+        AsyncMock(side_effect=AssertionError("Temporal should not be called")),
+    ) as connect_client, patch(
+        "darkfactory.eval.runner.run",
+        AsyncMock(side_effect=AssertionError("runner should not execute")),
+    ) as run_eval:
+        rc = asyncio.run(eval_command(args))
+
+    assert rc == 0
+    assert "loaded 1 cases; schema OK" in capsys.readouterr().out
+    connect_client.assert_not_awaited()
+    run_eval.assert_not_awaited()
 
 
 def test_run_propagates_model_profile_env(tmp_path: Path, monkeypatch):

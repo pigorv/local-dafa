@@ -74,8 +74,9 @@ TESTER_TOOLS: list[str] = [
     "Read", "Write", "Edit", "Grep", "Glob", "Bash", "mcp__*",
 ]
 PR_CREATOR_TOOLS: list[str] = [
-    "Read", "Grep", "Glob", "sandbox_bash", "mcp__*",
+    "Read", "Grep", "Glob", "Bash", "mcp__*",
 ]
+PR_CREATOR_DENYLIST: tuple[tuple[str, ...], ...] = (("gh", "issue"),)
 WORKER_DENYLIST: tuple[tuple[str, ...], ...] = (("git", "push"),)
 
 
@@ -233,25 +234,32 @@ def test_each_worker_has_heartbeat_on_stop(factory: Any) -> None:
     assert "heartbeat_hook" in stop_hook_names
 
 
-def test_pr_creator_client_options_are_pre_review_and_read_only() -> None:
+def test_pr_creator_client_options_use_builtin_bash_with_tight_allowlist() -> None:
     client = _pr_creator_client(_pr_state_slice())
     opts = client.options
     assert opts is not None
 
     assert opts.setting_sources == ["project"]
     assert opts.allowed_tools == PR_CREATOR_TOOLS
-    assert "Bash" not in opts.allowed_tools
+    # pr_creator runs git/gh through the built-in Bash (no sandbox_bash,
+    # no in-process darkfactory MCP server), but keeps a tight allowlist
+    # rather than the Builder/Tester pure-denylist.
+    assert "Bash" in opts.allowed_tools
+    assert "sandbox_bash" not in opts.allowed_tools
     assert "Write" not in opts.allowed_tools
     assert "Edit" not in opts.allowed_tools
     assert opts.cwd == "/workspace"
-    assert "darkfactory" in opts.mcp_servers
+    assert "darkfactory" not in opts.mcp_servers
+    assert opts.mcp_servers == {}
     assert callable(opts.can_use_tool)
     assert opts.model == "claude-haiku-4-5-20251001"
     assert opts.thinking is not None
     assert opts.thinking["type"] == "disabled"
 
-    manifest_tools = get_default_registry().get("pr_creator").tools
-    assert tuple(manifest_tools.argv_allowlist) == ("git", "gh")
+    manifest = get_default_registry().get("pr_creator")
+    assert tuple(manifest.tools.argv_allowlist) == ("git", "gh")
+    assert tuple(manifest.tools.argv_denylist) == PR_CREATOR_DENYLIST
+    assert manifest.mcp == []
 
     # PreToolUse / PostToolUse / Stop are populated; UserPromptSubmit is
     # intentionally absent — pr_creator is single-turn so goal_pin would
@@ -321,57 +329,45 @@ def test_permission_gate_denies_merge_tools_pre_gate(factory: Any) -> None:
     assert "agents cannot merge" in result.message
 
 
-def test_pr_creator_permission_gate_allows_gh_after_gate() -> None:
-    client = _pr_creator_client(_pr_state_slice())
+def _pr_gate_call(client: ClaudeSDKClient, command: str) -> Any:
     gate = client.options.can_use_tool
 
     async def call() -> Any:
-        return await gate(
-            "sandbox_bash",
-            {"argv": ["gh", "pr", "list", "--head", "agent/wf-pr-123"]},
-            ToolPermissionContext(),
-        )
+        return await gate("Bash", {"command": command}, ToolPermissionContext())
 
-    result = asyncio.run(call())
-    assert isinstance(result, PermissionResultAllow)
+    return asyncio.run(call())
+
+
+def test_pr_creator_permission_gate_allows_role_owned_gh_and_git() -> None:
+    client = _pr_creator_client(_pr_state_slice())
+    for command in (
+        "gh pr list --head agent/wf-pr-123",
+        "gh pr create --title T --body B",
+        "git push origin agent/wf-pr-123",
+    ):
+        result = _pr_gate_call(client, command)
+        assert isinstance(result, PermissionResultAllow), command
 
 
 def test_pr_creator_permission_gate_denies_off_allowlist_argv() -> None:
     client = _pr_creator_client(_pr_state_slice())
-    gate = client.options.can_use_tool
-
-    async def call() -> Any:
-        return await gate(
-            "sandbox_bash",
-            {"argv": ["curl", "https://example.com"]},
-            ToolPermissionContext(),
-        )
-
-    result = asyncio.run(call())
+    result = _pr_gate_call(client, "curl https://example.com")
     assert isinstance(result, PermissionResultDeny)
     assert "pr_creator allowlist" in result.message
 
 
-def test_pr_creator_merge_tools_respect_gate() -> None:
-    # The modern PR Creator flow pushes through `sandbox_bash` + the
-    # role-owned `git push` argv prefix; the legacy `git_push_agent_branch`
-    # MCP tool is unused in production but still gated for defence-in-depth.
-    # Exercise both branches by toggling `gate_approved` explicitly.
-    denied_client = _pr_creator_client({**_pr_state_slice(), "gate_approved": False})
-    allowed_client = _pr_creator_client({**_pr_state_slice(), "gate_approved": True})
+def test_pr_creator_permission_gate_denies_gh_issue_and_merge() -> None:
+    # The workflow owns the GitHub issue label lifecycle and no agent may
+    # merge; both are gate-enforced for pr_creator, not honor-system.
+    client = _pr_creator_client(_pr_state_slice())
 
-    async def denied() -> Any:
-        return await denied_client.options.can_use_tool(
-            "git_push_agent_branch", {}, ToolPermissionContext()
-        )
+    issue_result = _pr_gate_call(client, "gh issue edit 5 --add-label df:done")
+    assert isinstance(issue_result, PermissionResultDeny)
+    assert "denied for role 'pr_creator'" in issue_result.message
 
-    async def allowed() -> Any:
-        return await allowed_client.options.can_use_tool(
-            "git_push_agent_branch", {}, ToolPermissionContext()
-        )
-
-    assert isinstance(asyncio.run(denied()), PermissionResultDeny)
-    assert isinstance(asyncio.run(allowed()), PermissionResultAllow)
+    merge_result = _pr_gate_call(client, "gh pr merge 5 --squash")
+    assert isinstance(merge_result, PermissionResultDeny)
+    assert "denied for all agent roles" in merge_result.message
 
 
 # ---------- run_<role>: structured-output dict shape ----------

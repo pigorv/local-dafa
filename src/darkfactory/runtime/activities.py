@@ -20,6 +20,7 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
 
+from darkfactory.bootstrap import set_current_run_id
 from darkfactory.runtime.approval import (
     ApprovalSignal,
     is_authorized,
@@ -28,7 +29,7 @@ from darkfactory.runtime.approval import (
 from darkfactory.runtime.comment_templates import render as render_comment_template
 from darkfactory.runtime.issue_comments import filter_dark_factory_marker_comments
 from darkfactory.runtime.phase_comment import end_marker_for, marker_for
-from darkfactory.runtime.tracing import phase_span
+from darkfactory.runtime.tracing import coalesced_trace_id, phase_span
 from darkfactory.tools.sandbox import RepoSandbox
 from darkfactory.tools.shell import get_sandbox, register_sandbox
 from darkfactory.state import IssueComment, IssueRef, IssueRunRequest
@@ -181,10 +182,13 @@ def _stamp_temporal_activity_attrs() -> None:
     """
     if not activity.in_activity():
         return
+    info = activity.info()
+    # Bind the run id for this activity's async context BEFORE the span
+    # recording check, so non-recording-parent child spans still get it.
+    set_current_run_id(info.workflow_run_id)
     span = trace.get_current_span()
     if span is None or not span.is_recording():
         return
-    info = activity.info()
     span.set_attribute("langfuse.session.id", info.workflow_id)
     span.set_attribute("session.id", info.workflow_id)
     span.set_attribute("temporal.workflow.id", info.workflow_id)
@@ -193,6 +197,66 @@ def _stamp_temporal_activity_attrs() -> None:
     span.set_attribute("temporal.task_queue", info.task_queue)
     span.set_attribute("temporal.activity.type", info.activity_type)
     span.set_attribute("temporal.activity.attempt", info.attempt)
+
+
+def _coalesced_trace_id(workflow_id: str, workflow_run_id: str | None = None) -> str:
+    return coalesced_trace_id(workflow_id, workflow_run_id)
+
+
+def _langfuse_client():
+    """Langfuse v4 client, or None when scoring is disabled/unconfigured.
+
+    Scoring is observational: missing creds or an unreachable Langfuse must
+    never break the workflow. v4 `get_client()` is itself a process singleton
+    and reads LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_HOST from env.
+    """
+    if os.environ.get("LANGFUSE_SCORES_ENABLED", "true").lower() == "false":
+        return None
+    if not (os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY")):
+        return None
+    try:
+        from langfuse import get_client
+
+        return get_client()
+    except Exception:
+        log.warning("langfuse client init failed; scoring disabled", exc_info=True)
+        return None
+
+
+def _emit_langfuse_scores(
+    stage: str,
+    scores: dict[str, float | int],
+    comment: str | None = None,
+) -> None:
+    """Attach numeric scores to this workflow's coalesced Langfuse trace.
+
+    No-op outside an activity body or when Langfuse is disabled/unreachable.
+    Never raises - scoring must not change workflow outcomes. Flushes once at
+    the end because the worker container is torn down in the workflow `finally`,
+    so batched scores would otherwise be lost.
+    """
+    if not activity.in_activity():
+        return
+    client = _langfuse_client()
+    if client is None:
+        return
+    info = activity.info()
+    trace_id = _coalesced_trace_id(info.workflow_id, info.workflow_run_id)
+    for name, value in scores.items():
+        try:
+            client.create_score(
+                name=f"{stage}.{name}",
+                value=float(value),
+                trace_id=trace_id,
+                data_type="NUMERIC",
+                comment=comment,
+            )
+        except Exception:
+            log.warning("langfuse score emit failed for %s.%s", stage, name, exc_info=True)
+    try:
+        client.flush()
+    except Exception:
+        log.warning("langfuse flush failed after %s scores", stage, exc_info=True)
 
 
 def _runctx_from_state(state: dict) -> Any:
@@ -1584,8 +1648,17 @@ async def setup_worker_activity(wf_id: str, repo_url: str) -> str:
             "TEMPORAL_TASK_QUEUE": f"agent-tq-{wf_id}",
             "DARKFACTORY_WF_ID": wf_id,
             "DARKFACTORY_ENVIRONMENT": environment,
+            # Opt-in SDK argv/options diagnostics (sdk_diagnostics.py).
+            # Forwarded from the orchestrator so it can be flipped without a
+            # worker rebuild; empty (off) unless explicitly set.
+            "DARKFACTORY_LOG_SDK_ARGV": os.environ.get(
+                "DARKFACTORY_LOG_SDK_ARGV", ""
+            ),
             "CLAUDE_CODE_OAUTH_TOKEN": os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", ""),
             "GITHUB_TOKEN": os.environ.get("GITHUB_TOKEN", ""),
+            "LANGFUSE_PUBLIC_KEY": os.environ.get("LANGFUSE_PUBLIC_KEY", ""),
+            "LANGFUSE_SECRET_KEY": os.environ.get("LANGFUSE_SECRET_KEY", ""),
+            "LANGFUSE_HOST": os.environ.get("LANGFUSE_HOST", "http://langfuse-web:3000"),
             # Native Claude Code telemetry — see https://code.claude.com/docs/en/monitoring-usage.
             # Each role activity opens its own ClaudeSDKClient (one CLI subprocess per
             # activity), so traces propagate from the Temporal activity span via
@@ -1672,6 +1745,15 @@ async def discovery_stage(state: dict) -> dict:
 
         sg = discovery_subgraph()
         result = await sg.ainvoke(state)
+        _decision = result.get("review_decision") or {}
+        _emit_langfuse_scores(
+            stage="plan_critic",
+            scores={
+                "approved": 1.0 if _decision.get("approved") else 0.0,
+                "attempts": float(state.get("planning_attempts", 0) + 1),
+            },
+            comment=(_decision.get("reason") or "")[:200] or None,
+        )
         return {
             "stories": result.get("stories", []),
             "spec": result.get("spec", []),
@@ -2024,6 +2106,23 @@ async def verify_stage(state: dict) -> dict:
         ctx = _runctx_from_state(state)
         sg = verify_subgraph()
         result = await sg.ainvoke(state, context=ctx)
+        _vs = result.get("verify_summary") or {}
+        _cov = _vs.get("predicate_coverage") or []
+        _covered = sum(1 for c in _cov if c.get("status") == "covered")
+        _weak = sum(1 for c in _cov if c.get("status") == "weakly_covered")
+        _emit_langfuse_scores(
+            stage="verify",
+            scores={
+                "passed": 1.0 if _vs.get("passed") else 0.0,
+                "predicate_coverage_pct": (
+                    (_covered + 0.5 * _weak) / max(1, len(_cov))
+                ),
+                "uncovered_predicates": float(_vs.get("uncovered_predicates", 0) or 0),
+                "fixer_attempts_used": float(
+                    sum((state.get("fixer_attempts_by_wp") or {}).values())
+                ),
+            },
+        )
         delta: dict[str, Any] = {
             "test_results": result.get("test_results", []),
             "findings": result.get("findings", []),
@@ -2191,7 +2290,20 @@ async def reviewer_stage(state: dict) -> dict:
         from darkfactory.agents.reviewer import run_reviewer
 
         result = await run_reviewer(state)
-        return {"review_decision": result.model_dump()}
+        rv = result.model_dump()
+        _severity = {"low": 1.0, "medium": 2.0, "high": 3.0}
+        _emit_langfuse_scores(
+            stage="reviewer",
+            scores={
+                "severity_numeric": _severity.get(rv.get("severity"), 0.0),
+                "recommendation_approve": 1.0
+                if rv.get("recommendation") == "approve"
+                else 0.0,
+                "issue_count": float(len(rv.get("issues") or [])),
+                "findings_count": float(len(rv.get("findings") or [])),
+            },
+        )
+        return {"review_decision": rv}
 
 
 @activity.defn(name="code_quality_stage")

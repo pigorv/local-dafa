@@ -75,3 +75,19 @@ def test_build_options_leaves_disallowed_tools_empty() -> None:
     """
     opts = build_options("po", **_BASE_KWARGS)
     assert opts.disallowed_tools == []
+
+
+def test_build_options_force_path_guard_installs_with_empty_allowlist() -> None:
+    """``force_path_guard=True`` installs the guard even when no Edit/Write
+    tool is named — the ``allowed: "all"`` (pure-yolo) case where the
+    resolved allowlist is empty but Edit/Write are still reachable.
+    """
+    kwargs = {**_BASE_KWARGS, "allowed_tools": []}
+    opts = build_options("builder", force_path_guard=True, **kwargs)
+
+    pre_hooks = list(opts.hooks["PreToolUse"][0].hooks)
+    assert pre_hooks[0].__name__ == "path_guard_hook"
+
+    # Without the flag an empty allowlist installs no guard.
+    opts_off = build_options("builder", **kwargs)
+    assert not (opts_off.hooks or {}).get("PreToolUse")

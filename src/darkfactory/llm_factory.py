@@ -8,6 +8,7 @@ from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
 from claude_agent_sdk.types import (
     PermissionResultAllow,
     PermissionResultDeny,
+    SystemPromptPreset,
     ThinkingConfigDisabled,
     ThinkingConfigEnabled,
     ToolPermissionContext,
@@ -19,11 +20,11 @@ from darkfactory.hooks.path_guard import make_path_guard
 _DEFAULT_THINKING_BUDGET_TOKENS = 4096
 
 # Built-in CLI tools the SDK should never invoke autonomously. Empty by
-# default: build/test roles now get raw ``Bash`` in their allowed_tools so
-# they can introspect projects without going through the per-role argv
-# allowlist of ``sandbox_bash``. Permission mode is still
-# ``bypassPermissions``, so the SDK won't prompt the (non-interactive) CLI
-# UI for any tool already listed in a role's ``allowed_tools``.
+# default: shell-using roles get the built-in ``Bash`` tool in their
+# allowed_tools, argv-gated by ``hooks/permission_gate.py`` (per-role
+# allowlist/denylist). Permission mode is still ``bypassPermissions``,
+# so the SDK won't prompt the (non-interactive) CLI UI for any tool
+# already listed in a role's ``allowed_tools``.
 _DISALLOWED_BUILTIN_TOOLS: tuple[str, ...] = ()
 _FILE_MUTATION_TOOLS: frozenset[str] = frozenset({"Edit", "Write"})
 
@@ -62,6 +63,21 @@ def _otel_resource_attributes_with_parent_span() -> str | None:
     existing = os.environ.get("OTEL_RESOURCE_ATTRIBUTES", "")
     parts = [existing] if existing else []
     parts.append(f"darkfactory.cli_parent_span_id={parent_span_hex}")
+    # The bundled `claude` CLI subprocess does not speak Temporal, so its
+    # native claude_code.* spans have no `temporalRunID`. Pass the active
+    # run id as a resource attribute so the otel-collector keys them into
+    # the same per-run trace as the Python-side spans (one trace per run,
+    # not per workflow id — critical when re-running the same wf id while
+    # testing).
+    try:
+        from temporalio import activity as _activity
+
+        if _activity.in_activity():
+            run_id = _activity.info().workflow_run_id
+            if run_id:
+                parts.append(f"darkfactory.workflow_run_id={run_id}")
+    except Exception:
+        pass
     return ",".join(parts)
 
 
@@ -73,10 +89,18 @@ def _with_path_guard(
     hooks: dict[str, Any],
     allowed_tools: list[str],
     state: Mapping[str, Any] | None,
+    *,
+    force: bool = False,
 ) -> dict[str, Any]:
-    """Attach the path guard to edit-capable SDK clients."""
+    """Attach the path guard to edit-capable SDK clients.
+
+    ``force=True`` installs the guard even when ``allowed_tools`` does not
+    name Edit/Write — used for ``allowed: "all"`` (pure-yolo) roles, whose
+    resolved ``allowed_tools`` is empty yet still reach Edit/Write under
+    ``bypassPermissions``.
+    """
     out = {event: list(matchers) for event, matchers in hooks.items()}
-    if not _uses_file_mutation_tools(allowed_tools):
+    if not (force or _uses_file_mutation_tools(allowed_tools)):
         return out
 
     guard = make_path_guard(state)
@@ -110,6 +134,7 @@ def build_options(
     cwd: str = "/workspace",
     output_format: dict[str, Any] | None = None,
     skills: Literal["all"] | list[str] | None = None,
+    force_path_guard: bool = False,
 ) -> ClaudeAgentOptions:
     """Per-role ClaudeAgentOptions with env overrides and path-guard wiring.
 
@@ -126,6 +151,10 @@ def build_options(
     enabled — ``"all"`` for every one, a list of skill names to restrict,
     ``None``/``[]`` to disable. The Agent SDK defaults to ``None`` even
     when skills exist on disk, so callers must pass the resolved value.
+    ``force_path_guard=True`` installs the Edit/Write path guard even when
+    ``allowed_tools`` does not name Edit/Write — the composer passes this
+    for ``allowed: "all"`` roles, whose resolved allowlist is empty but
+    which still reach Edit/Write under ``bypassPermissions``.
     """
     raw_model = _env(role, "MODEL")
     if raw_model:
@@ -161,7 +190,9 @@ def build_options(
         disallowed_tools=list(_DISALLOWED_BUILTIN_TOOLS),
         mcp_servers=mcp_servers or {},
         can_use_tool=can_use_tool,
-        hooks=_with_path_guard(hooks, allowed_tools, path_guard_state),
+        hooks=_with_path_guard(
+            hooks, allowed_tools, path_guard_state, force=force_path_guard
+        ),
         cwd=cwd,
         setting_sources=["project"],
         thinking=thinking_cfg,
@@ -170,10 +201,26 @@ def build_options(
         output_format=output_format,
         skills=skills,
     )
-    # Roles that send their prompt as the first user message
-    # (``prompt_as_user_message: true``) pass ``system_prompt=None``: leaving
-    # the SDK field unset keeps the default Claude Code system prompt instead
-    # of overriding it with an empty string.
-    if system_prompt is not None:
-        options.system_prompt = system_prompt
+    # The Agent SDK lowers ``system_prompt=None`` to an explicit
+    # ``--system-prompt ""`` CLI arg (see claude_agent_sdk/_internal/
+    # transport/subprocess_cli.py:_build_command), which *replaces* the
+    # built-in Claude Code system prompt with an empty string. That default
+    # prompt is the scaffolding that injects the target repo's CLAUDE.md and
+    # surfaces installed project skills to the model, so an empty system
+    # prompt silently disables both. Passing the ``claude_code`` preset with
+    # no ``append`` makes the SDK emit no ``--system-prompt`` flag at all, so
+    # the CLI keeps its default prompt. A caller-supplied prompt is layered on
+    # via the preset's ``append`` so it adds to — rather than wipes — the
+    # Claude Code base (and thus CLAUDE.md / skills survive for those roles
+    # too). Roles using ``prompt_as_user_message: true`` pass
+    # ``system_prompt=None`` and get the bare preset; their instructions ride
+    # in as the first user message.
+    preset: SystemPromptPreset = {"type": "preset", "preset": "claude_code"}
+    if system_prompt:
+        preset = {
+            "type": "preset",
+            "preset": "claude_code",
+            "append": system_prompt,
+        }
+    options.system_prompt = preset
     return options

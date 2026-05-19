@@ -29,7 +29,20 @@ class LLMPolicy(_StrictModel):
 
 
 class ToolPolicy(_StrictModel):
-    allowed: list[str]
+    # ``"all"`` is a pure-yolo sentinel: the role may call any tool the
+    # CLI exposes, without enumerating each one. It mirrors the ``skills``
+    # field's ``Literal["all"]`` shape. At compose time ``"all"`` resolves
+    # to an *empty* SDK ``allowed_tools`` (no ``--allowedTools`` flag) —
+    # ``permission_mode="bypassPermissions"`` already auto-approves every
+    # tool, so the real guardrails are ``disallowed`` and the
+    # ``can_use_tool`` argv gate, not this allowlist. Because the resolved
+    # list is then empty, compose force-installs the Bash argv gate and the
+    # Edit/Write path guard for ``"all"`` roles (they no longer self-trigger
+    # off the concrete list). A list value keeps the explicit-allowlist
+    # behaviour. ``[]`` remains a deliberate "zero-tool" statement
+    # (plan_critic, verifier_semantic). Override per-role at runtime with
+    # ``LLM_<ROLE>_TOOLS="all" | "Read,Grep" | ""`` (empty string => []).
+    allowed: Literal["all"] | list[str]
     disallowed: list[str]
     argv_allowlist: list[str]
     argv_denylist: list[tuple[str, ...]] = Field(default_factory=list)

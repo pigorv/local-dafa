@@ -26,8 +26,9 @@ def test_triage_client_returns_sdk_client_with_triage_prompt():
     assert options.mcp_servers == {}
     # The prompt is rendered as the user message; the SDK enforces the
     # output shape via the StructuredOutput synthetic tool. system_prompt is
-    # left unset so the default Claude Code system prompt is used.
-    assert options.system_prompt is None
+    # the claude_code preset so the SDK keeps the default Claude Code system
+    # prompt (None would force --system-prompt "" and drop CLAUDE.md/skills).
+    assert options.system_prompt == {"type": "preset", "preset": "claude_code"}
     assert options.output_format is not None
     assert options.output_format["type"] == "json_schema"
 

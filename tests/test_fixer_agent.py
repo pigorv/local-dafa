@@ -247,8 +247,9 @@ def test_fixer_client_options_are_tool_using_and_hermetic() -> None:
     assert opts.output_format["type"] == "json_schema"
 
     # Prompt is rendered as the user message (prompt_as_user_message: true);
-    # system_prompt stays unset so the default Claude Code prompt is kept.
-    assert opts.system_prompt is None
+    # system_prompt is the claude_code preset so the SDK keeps the default
+    # Claude Code prompt (passing None would force --system-prompt "").
+    assert opts.system_prompt == {"type": "preset", "preset": "claude_code"}
 
     manifest_tools = get_default_registry().get("fixer").tools
     assert manifest_tools.argv_allowlist == []

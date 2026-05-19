@@ -63,6 +63,23 @@ def test_role_manifest_preserves_hook_parameters_and_argv_prefixes() -> None:
     assert manifest.hooks[0].parameters == {"cap": 80}
 
 
+def test_role_manifest_accepts_all_tools_sentinel() -> None:
+    payload = _manifest_payload()
+    payload["tools"]["allowed"] = "all"
+
+    manifest = RoleManifest.model_validate(payload)
+
+    assert manifest.tools.allowed == "all"
+
+
+def test_role_manifest_rejects_non_all_tools_string() -> None:
+    payload = _manifest_payload()
+    payload["tools"]["allowed"] = "everything"
+
+    with pytest.raises(ValidationError):
+        RoleManifest.model_validate(payload)
+
+
 def test_role_manifest_requires_missing_fields() -> None:
     payload = _manifest_payload()
     del payload["llm"]

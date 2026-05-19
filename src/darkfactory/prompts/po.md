@@ -40,6 +40,15 @@ You have read-only access to the repository via `Read`, `Grep`, and
 
 Keep total tool calls to a handful. Long search loops are a smell.
 
+## Project skills
+
+The repository may ship Claude skills that encode how work like yours is
+done here (domain conventions, analysis or design patterns, repo-specific
+knowledge). When one is relevant to what you are producing, use it and
+follow it instead of re-deriving the behavior. Do not assume none exist —
+treat an available, relevant skill as the project's preferred way to do
+the task.
+
 ## Rules
 
 - Every `acceptance_criteria` bullet must be observable from outside the

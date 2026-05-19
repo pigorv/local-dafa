@@ -23,19 +23,25 @@ tools:
     - Read
     - Grep
     - Glob
-    - sandbox_bash
   disallowed: []
+  # Built-in Bash, argv-gated by hooks/permission_gate.py. Unlike the
+  # Builder/Tester/Fixer pure-denylist policy, this publishing role keeps
+  # a tight allowlist: only `git` and `gh` binaries, with `gh issue`
+  # subcommands denied (the workflow owns the issue label lifecycle) and
+  # `gh pr merge` denied globally. `git push` / `gh pr create` / `gh pr
+  # list` are role-owned by pr_creator.
   argv_allowlist:
     - git
     - gh
+  argv_denylist:
+    - [gh, issue]
   role_owned_argv_prefixes:
     - [gh, pr, create]
     - [gh, pr, list]
     - [git, push]
   edit_path_allowlist: []
 
-mcp:
-  - darkfactory
+mcp: []
 
 hooks:
   - event: PreToolUse

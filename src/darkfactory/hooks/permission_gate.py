@@ -2,30 +2,25 @@
 
 Per ARCHITECTURE.md §5.5, every SDK client wired with ``can_use_tool`` routes
 its tool requests through this gate before the tool actually runs. The gate
-applies a single argv-check chain to two surfaces:
+guards the built-in ``Bash`` tool: the shell line in ``command`` is parsed
+with ``shlex.split`` and run through the argv-check chain.
 
-* The custom MCP ``sandbox_bash`` tool — argv arrives directly as ``argv``.
-* The built-in ``Bash`` tool — the shell line in ``command`` is parsed with
-  ``shlex.split`` first and then runs the same chain.
-
-For either surface the gate denies argv containing shell metachars from
+The gate denies argv containing shell metachars from
 ``tools/shell.py:FORBIDDEN_TOKENS``; denies globally forbidden argv
-prefixes such as ``gh pr merge``; denies role-owned argv prefixes such
-as ``git push`` outside their owning role; or denies if ``argv[0]`` is
-not in the per-role argv allowlist.
-
-For the destructive legacy tools, the gate denies merge outright and
-allows branch push only for the PR Creator role when a caller
-explicitly marks that legacy tool path as gate-approved. All other
-tool requests pass through.
+prefixes such as ``gh pr merge``; denies per-role manifest denylist
+prefixes; denies role-owned argv prefixes such as ``git push`` outside
+their owning role; or denies if ``argv[0]`` is not in the per-role argv
+allowlist (an empty allowlist opts the role into a pure denylist
+policy). A defensive deny also fires for any tool whose name matches the
+merge-tool set. All other tool requests pass through.
 
 The Claude Agent SDK's ``ToolPermissionContext`` does not carry the role or
 the workflow state; instead, this module exposes ``make_permission_gate``
 which closes over those values, mirroring the factory pattern already used
-by the loop-breaker / call-cap / goal-pin hooks. Tool names arriving from
-MCP servers are prefixed (``mcp__<server>__<tool>``); the helpers here
-match either the bare or the prefixed form so the gate stays correct
-regardless of how a particular role wires up its MCP server.
+by the loop-breaker / call-cap / goal-pin hooks. ``_match_tool`` matches
+either a bare tool name or an ``mcp__<server>__<tool>`` form so the merge
+deny stays correct even if a project ``.mcp.json`` ever exposes such a
+tool.
 """
 from __future__ import annotations
 
@@ -41,11 +36,8 @@ from claude_agent_sdk.types import (
 
 from darkfactory.tools.shell import FORBIDDEN_TOKENS
 
-SANDBOX_BASH_TOOL = "sandbox_bash"
 BUILTIN_BASH_TOOL = "Bash"
-PR_CREATOR_ROLE = "pr_creator"
 MERGE_TOOLS: frozenset[str] = frozenset({"gh_pr_merge"})
-GATE_APPROVED_TOOLS: frozenset[str] = frozenset({"git_push_agent_branch"})
 
 DENIED_ARGV_PREFIXES: tuple[tuple[str, ...], ...] = (("gh", "pr", "merge"),)
 
@@ -56,10 +48,6 @@ def _match_tool(tool_name: str, target: str) -> bool:
 
 def _is_merge_tool(tool_name: str) -> bool:
     return any(_match_tool(tool_name, t) for t in MERGE_TOOLS)
-
-
-def _is_gate_approved_tool(tool_name: str) -> bool:
-    return any(_match_tool(tool_name, t) for t in GATE_APPROVED_TOOLS)
 
 
 def _argv_has_prefix(argv: list[str], prefix: tuple[str, ...]) -> bool:
@@ -78,7 +66,7 @@ def _check_argv(
     denylist: tuple[tuple[str, ...], ...],
     effective_owned: Mapping[tuple[str, ...], frozenset[str]],
 ) -> PermissionResultAllow | PermissionResultDeny:
-    """Run the shared argv-policy chain for sandbox_bash and Bash.
+    """Run the argv-policy chain for the built-in Bash tool.
 
     Order is deny-first: ``FORBIDDEN_TOKENS`` → global ``DENIED_ARGV_PREFIXES``
     → per-role manifest denylist → role-owned prefixes (ownership table).
@@ -138,9 +126,10 @@ def make_permission_gate(
     """Return a ``can_use_tool`` callback for one SDK client.
 
     The role and its argv allowlist are baked into the closure at client
-    construction time. ``gate_approved`` is retained for legacy MCP tools that
-    mutate branches directly; modern PR Creator flows use ``sandbox_bash`` and
-    are controlled by role-owned argv prefixes instead.
+    construction time. ``gate_approved`` is a deprecated no-op kept only
+    for call/test signature compatibility — the legacy gate-approved MCP
+    push tool it guarded was removed; PR publication is controlled by the
+    role-owned ``git push`` / ``gh pr create`` argv prefixes instead.
 
     ``role_owned_argv_prefixes`` is the registry-derived aggregation of every
     manifest's ``tools.role_owned_argv_prefixes`` — a mapping from each
@@ -166,13 +155,6 @@ def make_permission_gate(
         tool_input: dict[str, Any],
         ctx: ToolPermissionContext,
     ) -> PermissionResultAllow | PermissionResultDeny:
-        if _match_tool(tool_name, SANDBOX_BASH_TOOL):
-            argv = list(tool_input.get("argv") or [])
-            joined = shlex.join(argv) if argv else ""
-            return _check_argv(
-                role, argv, joined, allowlist, denylist, effective_owned
-            )
-
         if _match_tool(tool_name, BUILTIN_BASH_TOOL):
             command = tool_input.get("command")
             if not isinstance(command, str) or not command.strip():
@@ -197,20 +179,6 @@ def make_permission_gate(
             return PermissionResultDeny(
                 message=f"{tool_name} blocked: agents cannot merge"
             )
-
-        if _is_gate_approved_tool(tool_name):
-            if role != PR_CREATOR_ROLE:
-                return PermissionResultDeny(
-                    message=(
-                        f"{tool_name} blocked: allowed only for "
-                        f"{PR_CREATOR_ROLE}"
-                    )
-                )
-            if not gate_approved:
-                return PermissionResultDeny(
-                    message=f"{tool_name} blocked: merge gate not approved"
-                )
-            return PermissionResultAllow()
 
         return PermissionResultAllow()
 

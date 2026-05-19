@@ -1,0 +1,14 @@
+version: 1
+cases:
+  - id: fixture-dry-run
+    description: "Synthetic fixture used only for CLI schema dry-runs."
+    repo_url: /tmp/darkfactory-eval-fixture-repo
+    repo_sha: fixture-sha
+    issue:
+      title: "Fix the synthetic benchmark case"
+      body: "This case is never executed by the dry-run gate."
+    expected:
+      pr_created: false
+      verify_passed: false
+    tags:
+      - fixture

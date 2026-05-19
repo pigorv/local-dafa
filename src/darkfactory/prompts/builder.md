@@ -49,6 +49,14 @@ $work_package
   prefer flags that emit structured report files (JUnit XML, SARIF)
   — those are what the verifier consumes.
 
+## Project skills
+
+The repository may ship Claude skills that encode how work like yours is
+done here (conventions, language/style rules, domain helpers, generators).
+When one is relevant to the change you are making, use it and follow it
+instead of re-deriving the behavior. Do not assume none exist — treat an
+available, relevant skill as the project's preferred way to do the task.
+
 ## Workflow
 
 1. **Read first.** Start from the brief's `proposed_design` /

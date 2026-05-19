@@ -69,6 +69,14 @@ private keys, unapproved lockfiles, and merge commands are blocked by
 hooks and command policy. If a repair appears to require one of these,
 stop and return `needs_brief_change` or `cannot_fix` as appropriate.
 
+## Project skills
+
+The repository may ship Claude skills that encode how work like yours is
+done here (conventions, language/style rules, domain helpers, generators).
+When one is relevant to the change you are making, use it and follow it
+instead of re-deriving the behavior. Do not assume none exist — treat an
+available, relevant skill as the project's preferred way to do the task.
+
 ## Decision rules
 
 - Return `fixed` only when the failure is within the approved brief and

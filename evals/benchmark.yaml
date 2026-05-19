@@ -1,0 +1,51 @@
+version: 1
+cases:
+  - id: pigorv-dark-factory-target-test-27-order-crud
+    description: "Add an in-memory Order CRUD pipeline matching the existing users slice."
+    repo_url: https://github.com/pigorv/dark-factory-target-test.git
+    repo_sha: c55b578e2ddf95fe8508a10da00a7397b091a464
+    issue:
+      title: "Create Order"
+      body: |
+        Let's create a default CRUD pipeline for the Order.
+
+        Create Controller and Repository layers.
+        Follow the same approach that is already in the existing user code.
+        Keep the repository in memory.
+        Add unit tests.
+
+        The Order record should have exactly four components in this order:
+        - id: long, unique and monotonically increasing 1..50
+        - userId: long, owning user, no foreign key enforcement
+        - total: BigDecimal, constructed via BigDecimal.valueOf(20 + (int) id)
+        - status: OrderStatus lifecycle state
+
+        Implement create, read, update, and delete operations without pagination.
+    expected:
+      pr_created: true
+      verify_passed: true
+      predicate_coverage_min_pct: 0.80
+      reviewer_severity_max: medium
+      reviewer_recommendation_approve: true
+      planning_attempts_max: 2
+      fixer_attempts_max: 1
+      must_touch_files:
+        - src/main/java/com/example/users/Order.java
+        - src/main/java/com/example/users/OrderController.java
+        - src/main/java/com/example/users/OrderRepository.java
+        - src/main/java/com/example/users/OrderStatus.java
+        - src/test/java/com/example/users/OrderControllerTest.java
+        - src/test/java/com/example/users/OrderRepositoryTest.java
+        - src/test/java/com/example/users/OrderStatusTest.java
+        - src/test/java/com/example/users/OrderTest.java
+      must_not_touch_files:
+        - .github/
+        - pom.xml
+        - README.md
+        - src/main/resources/application.properties
+      behavioral_predicates:
+        - "An Order record exists with id, userId, total, and status fields."
+        - "OrderRepository stores orders in memory and supports create, read, update, and delete operations."
+        - "OrderController exposes HTTP CRUD endpoints under /api/orders."
+        - "Unit tests cover the new Order domain, repository, and controller behavior."
+    tags: [feature, java, spring, crud]

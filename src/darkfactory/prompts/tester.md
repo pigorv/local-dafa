@@ -56,6 +56,14 @@ $builder_signal
   `gradle`, `npm`, `pnpm`, `pytest`, `cargo`, `go`, `make`), plus
   `git` for commit work.
 
+## Project skills
+
+The repository may ship Claude skills that encode how work like yours is
+done here (conventions, language/style rules, domain helpers, generators).
+When one is relevant to the change you are making, use it and follow it
+instead of re-deriving the behavior. Do not assume none exist — treat an
+available, relevant skill as the project's preferred way to do the task.
+
 ## Workflow per WP
 
 1. **Read `verification` first.** Before opening any file, write down

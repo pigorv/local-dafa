@@ -9,6 +9,7 @@ dependencies = [
     "claude-agent-sdk",
     "langgraph>=1.0.0",
     "langgraph-checkpoint-sqlite",
+    "langfuse>=4,<5",
     "docker",
     "gitpython",
     "tree-sitter",
@@ -18,6 +19,7 @@ dependencies = [
     "opentelemetry-sdk",
     "opentelemetry-exporter-otlp-proto-grpc",
     "openinference-instrumentation-langchain",
+    "pyyaml>=6.0",
     "python-dotenv>=1.0.0",
     "jinja2>=3.1",
 ]

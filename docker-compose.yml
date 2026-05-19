@@ -335,9 +335,14 @@ services:
       TEMPORAL_ADDRESS: temporal:7233
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
       LANGFUSE_HOST: http://langfuse-web:3000
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-local}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-local}
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       DARKFACTORY_WORKER_IMAGE: ${DARKFACTORY_WORKER_IMAGE:-darkfactory-worker:polyglot}
+      # Opt-in SDK argv/options diagnostics. The orchestrator forwards this
+      # into every worker container it spawns (activities.py:setup_worker).
+      DARKFACTORY_LOG_SDK_ARGV: ${DARKFACTORY_LOG_SDK_ARGV:-}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./src:/app/src:ro

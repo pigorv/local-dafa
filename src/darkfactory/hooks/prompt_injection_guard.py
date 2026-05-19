@@ -65,9 +65,9 @@ def _coerce_text(tool_response: Any) -> str:
     """Best-effort flatten of a ``tool_response`` payload to one string.
 
     Tool responses arrive in many shapes: a raw ``str`` from a built-in
-    text tool, a ``dict`` from ``sandbox_bash`` with ``stdout``/``stderr``
-    keys, a list of MCP content blocks, or arbitrary JSON. We scan the
-    full text in all cases — a base64 payload could be in any field.
+    text tool, a ``dict`` with ``stdout``/``stderr`` keys, a list of MCP
+    content blocks, or arbitrary JSON. We scan the full text in all
+    cases — a base64 payload could be in any field.
     """
     if tool_response is None:
         return ""

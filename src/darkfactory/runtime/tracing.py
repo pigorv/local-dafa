@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from contextlib import contextmanager
 from typing import Any, Iterator
 
@@ -8,6 +9,20 @@ from temporalio import activity
 
 
 _PHASE_TRACER = trace.get_tracer("darkfactory.phase")
+
+
+def coalesced_trace_id(workflow_id: str, workflow_run_id: str | None = None) -> str:
+    """Mirror otel-collector-config.yaml:47-54.
+
+    When a Temporal run id is available, one Langfuse trace equals one Temporal
+    run. The workflow-id-only hash is the collector fallback for spans that lack
+    a run id.
+    """
+    if workflow_run_id:
+        source = f"{workflow_id}/{workflow_run_id}"
+    else:
+        source = workflow_id
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()[:32]
 
 
 @contextmanager
