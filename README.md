@@ -1,16 +1,13 @@
 # local-dafa
 
-**local-dafa** (local Dark Factory) is an autonomous coding pipeline that turns
-a developer prompt or a labeled GitHub issue into a reviewed pull request —
-without human intervention beyond optional approval gates.
+*local Dark Factory — an autonomous coding pipeline: prompt or labeled GitHub issue → reviewed PR. A learning artifact for composing the 2026 agentic workflow stack — Temporal, Claude Agent SDK, LangGraph, Langfuse, OpenTelemetry, MCP.*
 
-A [Temporal](https://temporal.io) workflow coordinates a sequence of specialized
-[Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk) roles:
-triage, planning (PO → Architect → Plan Critic), implementation (Builder +
-Tester), verification/repair, PR creation, and review. Every step runs inside
-an isolated Docker worker container spawned per workflow execution.
+https://github.com/user-attachments/assets/c57ef717-3ac7-4d22-a570-cf1bd330df78
 
-**Version:** `0.1.0`
+*54s cut of a ~15min real run, sped up.*
+
+- A real, working composition of current agentic-workflow components — meant to be forked, taken apart, and learned from.
+- A learning artifact, not a product. No SaaS, no signups, no roadmap promises.
 
 ---
 
