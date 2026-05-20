@@ -240,9 +240,8 @@ async def run_fixer(state_slice: dict) -> dict[str, Any]:
     target_wp = (_target_wp_ids(state_slice) or [""])[0]
     compose_state.slice_id = target_wp
 
-    rendered = _render_user_prompt(state_slice, target_wp)
-
     async with role_turn_span(ROLE, wp_id=target_wp or None):
+        rendered = _render_user_prompt(state_slice, target_wp)
         async with compose(
             ROLE,
             compose_state,

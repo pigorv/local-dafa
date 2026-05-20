@@ -104,8 +104,8 @@ def _render_user_prompt(state_slice: dict) -> str:
 
 async def run_po(state_slice: dict) -> dict[str, Any]:
     compose_state = ComposeState.from_mapping(state_slice)
-    rendered = _render_user_prompt(state_slice)
     async with role_turn_span("po"):
+        rendered = _render_user_prompt(state_slice)
         async with compose(
             "po",
             compose_state,

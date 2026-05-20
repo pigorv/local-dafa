@@ -29,19 +29,18 @@ content scanner.
 from __future__ import annotations
 
 import json
-from string import Template
 from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from darkfactory.agents._sdk_common import (
     ParseError,
+    render_role_user_message,
     repo_summary,
     role_turn_span,
     run_to_completion,
 )
 from darkfactory.agents.compose import ComposeState, compose
-from darkfactory.agents.registry import get_default_registry, resolve_prompt_path
 
 
 class TriageOutput(TypedDict):
@@ -150,14 +149,11 @@ def _format_issue_comments(comments: Any) -> str:
 
 
 def _render_user_prompt(state_slice: dict) -> str:
-    manifest = get_default_registry().get("triage")
-    template_text = resolve_prompt_path(manifest.llm.prompt_path).read_text(
-        encoding="utf-8"
-    )
     issue = state_slice.get("issue") or {}
     title = state_slice.get("issue_title") or _state_value(issue, "title", "") or ""
     body = state_slice.get("issue_body") or _state_value(issue, "body", "") or ""
-    return Template(template_text).safe_substitute(
+    return render_role_user_message(
+        "triage",
         issue_title=str(title),
         issue_body=str(body),
         issue_comments=_format_issue_comments(state_slice.get("issue_comments")),
@@ -176,8 +172,8 @@ def _resolve_task_id(state_slice: dict) -> str:
 
 async def run_triage(state_slice: dict) -> TriageOutput:
     compose_state = ComposeState.task_only(_resolve_task_id(state_slice))
-    rendered = _render_user_prompt(state_slice)
     async with role_turn_span("triage"):
+        rendered = _render_user_prompt(state_slice)
         async with compose(
             "triage",
             compose_state,

@@ -56,8 +56,8 @@ async def run_verify_planner(state_slice: dict) -> dict[str, Any]:
     the activity.
     """
     compose_state = ComposeState.from_mapping(state_slice)
-    rendered = _render_user_prompt(state_slice)
     async with role_turn_span("verify_planner"):
+        rendered = _render_user_prompt(state_slice)
         async with compose(
             "verify_planner",
             compose_state,

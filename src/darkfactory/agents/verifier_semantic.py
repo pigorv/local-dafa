@@ -87,8 +87,8 @@ def _render_user_prompt(state_slice: dict) -> str:
 
 async def run_verifier_semantic(state_slice: dict) -> dict[str, Any]:
     compose_state = ComposeState.task_only(_resolve_task_id(state_slice))
-    rendered = _render_user_prompt(state_slice)
     async with role_turn_span(ROLE):
+        rendered = _render_user_prompt(state_slice)
         async with compose(
             ROLE,
             compose_state,

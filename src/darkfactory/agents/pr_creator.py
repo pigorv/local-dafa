@@ -94,8 +94,8 @@ async def run_pr_creator(state_slice: dict) -> dict[str, Any]:
     not loop on parse failures.
     """
     compose_state = ComposeState.from_mapping(state_slice)
-    rendered = _render_user_prompt(state_slice)
     async with role_turn_span(ROLE, branch=_feature_branch(state_slice)):
+        rendered = _render_user_prompt(state_slice)
         async with compose(
             ROLE,
             compose_state,

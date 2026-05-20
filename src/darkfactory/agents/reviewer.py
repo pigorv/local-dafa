@@ -99,8 +99,8 @@ def normalize_reviewer_output(raw: dict[str, Any]) -> ReviewerSummary:
 
 async def run_reviewer(state_slice: dict) -> ReviewerSummary:
     compose_state = ComposeState.from_mapping(state_slice)
-    rendered = _render_user_prompt(state_slice)
     async with role_turn_span(ROLE):
+        rendered = _render_user_prompt(state_slice)
         async with compose(
             ROLE,
             compose_state,

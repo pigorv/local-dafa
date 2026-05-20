@@ -6,7 +6,8 @@ output from that message. On `ValidationError` it sends one re-prompt asking
 for a clean JSON object matching the schema; if the second attempt still
 fails it raises `ParseError`.
 
-`load_prompt` reads a system-prompt markdown file from `darkfactory/prompts/`.
+`load_prompt` resolves a prompt through Langfuse when enabled, with the
+markdown file in `darkfactory/prompts/` as fallback.
 
 `BuilderOutput` / `BuilderEdit` mirror the JSON schema enforced on the
 Builder's structured output. Patches themselves are computed by the
@@ -15,9 +16,14 @@ response — workers commit code through `Edit` / `Write` / `Bash`.
 """
 from __future__ import annotations
 
+import functools
 import json
+import logging
+import os
 import re
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal, TypeVar
 
@@ -82,6 +88,105 @@ class PRCreatorOutput(BaseModel):
     summary: str = ""
 
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
+log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class PromptResolution:
+    name: str
+    text: str
+    source: Literal["langfuse", "disk"]
+    label: str
+    version: int | None
+    disk_path: Path
+    disk_sha: str
+
+    @property
+    def version_label(self) -> str:
+        return str(self.version) if self.version is not None else "disk"
+
+
+def _disk_prompt_path(name: str) -> Path:
+    return _PROMPTS_DIR / f"{name}.md"
+
+
+def _read_disk_prompt(path: Path) -> tuple[str, str]:
+    text = path.read_text(encoding="utf-8")
+    return text, sha256(text.encode("utf-8")).hexdigest()
+
+
+@functools.lru_cache(maxsize=1)
+def _langfuse_prompt_client():
+    if os.environ.get("LANGFUSE_PROMPTS_ENABLED", "true").lower() == "false":
+        return None
+    if not (
+        os.environ.get("LANGFUSE_PUBLIC_KEY")
+        and os.environ.get("LANGFUSE_SECRET_KEY")
+    ):
+        return None
+    try:
+        from langfuse import Langfuse
+
+        return Langfuse(
+            public_key=os.environ["LANGFUSE_PUBLIC_KEY"],
+            secret_key=os.environ["LANGFUSE_SECRET_KEY"],
+            host=os.environ.get("LANGFUSE_HOST", "http://langfuse-web:3000"),
+        )
+    except Exception:
+        log.warning(
+            "langfuse prompt client init failed; prompts will load from disk",
+            exc_info=True,
+        )
+        return None
+
+
+def resolve_prompt(
+    name: str,
+    *,
+    disk_path: Path | None = None,
+) -> PromptResolution:
+    path = disk_path or _disk_prompt_path(name)
+    disk_text, disk_sha = _read_disk_prompt(path)
+    label = os.environ.get("LANGFUSE_PROMPT_LABEL", "production")
+    client = _langfuse_prompt_client()
+    if client is not None:
+        try:
+            prompt = client.get_prompt(name, label=label, type="text")
+            return PromptResolution(
+                name=name,
+                text=str(prompt.prompt),
+                source="langfuse",
+                label=label,
+                version=getattr(prompt, "version", None),
+                disk_path=path,
+                disk_sha=disk_sha,
+            )
+        except Exception:
+            log.warning(
+                "langfuse get_prompt failed for name=%s label=%s; falling back to disk",
+                name,
+                label,
+                exc_info=True,
+            )
+    return PromptResolution(
+        name=name,
+        text=disk_text,
+        source="disk",
+        label=label,
+        version=None,
+        disk_path=path,
+        disk_sha=disk_sha,
+    )
+
+
+def stamp_prompt_attrs(span: trace.Span, prompt: PromptResolution) -> None:
+    if not span.is_recording():
+        return
+    span.set_attribute("darkfactory.prompt.name", prompt.name)
+    span.set_attribute("darkfactory.prompt.source", prompt.source)
+    span.set_attribute("darkfactory.prompt.label", prompt.label)
+    span.set_attribute("darkfactory.prompt.version", prompt.version_label)
+    span.set_attribute("darkfactory.prompt.disk_sha", prompt.disk_sha)
 
 
 class ParseError(Exception):
@@ -89,7 +194,7 @@ class ParseError(Exception):
 
 
 def load_prompt(name: str) -> str:
-    return (_PROMPTS_DIR / f"{name}.md").read_text(encoding="utf-8")
+    return resolve_prompt(name).text
 
 
 _REPO_SUMMARY_SECTIONS: tuple[str, ...] = (
@@ -171,23 +276,16 @@ def original_user_request(state_slice: dict) -> str:
 
 
 def render_role_user_message(role: str, **substitutions: object) -> str:
-    """Render a role's prompt file as a ``string.Template`` user message.
+    """Render a role prompt as a string.Template user message."""
+    from string import Template
 
-    Looks up the role in the default registry, resolves the prompt path,
-    reads the file, and runs ``Template.safe_substitute`` over it. Shared
-    by every role that uses ``prompt_as_user_message: true`` (PO,
-    Architect, Builder) so the contract — and any future changes to it —
-    live in one place.
-    """
     from darkfactory.agents.registry import get_default_registry, resolve_prompt_path
 
     manifest = get_default_registry().get(role)
-    template_text = resolve_prompt_path(manifest.llm.prompt_path).read_text(
-        encoding="utf-8"
-    )
-    from string import Template
-
-    return Template(template_text).safe_substitute(**substitutions)
+    prompt_path = resolve_prompt_path(manifest.llm.prompt_path)
+    prompt = resolve_prompt(role, disk_path=prompt_path)
+    stamp_prompt_attrs(trace.get_current_span(), prompt)
+    return Template(prompt.text).safe_substitute(**substitutions)
 
 
 _FENCED_JSON_RE = re.compile(r"```(?:json)?\s*\n(.*?)\n\s*```", re.DOTALL)

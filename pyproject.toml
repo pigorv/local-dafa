@@ -1,7 +1,7 @@
 [project]
 name = "darkfactory"
 version = "0.1.0"
-description = "Add your description here"
+description = "Autonomous coding pipeline that turns developer requests and GitHub issues into reviewed pull requests."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

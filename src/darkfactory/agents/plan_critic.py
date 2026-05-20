@@ -16,17 +16,16 @@ downstream).
 from __future__ import annotations
 
 import json
-from string import Template
 from typing import Any
 
 from darkfactory.agents._sdk_common import (
     ParseError,
     _drain,
+    render_role_user_message,
     role_turn_span,
     stamp_turn_usage,
 )
 from darkfactory.agents.compose import ComposeState, compose
-from darkfactory.agents.registry import get_default_registry, resolve_prompt_path
 from opentelemetry import trace
 
 DEFAULT_PLANNING_MAX_ATTEMPTS = 5
@@ -44,10 +43,6 @@ def _planning_feedback_text(state_slice: dict) -> str:
 
 
 def _render_user_prompt(state_slice: dict) -> str:
-    manifest = get_default_registry().get("plan_critic")
-    template_text = resolve_prompt_path(manifest.llm.prompt_path).read_text(
-        encoding="utf-8"
-    )
     brief = state_slice.get("implementation_brief") or {}
     if not isinstance(brief, dict):
         brief = {}
@@ -60,7 +55,8 @@ def _render_user_prompt(state_slice: dict) -> str:
     max_attempts = int(
         state_slice.get("planning_max_attempts") or DEFAULT_PLANNING_MAX_ATTEMPTS
     )
-    return Template(template_text).safe_substitute(
+    return render_role_user_message(
+        "plan_critic",
         user_request=state_slice.get("user_request", "") or "",
         current_understanding=str(brief.get("current_understanding") or ""),
         contract_changes=json.dumps(contract_changes, indent=2),
@@ -131,8 +127,8 @@ def _resolve_task_id(state_slice: dict) -> str:
 
 async def run_plan_critic(state_slice: dict) -> dict[str, Any]:
     compose_state = ComposeState.task_only(_resolve_task_id(state_slice))
-    rendered = _render_user_prompt(state_slice)
     async with role_turn_span("plan_critic"):
+        rendered = _render_user_prompt(state_slice)
         async with compose(
             "plan_critic",
             compose_state,

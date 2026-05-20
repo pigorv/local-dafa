@@ -88,9 +88,9 @@ async def run_tester(state_slice: dict) -> dict[str, Any]:
     array only ever holds Tester-declared findings).
     """
     compose_state = ComposeState.from_mapping(state_slice)
-    rendered = _render_user_prompt(state_slice)
     slice_id = state_slice.get("current_slice") or ""
     async with role_turn_span(ROLE, wp_id=slice_id or None):
+        rendered = _render_user_prompt(state_slice)
         async with compose(
             ROLE,
             compose_state,

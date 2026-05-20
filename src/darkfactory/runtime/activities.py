@@ -1659,6 +1659,12 @@ async def setup_worker_activity(wf_id: str, repo_url: str) -> str:
             "LANGFUSE_PUBLIC_KEY": os.environ.get("LANGFUSE_PUBLIC_KEY", ""),
             "LANGFUSE_SECRET_KEY": os.environ.get("LANGFUSE_SECRET_KEY", ""),
             "LANGFUSE_HOST": os.environ.get("LANGFUSE_HOST", "http://langfuse-web:3000"),
+            "LANGFUSE_PROMPTS_ENABLED": os.environ.get(
+                "LANGFUSE_PROMPTS_ENABLED", "true"
+            ),
+            "LANGFUSE_PROMPT_LABEL": os.environ.get(
+                "LANGFUSE_PROMPT_LABEL", "production"
+            ),
             # Native Claude Code telemetry — see https://code.claude.com/docs/en/monitoring-usage.
             # Each role activity opens its own ClaudeSDKClient (one CLI subprocess per
             # activity), so traces propagate from the Temporal activity span via

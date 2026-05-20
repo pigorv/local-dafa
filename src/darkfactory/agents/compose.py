@@ -16,6 +16,7 @@ from claude_agent_sdk.types import (
 from opentelemetry import trace as _otel_trace
 
 import darkfactory.hooks as hook_exports
+from darkfactory.agents._sdk_common import resolve_prompt, stamp_prompt_attrs
 from darkfactory.agents.manifest import HookAttachment, RoleManifest
 from darkfactory.agents.registry import (
     Registry,
@@ -110,10 +111,12 @@ def compose(
     runtime_task_id = state_slice.task_id or task_id
 
     prompt_path = resolve_prompt_path(manifest.llm.prompt_path)
-    system_prompt = (
-        None if manifest.llm.prompt_as_user_message
-        else prompt_path.read_text(encoding="utf-8")
-    )
+    prompt_resolution = None
+    if manifest.llm.prompt_as_user_message:
+        system_prompt = None
+    else:
+        prompt_resolution = resolve_prompt(role, disk_path=prompt_path)
+        system_prompt = prompt_resolution.text
     tools_value = _resolve_tools(role, manifest)
     hooks = _materialize_hooks(role, manifest, state_slice, runtime_task_id)
     mcp_servers = _materialize_mcp_servers(manifest.mcp, runtime_task_id)
@@ -146,6 +149,8 @@ def compose(
     options.disallowed_tools = list(manifest.tools.disallowed)
     _apply_in_process_overrides(options, manifest, overrides)
     _stamp_manifest_attrs(registry, role, manifest, prompt_path)
+    if prompt_resolution is not None:
+        stamp_prompt_attrs(_otel_trace.get_current_span(), prompt_resolution)
     log_resolved_options(role, options)
     return ClaudeSDKClient(options=options)
 

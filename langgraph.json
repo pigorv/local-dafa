@@ -1,6 +1,7 @@
 {
   "dependencies": ["."],
   "graphs": {
+    "triage": "./src/darkfactory/stages/triage.py:triage_subgraph",
     "discovery": "./src/darkfactory/stages/discovery.py:discovery_subgraph",
     "build": "./src/darkfactory/stages/build.py:build_subgraph",
     "verify": "./src/darkfactory/stages/verify.py:verify_subgraph"
