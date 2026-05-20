@@ -1,6 +1,6 @@
 # local-dafa
 
-*local Dark Factory — an autonomous coding pipeline: prompt or labeled GitHub issue → reviewed PR. A learning artifact for composing the 2026 agentic workflow stack — Temporal, Claude Agent SDK, LangGraph, Langfuse, OpenTelemetry, MCP.*
+*local Dark Factory — an autonomous coding pipeline: prompt or labeled GitHub issue → reviewed PR. A learning artifact for composing the 2026 agentic workflow stack — Temporal, Claude Agent SDK, LangGraph, Langfuse, OpenTelemetry.*
 
 https://github.com/user-attachments/assets/c57ef717-3ac7-4d22-a570-cf1bd330df78
 
