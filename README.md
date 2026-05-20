@@ -2,7 +2,7 @@
 
 *local Dark Factory — an autonomous coding pipeline: prompt or labeled GitHub issue → reviewed PR. A learning artifact for composing the 2026 agentic workflow stack — Temporal, Claude Agent SDK, LangGraph, Langfuse, OpenTelemetry, MCP.*
 
-<!-- TODO: paste GitHub user-attachments URL for assets/local-dafa-demo.mp4 on its own line below. Generate one by dragging the MP4 into a GitHub issue/PR draft on github.com; the resulting https://github.com/user-attachments/assets/... URL auto-renders as an inline player. -->
+https://github.com/user-attachments/assets/c57ef717-3ac7-4d22-a570-cf1bd330df78
 
 *54s cut of a ~15min real run, sped up.*
 
