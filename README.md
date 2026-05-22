@@ -68,8 +68,10 @@ Hydrate → Triage → [PO → Architect → Plan Critic] × up to 5
         → Merge gate (human optional) → Merge
 ```
 
-Human gates are opt-in: they pause the workflow until you apply a GitHub label
-or post an approval comment. You can skip gates by automating label application.
+Human gates pause the workflow until you act on them — via a GitHub label or
+comment (issue-driven runs) or the `darkfactory gate` CLI (prompt runs). Prompt
+runs can skip both gates with `run --auto-approve-gates`; issue-driven runs can
+skip them by automating label application.
 
 ---
 
@@ -263,6 +265,14 @@ The CLI starts the workflow and waits for the result. To fire-and-forget:
 uv run darkfactory run "Implement X" --repo /path/to/repo --no-wait
 ```
 
+A prompt run pauses at the brief and merge gates (see [Human gates](#human-gates)).
+To run fully unattended — approving both gates automatically, including the
+final merge:
+
+```bash
+uv run darkfactory run "Implement X" --repo /path/to/repo --auto-approve-gates
+```
+
 ### Smoke test (no LLMs)
 
 ```bash
@@ -271,11 +281,16 @@ uv run darkfactory run --hello-worker --repo /path/to/repo
 
 ### Human gates
 
-The workflow pauses at two optional human gates:
+The workflow pauses at two human gates — the **brief gate** (after planning
+completes) and the **merge gate** (after the reviewer approves, before merging).
+How you act on a gate depends on how the run was started.
 
-**Brief gate** — after planning completes, the workflow posts the
-implementation brief as a GitHub issue comment (issue-driven mode) or waits for
-a Temporal update (manual mode). Actions:
+#### Issue-driven runs
+
+The workflow posts the implementation brief (brief gate) or the PR link (merge
+gate) as a GitHub issue comment, then waits for a label or comment.
+
+**Brief gate:**
 
 | Action | How |
 |---|---|
@@ -283,8 +298,7 @@ a Temporal update (manual mode). Actions:
 | Revise | Post `revise: <feedback>` comment |
 | Reject | Post `reject` comment or apply `df:cancel` label |
 
-**Merge gate** — after the reviewer approves, the workflow pauses before
-merging. Actions:
+**Merge gate:**
 
 | Action | How |
 |---|---|
@@ -292,6 +306,37 @@ merging. Actions:
 | Request fix | Post `fix: <instructions>` comment |
 | Rebuild | Post `rebuild` comment |
 | Reject | Apply `df:cancel` label or post `reject` comment |
+
+#### Prompt runs
+
+A prompt run blocks at each gate until you act on it with the `darkfactory gate`
+subcommands, addressed by the workflow ID printed when the run starts. Because a
+`--wait` run holds the terminal, start runs you intend to gate with `--no-wait`
+and note the printed `workflow_id`.
+
+`gate show` renders the pending gate — the implementation brief, or the PR plus
+reviewer findings at the merge gate — to a local markdown file for review:
+
+```bash
+# Inspect the pending gate; writes ./.darkfactory/briefs/<workflow-id>.md
+uv run darkfactory gate show <workflow-id>
+
+# Brief gate
+uv run darkfactory gate approve <workflow-id>
+uv run darkfactory gate revise  <workflow-id> --feedback "tighten the API contract"
+uv run darkfactory gate reject  <workflow-id> --reason "out of scope"
+
+# Merge gate
+uv run darkfactory gate approve <workflow-id>
+uv run darkfactory gate fix     <workflow-id> --focus "handle the null case"
+uv run darkfactory gate rebuild <workflow-id> --focus "rework the data model"
+uv run darkfactory gate reject  <workflow-id> --reason "wrong approach"
+```
+
+`approve` and `reject` auto-detect which gate is pending; an action that does
+not apply to the current gate (e.g. `fix` at the brief gate) fails without
+sending anything. To skip both gates entirely, start the run with
+`--auto-approve-gates`.
 
 ---
 
@@ -413,8 +458,32 @@ uv run darkfactory run "Implement X" --repo /path/to/repo
 # Fire and forget
 uv run darkfactory run "Implement X" --repo /path/to/repo --no-wait
 
+# Unattended — auto-approve the brief and merge gates
+uv run darkfactory run "Implement X" --repo /path/to/repo --auto-approve-gates
+
 # Smoke test (no LLMs, confirms worker plumbing only)
 uv run darkfactory run --hello-worker --repo /path/to/repo
+```
+
+### `gate` — review and act on a prompt run's human gates
+
+Drives the brief and merge gates of a prompt run by workflow ID. See
+[Human gates](#human-gates) for the full flow.
+
+```bash
+# Render the pending gate to ./.darkfactory/briefs/<workflow-id>.md (--out overrides)
+uv run darkfactory gate show <workflow-id>
+
+# Brief gate
+uv run darkfactory gate approve <workflow-id>
+uv run darkfactory gate revise  <workflow-id> --feedback "<feedback>"
+uv run darkfactory gate reject  <workflow-id> --reason "<reason>"
+
+# Merge gate
+uv run darkfactory gate approve <workflow-id>
+uv run darkfactory gate fix     <workflow-id> --focus "<focus>"
+uv run darkfactory gate rebuild <workflow-id> --focus "<focus>"
+uv run darkfactory gate reject  <workflow-id> --reason "<reason>"
 ```
 
 ### `schedule` — manage issue-watch schedules

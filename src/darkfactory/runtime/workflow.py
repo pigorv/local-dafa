@@ -942,4 +942,11 @@ class DarkFactoryWorkflow:
             "merge_gate_pending": merge_gate_pending,
             "current_slice": self._state.get("current_slice"),
             "pr_url": self._state.get("pr_url"),
+            # Design artifacts so the `darkfactory gate` CLI can render the
+            # brief / review for human approval on prompt-driven runs.
+            "implementation_brief": self._state.get("implementation_brief"),
+            "spec": self._state.get("spec", []),
+            "stories": self._state.get("stories", []),
+            "review_decision": self._state.get("review_decision"),
+            "user_request": self._state.get("user_request"),
         }
