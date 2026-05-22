@@ -17,9 +17,11 @@ import pytest
 import yaml
 
 from darkfactory.cli import (
+    _wait_for_result_auto_approving_gates,
     _wait_for_result_with_eval_gates,
     build_parser,
     eval_command,
+    gate_command,
     roles_command,
     run_command,
     schedule_command,
@@ -161,6 +163,221 @@ def test_eval_gate_wait_approves_brief_then_rejects_merge():
         "benchmark auto-approved brief",
         "benchmark stopped before merge",
     ]
+
+
+def test_auto_approve_gate_wait_approves_brief_then_merge():
+    async def exercise() -> tuple[RunResult, list[tuple[object, GateDecision]]]:
+        real_sleep = asyncio.sleep
+        done = asyncio.Event()
+        updates: list[tuple[object, GateDecision]] = []
+
+        class FakeHandle:
+            async def result(self) -> RunResult:
+                await done.wait()
+                return RunResult(status="merged", state={})
+
+            async def query(self, query: object) -> dict[str, str | None]:
+                assert query is DarkFactoryWorkflow.current_state_summary
+                if not updates:
+                    return {"pending_gate": "brief"}
+                if len(updates) == 1:
+                    return {"pending_gate": "merge"}
+                return {"pending_gate": None}
+
+            async def execute_update(
+                self,
+                update: object,
+                decision: GateDecision,
+            ) -> None:
+                updates.append((update, decision))
+                if update is DarkFactoryWorkflow.approve_merge:
+                    done.set()
+
+        async def fast_sleep(_: float) -> None:
+            await real_sleep(0)
+
+        with patch("darkfactory.cli.asyncio.sleep", fast_sleep):
+            result = await _wait_for_result_auto_approving_gates(FakeHandle())
+        return result, updates
+
+    result, updates = asyncio.run(exercise())
+
+    assert result.status == "merged"
+    assert [update for update, _ in updates] == [
+        DarkFactoryWorkflow.approve_brief,
+        DarkFactoryWorkflow.approve_merge,
+    ]
+    assert all(decision.approved for _, decision in updates)
+
+
+def test_run_auto_approve_gates_flag_drives_gate_waiter(tmp_path: Path):
+    args = _parse(
+        ["run", "ship it", "--repo", str(tmp_path), "--auto-approve-gates"]
+    )
+    client, handle = _fake_client(RunResult(status="merged", state={}))
+
+    with patch(
+        "darkfactory.cli._connect_client",
+        AsyncMock(return_value=client),
+    ), patch(
+        "darkfactory.cli._wait_for_result_auto_approving_gates",
+        AsyncMock(return_value=RunResult(status="merged", state={})),
+    ) as waiter:
+        rc = asyncio.run(run_command(args))
+
+    assert rc == 0
+    waiter.assert_awaited_once()
+    handle.result.assert_not_awaited()
+
+
+def test_run_without_auto_approve_flag_awaits_result_directly(tmp_path: Path):
+    args = _parse(["run", "ship it", "--repo", str(tmp_path)])
+    client, handle = _fake_client(RunResult(status="merged", state={}))
+
+    with patch(
+        "darkfactory.cli._connect_client",
+        AsyncMock(return_value=client),
+    ), patch(
+        "darkfactory.cli._wait_for_result_auto_approving_gates",
+        AsyncMock(),
+    ) as waiter:
+        rc = asyncio.run(run_command(args))
+
+    assert rc == 0
+    waiter.assert_not_awaited()
+    handle.result.assert_awaited_once()
+
+
+def _fake_gate_client(summary: dict) -> tuple[MagicMock, MagicMock]:
+    handle = MagicMock()
+    handle.query = AsyncMock(return_value=summary)
+    handle.execute_update = AsyncMock()
+    client = MagicMock()
+    client.get_workflow_handle = MagicMock(return_value=handle)
+    return client, handle
+
+
+def test_gate_show_writes_brief_file(tmp_path: Path, capsys):
+    out = tmp_path / "brief.md"
+    args = _parse(["gate", "show", "darkfactory-abc", "--out", str(out)])
+    summary = {
+        "pending_gate": "brief",
+        "brief_gate_pending": True,
+        "implementation_brief": {
+            "problem": "no CLI gate surface",
+            "expected_behavior": [],
+            "current_understanding": "",
+            "proposed_design": "add it",
+            "contract_changes": {"api": [], "data": [], "events": []},
+            "compatibility_risks": [],
+            "open_assumptions": [],
+            "test_strategy": "",
+            "work_packages": [],
+        },
+    }
+    client, handle = _fake_gate_client(summary)
+
+    with patch(
+        "darkfactory.cli._connect_client",
+        AsyncMock(return_value=client),
+    ):
+        rc = asyncio.run(gate_command(args))
+
+    assert rc == 0
+    assert out.exists()
+    assert "no CLI gate surface" in out.read_text(encoding="utf-8")
+    handle.execute_update.assert_not_awaited()
+    printed = capsys.readouterr().out
+    assert "pending_gate=brief" in printed
+    assert f"brief_file={out.resolve()}" in printed
+
+
+def test_gate_show_no_pending_gate(tmp_path: Path, capsys):
+    args = _parse(["gate", "show", "darkfactory-abc"])
+    client, handle = _fake_gate_client({"pending_gate": None})
+
+    with patch(
+        "darkfactory.cli._connect_client",
+        AsyncMock(return_value=client),
+    ):
+        rc = asyncio.run(gate_command(args))
+
+    assert rc == 0
+    handle.execute_update.assert_not_awaited()
+    assert "pending_gate=none" in capsys.readouterr().out
+
+
+def test_gate_approve_routes_to_brief_update():
+    args = _parse(["gate", "approve", "darkfactory-abc"])
+    client, handle = _fake_gate_client(
+        {"pending_gate": "brief", "brief_gate_pending": True}
+    )
+
+    with patch(
+        "darkfactory.cli._connect_client",
+        AsyncMock(return_value=client),
+    ):
+        rc = asyncio.run(gate_command(args))
+
+    assert rc == 0
+    handle.execute_update.assert_awaited_once()
+    update, decision = handle.execute_update.await_args.args
+    assert update is DarkFactoryWorkflow.approve_brief
+    assert decision.approved is True
+
+
+def test_gate_approve_routes_to_merge_update():
+    args = _parse(["gate", "approve", "darkfactory-abc", "--reason", "lgtm"])
+    client, handle = _fake_gate_client(
+        {"pending_gate": "merge", "merge_gate_pending": True}
+    )
+
+    with patch(
+        "darkfactory.cli._connect_client",
+        AsyncMock(return_value=client),
+    ):
+        rc = asyncio.run(gate_command(args))
+
+    assert rc == 0
+    update, decision = handle.execute_update.await_args.args
+    assert update is DarkFactoryWorkflow.approve_merge
+    assert decision.approved is True
+    assert decision.reason == "lgtm"
+
+
+def test_gate_fix_at_brief_gate_errors_without_sending_update():
+    args = _parse(["gate", "fix", "darkfactory-abc"])
+    client, handle = _fake_gate_client(
+        {"pending_gate": "brief", "brief_gate_pending": True}
+    )
+
+    with patch(
+        "darkfactory.cli._connect_client",
+        AsyncMock(return_value=client),
+    ), pytest.raises(SystemExit):
+        asyncio.run(gate_command(args))
+
+    handle.execute_update.assert_not_awaited()
+
+
+def test_gate_revise_passes_feedback_as_reason():
+    args = _parse(
+        ["gate", "revise", "darkfactory-abc", "--feedback", "tighten the contract"]
+    )
+    client, handle = _fake_gate_client(
+        {"pending_gate": "brief", "brief_gate_pending": True}
+    )
+
+    with patch(
+        "darkfactory.cli._connect_client",
+        AsyncMock(return_value=client),
+    ):
+        rc = asyncio.run(gate_command(args))
+
+    assert rc == 0
+    update, decision = handle.execute_update.await_args.args
+    assert update is DarkFactoryWorkflow.revise_brief
+    assert decision.reason == "tighten the contract"
 
 
 def test_eval_dry_run_loads_schema_without_temporal(capsys):

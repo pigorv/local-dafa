@@ -21,7 +21,7 @@ from darkfactory.agents.registry import (
 )
 from darkfactory.bootstrap import init_observability
 from darkfactory.eval.runner import WorkflowRun
-from darkfactory.runtime import schedule_admin
+from darkfactory.runtime import gate_admin, schedule_admin
 from darkfactory.runtime.workflow import DarkFactoryWorkflow
 from darkfactory.state import GateDecision, RunRequest, RunResult
 
@@ -44,6 +44,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--wait", dest="wait", action="store_true", default=True
     )
     run_parser.add_argument("--no-wait", dest="wait", action="store_false")
+    run_parser.add_argument(
+        "--auto-approve-gates",
+        action="store_true",
+        help="approve the brief and merge gates without a human (unattended runs)",
+    )
 
     eval_parser = subparsers.add_parser("eval")
     eval_parser.add_argument("benchmark", type=Path)
@@ -88,6 +93,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="include schedules outside the df-watch-* namespace",
     )
     list_parser.add_argument("--page-size", type=int, default=1000)
+
+    gate_parser = subparsers.add_parser("gate")
+    gate_subparsers = gate_parser.add_subparsers(
+        dest="gate_command",
+        required=True,
+    )
+
+    gate_show_parser = gate_subparsers.add_parser("show")
+    gate_show_parser.add_argument("workflow_id")
+    gate_show_parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="file to write the rendered design to "
+        "(default: ./.darkfactory/briefs/<workflow-id>.md)",
+    )
+
+    for command in ("approve", "reject"):
+        command_parser = gate_subparsers.add_parser(command)
+        command_parser.add_argument("workflow_id")
+        command_parser.add_argument("--reason", default=None)
+
+    gate_revise_parser = gate_subparsers.add_parser("revise")
+    gate_revise_parser.add_argument("workflow_id")
+    gate_revise_parser.add_argument("--feedback", required=True)
+
+    for command in ("fix", "rebuild"):
+        command_parser = gate_subparsers.add_parser(command)
+        command_parser.add_argument("workflow_id")
+        command_parser.add_argument("--focus", default=None)
 
     roles_parser = subparsers.add_parser("roles")
     roles_subparsers = roles_parser.add_subparsers(
@@ -156,6 +191,34 @@ async def _wait_for_result_with_eval_gates(handle) -> RunResult:
     return await result_task
 
 
+async def _wait_for_result_auto_approving_gates(handle) -> RunResult:
+    # Unattended prompt runs: approve BOTH gates with no human review. Approving
+    # the merge gate triggers the deterministic merge. This is opt-in via
+    # `darkfactory run --auto-approve-gates`. Unlike `_wait_for_result_with_eval_gates`
+    # (which rejects the merge gate for benchmark safety), this drives the run
+    # all the way to a merged PR.
+    result_task = asyncio.create_task(handle.result())
+    approved_brief = False
+    approved_merge = False
+    while not result_task.done():
+        summary = await handle.query(DarkFactoryWorkflow.current_state_summary)
+        pending_gate = summary.get("pending_gate")
+        if pending_gate == "brief" and not approved_brief:
+            await handle.execute_update(
+                DarkFactoryWorkflow.approve_brief,
+                GateDecision(approved=True, reason="auto-approved brief (--auto-approve-gates)"),
+            )
+            approved_brief = True
+        elif pending_gate == "merge" and not approved_merge:
+            await handle.execute_update(
+                DarkFactoryWorkflow.approve_merge,
+                GateDecision(approved=True, reason="auto-approved merge (--auto-approve-gates)"),
+            )
+            approved_merge = True
+        await asyncio.sleep(2)
+    return await result_task
+
+
 async def _start_workflow_and_wait(
     *,
     prompt: str,
@@ -163,6 +226,7 @@ async def _start_workflow_and_wait(
     workflow_id: str | None = None,
     wait: bool = True,
     auto_eval_gates: bool = False,
+    auto_approve_gates: bool = False,
 ) -> WorkflowRun:
     workflow_id = workflow_id or f"darkfactory-{uuid.uuid4().hex}"
     request = RunRequest(
@@ -193,6 +257,8 @@ async def _start_workflow_and_wait(
             )
         if auto_eval_gates:
             result = await _wait_for_result_with_eval_gates(handle)
+        elif auto_approve_gates:
+            result = await _wait_for_result_auto_approving_gates(handle)
         else:
             result = await handle.result()
     return WorkflowRun(
@@ -244,6 +310,7 @@ async def run_command(args: argparse.Namespace) -> int:
         repo=args.repo,
         workflow_id=workflow_id,
         wait=args.wait,
+        auto_approve_gates=args.auto_approve_gates,
     )
     _flush_traces()
     print(f"workflow_id={run.workflow_id}")
@@ -390,6 +457,88 @@ def _print_schedule_list(
         )
 
 
+async def gate_command(args: argparse.Namespace) -> int:
+    init_observability("darkfactory-cli")
+    tracer = trace.get_tracer("darkfactory.cli")
+
+    with tracer.start_as_current_span("darkfactory.cli.gate") as span:
+        span.set_attribute("gate.command", args.gate_command)
+        span.set_attribute("workflow.id", args.workflow_id)
+        client = await _connect_client()
+        status = await gate_admin.describe_gate(
+            client, workflow_id=args.workflow_id
+        )
+
+        if args.gate_command == "show":
+            _gate_show(args, status)
+            _flush_traces()
+            return 0
+
+        try:
+            update = gate_admin.route_action(status.pending_gate, args.gate_command)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+
+        await gate_admin.submit_gate_decision(
+            client,
+            workflow_id=args.workflow_id,
+            update=update,
+            decision=_gate_decision_for(args),
+        )
+        print(f"workflow_id={args.workflow_id}")
+        print(f"gate={status.pending_gate}")
+        print(f"action={args.gate_command}")
+        _flush_traces()
+        return 0
+
+    raise SystemExit(f"unknown gate command: {args.gate_command}")
+
+
+def _gate_show(args: argparse.Namespace, status: gate_admin.GateStatus) -> None:
+    print(f"workflow_id={args.workflow_id}")
+    if status.pending_gate is None:
+        print("pending_gate=none")
+        print("no gate is currently pending (workflow running or finished)")
+        return
+
+    if status.pending_gate == "merge":
+        body = gate_admin.render_merge_markdown(status)
+    else:
+        body = gate_admin.render_brief_markdown(status)
+
+    out_path = args.out or (
+        Path.cwd() / ".darkfactory" / "briefs" / f"{args.workflow_id}.md"
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(body, encoding="utf-8")
+
+    print(f"pending_gate={status.pending_gate}")
+    if status.pr_url:
+        print(f"pr_url={status.pr_url}")
+    print(f"brief_file={out_path.resolve()}")
+
+
+def _gate_decision_for(args: argparse.Namespace) -> GateDecision:
+    command = args.gate_command
+    if command == "approve":
+        return GateDecision(
+            approved=True,
+            reason=args.reason or "approved via darkfactory gate",
+        )
+    if command == "reject":
+        return GateDecision(
+            approved=False,
+            reason=args.reason or "rejected via darkfactory gate",
+        )
+    if command == "revise":
+        # revise_brief reads `reason` as the human feedback; `approved` is ignored.
+        return GateDecision(approved=False, reason=args.feedback)
+    # fix / rebuild: trigger_fix / trigger_rebuild read `reason` as the focus
+    # hint; `approved` is ignored.
+    focus = args.focus or f"{command} requested via darkfactory gate"
+    return GateDecision(approved=False, reason=focus)
+
+
 def roles_command(args: argparse.Namespace) -> int:
     if args.roles_command == "list":
         return _roles_list()
@@ -441,6 +590,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(eval_command(args))
     if args.command == "schedule":
         return asyncio.run(schedule_command(args))
+    if args.command == "gate":
+        return asyncio.run(gate_command(args))
     if args.command == "roles":
         return roles_command(args)
 
